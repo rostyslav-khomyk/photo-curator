@@ -1,5 +1,6 @@
 .DS_Store
 build/
+.build/
 dist/
 wheelhouse/
 icloudpd.egg-info
@@ -25,6 +26,12 @@ node_modules/
 # used for local troubleshooting
 .photos
 .cookies/
+
+# Local sync state and secrets
+/google_credentials*.json
+/icloud_photos_sync_config.json
+/album_mapping.json
+/icloud_photos/
 
 .claude/
 

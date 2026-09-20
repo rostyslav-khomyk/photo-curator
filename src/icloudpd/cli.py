@@ -257,6 +257,24 @@ def add_options_for_user(parser: argparse.ArgumentParser) -> argparse.ArgumentPa
         help="Don't download any photos (default: download all photos and videos)",
         action="store_true",
     )
+    cloned.add_argument(
+        "--google-photos-sync",
+        help="Enable syncing photos to Google Photos",
+        action="store_true",
+        default=False,
+    )
+    cloned.add_argument(
+        "--google-photos-credentials",
+        help="Path to Google Photos OAuth2 credentials JSON file",
+        default=None,
+        type=str,
+    )
+    cloned.add_argument(
+        "--google-photos-album-mapping",
+        help="Path to JSON file mapping iCloud albums to Google Photos albums",
+        default=None,
+        type=str,
+    )
     return cloned
 
 
@@ -297,6 +315,30 @@ def add_global_options(parser: argparse.ArgumentParser) -> argparse.ArgumentPars
     group.add_argument("--help", "-h", action="store_true", help="Show this information")
     group.add_argument(
         "--version", help="Show the version, commit hash, and timestamp", action="store_true"
+    )
+    group.add_argument(
+        "--web-ui",
+        help="Start the local web dashboard at http://127.0.0.1:8080",
+        action="store_true",
+    )
+    group.add_argument(
+        "--preflight",
+        help="Run pre-flight setup wizard for simplified authentication and configuration",
+        action="store_true",
+    )
+    group.add_argument(
+        "--sync-from-config",
+        help="Run sync using configuration from preflight mode (default: icloud_photos_sync_config.json)",
+        nargs="?",
+        const="icloud_photos_sync_config.json",
+        default=None,
+        metavar="CONFIG_FILE",
+    )
+    cloned.add_argument(
+        "--clear-credentials",
+        help="Clear stored credentials. Options: icloud, google, all",
+        choices=["icloud", "google", "all"],
+        default=None,
     )
     cloned.add_argument(
         "--use-os-locale", help="Use the locale of the host OS to format dates", action="store_true"
@@ -473,6 +515,9 @@ def map_to_config(user_ns: argparse.Namespace) -> UserConfig:
         skip_created_before=user_ns.skip_created_before,
         skip_created_after=user_ns.skip_created_after,
         skip_photos=user_ns.skip_photos,
+        google_photos_sync=user_ns.google_photos_sync,
+        google_photos_credentials=user_ns.google_photos_credentials,
+        google_photos_album_mapping=user_ns.google_photos_album_mapping,
     )
 
 
@@ -513,6 +558,10 @@ def parse(args: Sequence[str]) -> Tuple[GlobalConfig, Sequence[UserConfig]]:
         GlobalConfig(
             help=global_ns.help,
             version=global_ns.version,
+            web_ui=global_ns.web_ui,
+            preflight=global_ns.preflight,
+            sync_from_config=global_ns.sync_from_config,
+            clear_credentials=global_ns.clear_credentials,
             use_os_locale=global_ns.use_os_locale,
             only_print_filenames=global_ns.only_print_filenames,
             log_level=log_level(global_ns.log_level),
@@ -551,6 +600,28 @@ def cli() -> int:
         return 0
     elif global_ns.version:
         print(foundation.version_info_formatted())
+        return 0
+    elif global_ns.web_ui:
+        return run_web_dashboard(global_ns)
+    elif global_ns.sync_from_config:
+        # Run sync using saved configuration
+        from icloudpd.config_runner import run_from_config
+
+        return run_from_config(global_ns.sync_from_config, global_ns)
+    elif global_ns.preflight or global_ns.clear_credentials:
+        # Run pre-flight setup wizard or clear credentials
+        from icloudpd.preflight import run_preflight_setup
+
+        # Handle credential clearing
+        if global_ns.clear_credentials:
+            clear_apple = global_ns.clear_credentials in ("icloud", "all")
+            clear_google = global_ns.clear_credentials in ("google", "all")
+            clear_all_flag = global_ns.clear_credentials == "all"
+            run_preflight_setup(
+                clear_apple=clear_apple, clear_google=clear_google, clear_all=clear_all_flag
+            )
+        else:
+            run_preflight_setup()
         return 0
     else:
         # check param compatibility
@@ -622,6 +693,126 @@ def cli() -> int:
             return 2
         else:
             return run_with_configs(global_ns, user_nses)
+
+
+def run_web_dashboard(global_config: GlobalConfig) -> int:
+    """Start a loopback-only dashboard that launches normal sync runs."""
+    import threading
+    import webbrowser
+    from functools import partial
+
+    from icloudpd.authentication import authenticator
+    from icloudpd.base import (
+        create_logger,
+        get_password_from_webui,
+        keyring_password_writter,
+        update_password_status_in_webui,
+    )
+    from icloudpd.google_photos_client import GooglePhotosClient
+    from icloudpd.server import WebControl, serve_app
+    from icloudpd.status import StatusExchange
+    from pyicloud_ipd.response_types import (
+        AlbumsFetchSuccess,
+        AuthenticatorSuccess,
+        PhotosServiceAccessSuccess,
+    )
+    from pyicloud_ipd.utils import get_password_from_keyring
+
+    logger = create_logger(global_config)
+    status_exchange = StatusExchange()
+
+    parent_pid = os.environ.get("ICLOUDPD_PARENT_PID")
+    if parent_pid and parent_pid.isdigit():
+        import time
+
+        def stop_with_parent() -> None:
+            while True:
+                try:
+                    os.kill(int(parent_pid), 0)
+                except ProcessLookupError:
+                    os._exit(0)
+                except PermissionError:
+                    return
+                time.sleep(2)
+
+        threading.Thread(target=stop_with_parent, daemon=True).start()
+
+    def run_from_form(args: list[str]) -> int:
+        status_exchange.reset_for_run()
+        run_global_config, user_configs = parse(args)
+        for user_config in user_configs:
+            if user_config.directory:
+                os.makedirs(user_config.directory, exist_ok=True)
+        run_global_config.password_providers = [PasswordProvider.KEYRING, PasswordProvider.WEBUI]
+        run_global_config.mfa_provider = MFAProvider.WEBUI
+        return run_with_configs(
+            run_global_config,
+            user_configs,
+            status_exchange=status_exchange,
+            start_web_server=False,
+        )
+
+    def browse_icloud_albums(username: str) -> list[str]:
+        status_exchange.reset_for_run()
+        status_exchange.set_current_user(username)
+        password_providers = {
+            PasswordProvider.KEYRING.value: (
+                get_password_from_keyring,
+                keyring_password_writter(logger),
+            ),
+            PasswordProvider.WEBUI.value: (
+                partial(get_password_from_webui, logger, status_exchange),
+                partial(update_password_status_in_webui, status_exchange),
+            ),
+        }
+        auth_result = authenticator(
+            logger=logger,
+            domain=global_config.domain,
+            password_providers=password_providers,
+            mfa_provider=MFAProvider.WEBUI,
+            status_exchange=status_exchange,
+            username=username,
+            notificator=lambda: None,
+            cookie_directory=os.path.expanduser("~/.pyicloud"),
+        )
+        match auth_result:
+            case AuthenticatorSuccess(icloud):
+                pass
+            case _:
+                raise RuntimeError(
+                    f"iCloud authentication was not completed ({type(auth_result).__name__})."
+                )
+
+        photos_result = icloud.get_photos_service()
+        match photos_result:
+            case PhotosServiceAccessSuccess(photos_service):
+                pass
+            case _:
+                raise RuntimeError("Could not access the iCloud Photos library.")
+        albums_result = photos_service.get_albums()
+        match albums_result:
+            case AlbumsFetchSuccess(albums):
+                return sorted(albums.keys(), key=str.casefold)
+            case _:
+                raise RuntimeError("Could not load iCloud albums.")
+
+    def browse_google_albums(credentials_path: str) -> list[str]:
+        client = GooglePhotosClient(credentials_path, logger)
+        return sorted(
+            {str(album["title"]) for album in client.list_albums() if album.get("title")},
+            key=str.casefold,
+        )
+
+    control = WebControl(run_from_form, logger)
+    control.set_cloud_browsers(browse_icloud_albums, browse_google_albums)
+    dashboard_url = "http://127.0.0.1:8080"
+    if os.environ.get("ICLOUDPD_NO_OPEN_BROWSER") != "1":
+        threading.Timer(0.5, webbrowser.open, args=[dashboard_url]).start()
+    try:
+        serve_app(logger, status_exchange, control=control)
+    except KeyboardInterrupt:
+        logger.info("Web dashboard stopped")
+    return 0
 
 
 def validate_folder_structure(folder_structure: str) -> str:

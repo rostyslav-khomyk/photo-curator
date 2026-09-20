@@ -50,6 +50,9 @@ class _DefaultConfig:
     skip_created_before: datetime.datetime | datetime.timedelta | None
     skip_created_after: datetime.datetime | datetime.timedelta | None
     skip_photos: bool
+    google_photos_sync: bool = False
+    google_photos_credentials: str | None = None
+    google_photos_album_mapping: str | None = None
 
 
 @dataclass(kw_only=True)
@@ -62,6 +65,10 @@ class UserConfig(_DefaultConfig):
 class GlobalConfig:
     help: bool
     version: bool
+    web_ui: bool = False
+    preflight: bool = False
+    sync_from_config: str | None = None
+    clear_credentials: str | None = None
     use_os_locale: bool
     only_print_filenames: bool
     log_level: LogLevel

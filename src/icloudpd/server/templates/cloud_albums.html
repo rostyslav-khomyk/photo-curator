@@ -1,0 +1,18 @@
+<div class="cloud-results">
+    {% if error %}
+        <p class="cloud-error">{{ error }}</p>
+    {% elif albums %}
+        <p>{{ "Choose source albums" if kind == "icloud" else "Choose a destination album" }}</p>
+        <div class="album-chips">
+            {% for album in albums %}
+                {% if kind == "icloud" %}
+                <button type="button" onclick='addSourceAlbum({{ album|tojson }})'>+ {{ album }}</button>
+                {% else %}
+                <button type="button" onclick='chooseGoogleAlbum({{ album|tojson }})'>{{ album }}</button>
+                {% endif %}
+            {% endfor %}
+        </div>
+    {% else %}
+        <p>No {{ "iCloud" if kind == "icloud" else "app-created Google" }} albums were found.</p>
+    {% endif %}
+</div>

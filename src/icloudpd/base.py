@@ -259,14 +259,19 @@ def create_logger(config: GlobalConfig) -> logging.Logger:
     return logger
 
 
-def run_with_configs(global_config: GlobalConfig, user_configs: Sequence[UserConfig]) -> int:
+def run_with_configs(
+    global_config: GlobalConfig,
+    user_configs: Sequence[UserConfig],
+    status_exchange: StatusExchange | None = None,
+    start_web_server: bool = True,
+) -> int:
     """Run the application with the new configuration system"""
 
     # Create shared logger
     logger = create_logger(global_config)
 
     # Create shared status exchange for web server and progress tracking
-    shared_status_exchange = StatusExchange()
+    shared_status_exchange = status_exchange or StatusExchange()
 
     # Check if any user needs web server (webui for MFA or passwords)
     needs_web_server = global_config.mfa_provider == MFAProvider.WEBUI or any(
@@ -274,7 +279,7 @@ def run_with_configs(global_config: GlobalConfig, user_configs: Sequence[UserCon
     )
 
     # Start web server ONCE if needed, outside all loops
-    if needs_web_server:
+    if needs_web_server and start_web_server:
         logger.info("Starting web server for WebUI authentication...")
         server_thread = Thread(target=serve_app, daemon=True, args=[logger, shared_status_exchange])
         server_thread.start()
@@ -422,6 +427,16 @@ def _process_all_users_once(
                 filename_builder,
             )
 
+            # Initialize Google Photos uploader if enabled
+            from icloudpd.google_photos_sync import build_google_photos_uploader
+
+            google_photos_uploader = build_google_photos_uploader(
+                user_config.google_photos_credentials,
+                user_config.google_photos_album_mapping,
+                logger,
+                user_config.google_photos_sync,
+            )
+
             downloader = (
                 partial(
                     download_builder,
@@ -440,6 +455,7 @@ def _process_all_users_once(
                     lp_filename_generator,
                     filename_builder,
                     user_config.align_raw,
+                    google_photos_uploader,
                 )
                 if user_config.directory is not None
                 else (lambda _s, _c, _p: DownloadMediaSkipped())
@@ -627,6 +643,8 @@ def download_builder(
     lp_filename_generator: Callable[[str], str],
     filename_builder: Callable[[PhotoAsset], str],
     raw_policy: RawTreatmentPolicy,
+    google_photos_uploader: Callable[[str, str | None], bool] | None,
+    current_album_name: str | None,
     icloud: PyiCloudService,
     counter: Counter,
     photo: PhotoAsset,
@@ -781,6 +799,13 @@ def download_builder(
                         if not dry_run:
                             download.set_utime(download_path, created_date)
                         logger.info("Downloaded %s", truncated_path)
+
+                        # Upload to Google Photos if enabled
+                        if google_photos_uploader and not dry_run:
+                            try:
+                                google_photos_uploader(download_path, current_album_name)
+                            except Exception as e:
+                                logger.error(f"Google Photos upload failed: {e}")
                     case _:
                         # Error ADT - store it
                         last_result = download_result
@@ -860,6 +885,14 @@ def download_builder(
                     match download_result:
                         case DownloadMediaSuccess():
                             logger.info("Downloaded %s", truncated_path)
+
+                            # Upload to Google Photos if enabled
+                            if google_photos_uploader and not dry_run:
+                                try:
+                                    google_photos_uploader(lp_download_path, current_album_name)
+                                except Exception as e:
+                                    logger.error(f"Google Photos upload failed for live photo: {e}")
+
                             # Update last_result to success if it was skipped
                             match last_result:
                                 case DownloadMediaSkipped():
@@ -1253,6 +1286,9 @@ def core_single_run(
                 # Flag to track if we need to retry the whole operation
                 needs_retry = False
                 for photo_album in albums:
+                    # Get current album name for Google Photos sync
+                    current_album_name = photo_album.name if hasattr(photo_album, "name") else None
+
                     photos_enumerator: Iterable[PhotoIterationResult] = photo_album
 
                     # Optional: Only download the x most recent photos.
@@ -1328,7 +1364,7 @@ def core_single_run(
                     now = datetime.datetime.now(get_localzone())
                     # photos_iterator = iter(photos_enumerator)
 
-                    download_photo = partial(downloader, icloud)
+                    download_photo = partial(downloader, current_album_name, icloud)
 
                     try:
                         for item_result in photos_bar:

@@ -1,0 +1,687 @@
+import AppKit
+import Foundation
+import Photos
+
+enum GoogleDestinationMode: String, CaseIterable, Identifiable {
+    case matching
+    case custom
+    case frame
+
+    var id: Self { self }
+    var title: String {
+        switch self {
+        case .matching: "Match Photos album names"
+        case .custom: "Choose custom albums…"
+        case .frame: "Desk photo frame"
+        }
+    }
+}
+
+@MainActor
+final class PhotoRelayViewModel: ObservableObject {
+    @Published var albums: [PhotosAlbum] = []
+    @Published var selectedAlbumIDs: Set<String> = []
+    @Published var exportDirectory: String
+    @Published var skipVideos: Bool { didSet { UserDefaults.standard.set(skipVideos, forKey: "google.skipVideos") } }
+    @Published var skipLivePhotos: Bool { didSet { UserDefaults.standard.set(skipLivePhotos, forKey: "google.skipLivePhotos") } }
+    @Published var googleEnabled = false
+    @Published private(set) var googleConnected: Bool
+    @Published var destinationMode = GoogleDestinationMode.matching
+    @Published var customAlbumMappings: [String: String] = [:]
+    @Published var showsGoogleAlbumPicker = false
+    @Published var googleAlbums: [GoogleAlbum] = []
+    @Published var frameAlbumID: String {
+        didSet { UserDefaults.standard.set(frameAlbumID, forKey: "frameAlbumID") }
+    }
+    @Published var frameAlbumTitle: String {
+        didSet { UserDefaults.standard.set(frameAlbumTitle, forKey: "frameAlbumTitle") }
+    }
+    @Published var syncReview: SyncReview?
+    @Published var showsSyncReview = false
+    @Published private(set) var transferProgress: TransferProgress?
+    @Published var isLoadingAlbums = false
+    @Published private(set) var albumLoadAttempted = false
+    @Published private(set) var albumLoadError: String?
+    @Published private(set) var googleUploadedAssetIDs: Set<String>
+    private var hadPhotosAccess = false
+    private var preparedGoogleItems: [ExportedPhotosItem] = []
+    private var pendingGoogleAssetIDs: Set<String> = []
+
+    func refreshPhotosAccess() {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        let readable = status == .authorized || status == .limited
+        guard !isWorking else { return }
+        if !readable {
+            hadPhotosAccess = false
+            albumLoadAttempted = false
+            albums = []
+            return
+        }
+        if !hadPhotosAccess {
+            hadPhotosAccess = true
+            albumLoadAttempted = false
+        }
+        if !albumLoadAttempted && !isLoadingAlbums { loadAlbums() }
+    }
+    @Published var isWorking = false { didSet { if !isWorking { backend.stop() } } }
+    @Published private(set) var isAborting = false
+    @Published private var activeUploadID: String?
+    var canAbortUpload: Bool { isWorking && activeUploadID != nil }
+    @Published var activity = "Choose albums to begin."
+    @Published var errorMessage: String?
+    @Published var showsAccessRecovery = false
+    @Published var accessRecoveryMessage = ""
+    private var googleNeedsRecovery = false
+    private var startupAccessChecked = false
+
+    func checkStartupAccess() async {
+        guard !startupAccessChecked, !isWorking else { return }
+        startupAccessChecked = true
+        await checkGoogleAccess()
+        let photosMissing = PHPhotoLibrary.authorizationStatus(for: .readWrite) != .authorized
+        var missing: [String] = []
+        if photosMissing { missing.append("Allow full Photos library access for Moments.") }
+        if googleNeedsRecovery {
+            missing.append("Reconnect Google for Photos sync and album updates.")
+        }
+        accessRecoveryMessage = missing.joined(separator: "\n\n")
+        showsAccessRecovery = !missing.isEmpty
+    }
+
+    func recoverAccess() async {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if status == .notDetermined {
+            _ = await PHPhotoLibrary.requestAuthorization(for: .readWrite)
+        } else if status == .denied || status == .limited {
+            if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos") {
+                NSWorkspace.shared.open(url)
+            }
+        }
+        NotificationCenter.default.post(name: .photoRelayPhotosAccessChanged, object: nil)
+        refreshPhotosAccess()
+        if googleNeedsRecovery { await checkGoogleAccess(interactive: true) }
+    }
+
+    func checkGoogleAccess(interactive: Bool = false) async {
+        guard !isWorking, !googleCredentials.isEmpty else { return }
+        isWorking = true
+        defer { isWorking = false }
+        do {
+            let csrf = try await fetchCSRFToken()
+            var request = URLRequest(url: backend.dashboardURL.appendingPathComponent("google-access"))
+            request.httpMethod = "POST"
+            request.timeoutInterval = interactive ? 330 : 40
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(csrf, forHTTPHeaderField: "X-CSRF-Token")
+            request.httpBody = try JSONSerialization.data(withJSONObject: [
+                "credentials": googleCredentials, "interactive": interactive
+            ])
+            let (data, response) = try await backend.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200,
+                  let result = try JSONSerialization.jsonObject(with: data) as? [String: String],
+                  let status = result["status"] else { throw RelayError.noResponse }
+            googleNeedsRecovery = status == "needs_connection"
+            if status != "unavailable" {
+                googleConnected = status == "connected"
+            }
+        } catch {
+            // A transient check failure must not clear the saved login or force consent.
+        }
+    }
+
+    private let backend: BackendController
+    private let photosSource = PhotosLibrarySource()
+    private let googleCredentials: String
+    private let albumMapping: String
+
+    init(backend: BackendController) {
+        self.backend = backend
+        let defaults = UserDefaults.standard
+        frameAlbumID = defaults.string(forKey: "frameAlbumID") ?? ""
+        frameAlbumTitle = defaults.string(forKey: "frameAlbumTitle") ?? "Desk Travels"
+        skipVideos = defaults.object(forKey: "google.skipVideos") as? Bool ?? true
+        skipLivePhotos = defaults.object(forKey: "google.skipLivePhotos") as? Bool ?? true
+        if defaults.bool(forKey: "usesDeskFrame") { destinationMode = .frame }
+        exportDirectory = defaults.string(forKey: "exportDirectory")
+            ?? FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Pictures/Photo Relay").path
+        googleCredentials = Self.prepareGoogleCredentials(defaults: defaults)
+        albumMapping = defaults.string(forKey: "albumMapping")
+            ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Photo Relay/album_mapping.json").path
+        googleConnected = Self.hasGoogleToken(for: googleCredentials)
+        googleUploadedAssetIDs = Set(defaults.stringArray(forKey: "google.uploadedAssetIDs.v1") ?? [])
+        pendingGoogleAssetIDs = Set(defaults.stringArray(forKey: "google.pendingAssetIDs.v1") ?? [])
+    }
+
+    var selectedCount: Int { selectedAlbumIDs.count }
+    var canStart: Bool {
+        !isWorking && !selectedAlbumIDs.isEmpty && !exportDirectory.isEmpty
+            && (!googleEnabled || (googleConnected && hasCompleteDestinationMapping))
+    }
+
+    var selectedAlbumNames: [String] {
+        Array(Set(albums.filter { selectedAlbumIDs.contains($0.id) }.map(\.title))).sorted()
+    }
+
+    var hasCompleteDestinationMapping: Bool {
+        if destinationMode == .frame {
+            return !frameAlbumID.isEmpty || !frameAlbumTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        return destinationMode == .matching
+            || selectedAlbumNames.allSatisfy { customAlbumMappings[$0]?.isEmpty == false }
+    }
+
+    func loadAlbums() {
+        guard !isLoadingAlbums, !isWorking else { return }
+        albumLoadAttempted = true
+        albumLoadError = nil
+        isLoadingAlbums = true
+        activity = "Reading your Photos library…"
+        photosSource.listAlbums { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.isLoadingAlbums = false
+                switch result {
+                case .success(let albums):
+                    let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+                    guard status == .authorized || status == .limited else {
+                        self.refreshPhotosAccess()
+                        return
+                    }
+                    self.albums = albums
+                    self.hadPhotosAccess = true
+                    self.selectedAlbumIDs.formIntersection(Set(albums.map(\.id)))
+                    if !self.isWorking { self.activity = "Choose the albums you want to export." }
+                case .failure(let error):
+                    self.albumLoadError = error.localizedDescription
+                    if !self.isWorking { self.activity = "Could not load Photos albums. Retry in the sidebar." }
+                }
+            }
+        }
+    }
+
+    func toggleAlbum(_ album: PhotosAlbum) {
+        guard !isWorking else { return }
+        if selectedAlbumIDs.contains(album.id) {
+            selectedAlbumIDs.remove(album.id)
+        } else {
+            selectedAlbumIDs.insert(album.id)
+        }
+    }
+
+    func clearSelection() {
+        guard !isWorking else { return }
+        selectedAlbumIDs.removeAll()
+    }
+
+    func chooseExportDirectory() {
+        let panel = NSOpenPanel()
+        panel.title = "Choose Export Folder"
+        panel.prompt = "Choose"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = URL(fileURLWithPath: exportDirectory, isDirectory: true)
+        guard panel.runModal() == .OK, let path = panel.url?.path else { return }
+        exportDirectory = path
+        UserDefaults.standard.set(path, forKey: "exportDirectory")
+    }
+
+    func signInToGoogle(showAlbumPicker: Bool = false) {
+        guard !isWorking else { return }
+        guard !googleCredentials.isEmpty else {
+            errorMessage = "Google sign-in is not configured in this build of Photo Relay."
+            return
+        }
+        isWorking = true
+        activity = "Connecting to Google Photos in your browser…"
+        Task {
+            do {
+                let csrf = try await fetchCSRFToken()
+                var request = URLRequest(url: backend.dashboardURL.appendingPathComponent("frame-albums"))
+                request.httpMethod = "POST"
+                request.timeoutInterval = 330
+                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                request.setValue(csrf, forHTTPHeaderField: "X-CSRF-Token")
+                request.httpBody = try JSONSerialization.data(
+                    withJSONObject: ["credentials": googleCredentials]
+                )
+                let (data, response) = try await backend.data(for: request)
+                guard let http = response as? HTTPURLResponse else { throw RelayError.noResponse }
+                let result = try JSONDecoder().decode(GoogleAlbumsResponse.self, from: data)
+                guard http.statusCode == 200 else {
+                    throw RelayError.message(result.error ?? "Google Photos could not be connected.")
+                }
+                googleAlbums = result.albums ?? []
+                googleConnected = true
+                if showAlbumPicker {
+                    showsGoogleAlbumPicker = true
+                }
+                activity = googleAlbums.isEmpty
+                    ? "Google Photos is connected. No app-created albums exist yet."
+                    : "Google Photos is connected."
+            } catch {
+                googleConnected = false
+                errorMessage = error.localizedDescription
+                activity = "Google Photos connection failed."
+            }
+            isWorking = false
+        }
+    }
+
+    func chooseCustomGoogleAlbums() {
+        guard googleConnected else { return }
+        if googleAlbums.isEmpty {
+            signInToGoogle(showAlbumPicker: true)
+        } else {
+            showsGoogleAlbumPicker = true
+        }
+    }
+
+    func startSync() {
+        guard canStart else { return }
+        let selections = albums
+            .filter { selectedAlbumIDs.contains($0.id) }
+            .map { PhotosAlbumSelection(id: $0.id, title: $0.title) }
+        guard !selections.isEmpty else { return }
+        isWorking = true
+        transferProgress = nil
+        UserDefaults.standard.set(destinationMode == .frame, forKey: "usesDeskFrame")
+        activity = "Preparing your Photos library…"
+        photosSource.export(
+            selections: selections,
+            directory: exportDirectory,
+            skipVideos: skipVideos,
+            skipLivePhotos: skipLivePhotos,
+            recent: nil,
+            dryRun: false,
+            progress: { [weak self] message in
+                DispatchQueue.main.async { self?.activity = message }
+            }
+        ) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let items):
+                    self.activity = "Exported \(items.count) item(s). Preparing destination…"
+                    Task { await self.startUpload(items: items) }
+                case .failure(let error):
+                    self.isWorking = false
+                    self.errorMessage = error.localizedDescription
+                    self.activity = "Export failed."
+                }
+            }
+        }
+    }
+
+    func startMomentSync(moments: [PhotoMoment], decisions: MomentReviewDecisions, favoritesOnly: Bool) {
+        guard !isWorking, googleConnected else { return }
+        var ids: [String] = []
+        if moments.isEmpty, favoritesOnly {
+            let options = PHFetchOptions()
+            options.predicate = NSCompoundPredicate(andPredicateWithSubpredicates: [
+                NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue),
+                NSPredicate(format: "favorite == YES")
+            ])
+            options.includeHiddenAssets = false
+            PHAsset.fetchAssets(with: options).enumerateObjects { asset, _, _ in
+                ids.append(asset.localIdentifier)
+            }
+        }
+        for moment in moments {
+            let selected: [String]
+            if favoritesOnly {
+                let candidateIDs = moment.photos.map(\.id)
+                let current = PHAsset.fetchAssets(withLocalIdentifiers: candidateIDs, options: nil)
+                var favorites: [String] = []
+                current.enumerateObjects { asset, _, _ in
+                    if asset.isFavorite { favorites.append(asset.localIdentifier) }
+                }
+                selected = favorites
+            } else if let selection = moment.selection {
+                selected = MomentReviewDecisions.apply(decisions.values, to: selection, photos: moment.photos).selected
+            } else {
+                selected = moment.photos.map(\.id)
+            }
+            ids.append(contentsOf: selected)
+        }
+        ids = Array(Set(ids))
+        guard !ids.isEmpty else {
+            errorMessage = favoritesOnly
+                ? (moments.isEmpty ? "Your Photos library contains no Favorites." : "The selected Moments contain no Photos Favorites.")
+                : "The selected Moments contain no highlights."
+            return
+        }
+        googleEnabled = true
+        clearPendingGoogleAssets()
+        destinationMode = .frame
+        isWorking = true
+        transferProgress = nil
+        activity = "Preparing selected Moments for Google Photos…"
+        let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Photo Curator/Google Staging", isDirectory: true).path
+        photosSource.export(assetIDs: ids, albumTitle: "Selected Moments", directory: cache,
+            skipVideos: skipVideos, skipLivePhotos: skipLivePhotos,
+            progress: { [weak self] message in DispatchQueue.main.async { self?.activity = message } }) { [weak self] result in
+                DispatchQueue.main.async {
+                    guard let self else { return }
+                    switch result {
+                    case .success(let items): Task { await self.startUpload(items: items) }
+                    case .failure(let error):
+                        self.isWorking = false
+                        self.errorMessage = error.localizedDescription
+                        self.activity = "Could not prepare selected Moments."
+                    }
+                }
+            }
+    }
+
+    func clearGoogleAlbum(id: String) {
+        guard googleConnected, !isWorking, !id.isEmpty else { return }
+        isWorking = true
+        activity = "Clearing the Google Photos album…"
+        Task {
+            do {
+                let data = try await post("clear-google-album", body: [
+                    "credentials": googleCredentials,
+                    "album_id": id,
+                ])
+                let result = try JSONDecoder().decode(GoogleAlbumClearResponse.self, from: data)
+                googleAlbums = googleAlbums.map { album in
+                    album.id == id
+                        ? GoogleAlbum(id: album.id, title: album.title,
+                                      mediaItemsCount: String(max(0, album.count - result.removed)))
+                        : album
+                }
+                activity = "Cleared \(result.removed) photo(s) from the Google album. The photos remain in your library."
+            } catch {
+                errorMessage = error.localizedDescription
+                activity = "Could not clear the Google Photos album."
+            }
+            isWorking = false
+        }
+    }
+
+    private func startUpload(items: [ExportedPhotosItem]) async {
+        do {
+            if !googleEnabled {
+                isWorking = false
+                activity = "Export complete: \(items.count) item(s)."
+                return
+            }
+            let encodedItems = items.map { ["path": $0.path, "album": $0.album] }
+            preparedGoogleItems = items
+            var destinations: [String: [String: String]] = [:]
+            for source in Set(items.map(\.album)) {
+                switch destinationMode {
+                case .matching: destinations[source] = ["title": source]
+                case .custom:
+                    guard let id = customAlbumMappings[source] else {
+                        throw RelayError.message("Choose a Google destination for \(source).")
+                    }
+                    destinations[source] = ["id": id]
+                case .frame:
+                    destinations[source] = frameAlbumID.isEmpty
+                        ? ["title": frameAlbumTitle.trimmingCharacters(in: .whitespacesAndNewlines)]
+                        : ["id": frameAlbumID]
+                }
+            }
+            let body: [String: Any] = [
+                "items": encodedItems,
+                "credentials": googleCredentials,
+                "destinations": destinations,
+            ]
+            activity = "Checking your Google destination before making changes…"
+            let data = try await post("prepare-frame-sync", body: body)
+            syncReview = try JSONDecoder().decode(SyncReview.self, from: data)
+            showsSyncReview = true
+            activity = "Review how to update your Google album."
+        } catch {
+            isWorking = false
+            errorMessage = error.localizedDescription
+            activity = "Sync failed."
+        }
+    }
+
+    func cancelSyncReview() {
+        showsSyncReview = false
+        syncReview = nil
+        preparedGoogleItems = []
+        clearPendingGoogleAssets()
+        isWorking = false
+        StorageMaintenance.removeGoogleStaging()
+        activity = "Sync canceled. Temporary files were removed; Google Photos was not changed."
+    }
+
+    func confirmSync(replace: Bool, skipUnresolved: Bool) {
+        guard let review = syncReview else { return }
+        let unresolved = Set(review.unresolvedFiles ?? [])
+        pendingGoogleAssetIDs = Set(preparedGoogleItems.compactMap { item in
+            guard !skipUnresolved || !unresolved.contains(item.path) else { return nil }
+            return item.assetID
+        })
+        UserDefaults.standard.set(Array(pendingGoogleAssetIDs), forKey: "google.pendingAssetIDs.v1")
+        showsSyncReview = false
+        syncReview = nil
+        activity = "Starting Google Photos sync…"
+        Task {
+            do {
+                _ = try await post("start-frame-sync", body: ["token": review.token, "mode": replace ? "replace" : "append", "skip_unresolved": skipUnresolved])
+                activeUploadID = review.token
+                await monitorUpload(expectedRunID: review.token)
+            } catch let error as RelayError {
+                isWorking = false
+                clearPendingGoogleAssets()
+                errorMessage = error.localizedDescription
+                activity = "Sync did not start. Review the selection again."
+            } catch {
+                // A lost start response does not mean the upload failed to start.
+                activity = "Checking whether Google Photos sync started…"
+                await monitorUpload(expectedRunID: review.token)
+            }
+        }
+    }
+
+    func restoreUploadIfNeeded() async {
+        guard !isWorking else { return }
+        guard let (data, _) = try? await backend.data(from: backend.dashboardURL.appendingPathComponent("control-state")),
+              let state = try? JSONDecoder().decode(ControlState.self, from: data), state.running else { return }
+        isWorking = true
+        await monitorUpload()
+    }
+
+    func abortUpload() {
+        guard canAbortUpload, !isAborting, let token = activeUploadID else { return }
+        isAborting = true
+        activity = "Aborting; waiting for any in-flight Google request to finish…"
+        Task {
+            do {
+                _ = try await post("abort-frame-sync", body: ["token": token])
+            } catch {
+                isAborting = false
+                if isWorking {
+                    errorMessage = "Could not confirm the abort request: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    private func post(_ endpoint: String, body: [String: Any]) async throws -> Data {
+        let encodedBody = try JSONSerialization.data(withJSONObject: body)
+        for attempt in 0..<2 {
+            var request = URLRequest(url: backend.dashboardURL.appendingPathComponent(endpoint))
+            request.httpMethod = "POST"
+            request.timeoutInterval = 360
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue(try await fetchCSRFToken(), forHTTPHeaderField: "X-CSRF-Token")
+            request.httpBody = encodedBody
+            let (data, response) = try await backend.data(for: request)
+            guard let http = response as? HTTPURLResponse else { throw RelayError.noResponse }
+            if (200..<300).contains(http.statusCode) { return data }
+            // A restarted helper has a new CSRF token. Refresh once without repeating
+            // remote work: rejected requests never reach the route handler.
+            if http.statusCode == 403, attempt == 0 { continue }
+            let message = (try? JSONDecoder().decode(ServiceError.self, from: data))?.error
+            throw RelayError.message(message ?? Self.serviceFailureMessage(status: http.statusCode))
+        }
+        throw RelayError.message("The local sync service could not verify this request. Try again.")
+    }
+
+    private static func serviceFailureMessage(status: Int) -> String {
+        switch status {
+        case 403:
+            "The local sync service could not verify this request. Try again."
+        case 413:
+            "This selection is too large for the local sync service. Select fewer photos and try again."
+        default:
+            "The local sync service could not complete the request (error \(status))."
+        }
+    }
+
+    private func monitorUpload(expectedRunID: String? = nil) async {
+        defer {
+            activeUploadID = nil
+            isAborting = false
+        }
+        while true {
+            try? await Task.sleep(for: .seconds(1))
+            do {
+                let (data, _) = try await backend.data(
+                    from: backend.dashboardURL.appendingPathComponent("control-state")
+                )
+                let state = try JSONDecoder().decode(ControlState.self, from: data)
+                if let expectedRunID, state.progress?.runID != expectedRunID {
+                    if state.running {
+                        activity = "Waiting for the local service to identify this sync…"
+                        continue
+                    }
+                    isWorking = false
+                    clearPendingGoogleAssets()
+                    activity = "This sync was not confirmed. Review the selection and try again."
+                    return
+                }
+                transferProgress = state.progress
+                activeUploadID = state.progress?.runID
+                if state.progress?.phase == "aborting" { isAborting = true }
+                if let progress = state.progress { activity = progress.message }
+                if state.running { continue }
+                isWorking = false
+                StorageMaintenance.removeGoogleStaging()
+                if state.progress?.phase == "aborted" {
+                    clearPendingGoogleAssets()
+                    activity = "Upload aborted. Completed changes were kept; remaining work was stopped."
+                } else if let error = state.error {
+                    clearPendingGoogleAssets()
+                    errorMessage = error
+                    activity = "Google Photos upload failed."
+                } else if state.lastExitCode == 0 {
+                    googleUploadedAssetIDs.formUnion(pendingGoogleAssetIDs)
+                    UserDefaults.standard.set(Array(googleUploadedAssetIDs), forKey: "google.uploadedAssetIDs.v1")
+                    clearPendingGoogleAssets()
+                    activity = state.progress?.message ?? "Google album updated."
+                    if destinationMode == .frame, let destination = state.progress?.destinations?.first {
+                        frameAlbumID = destination.id
+                        frameAlbumTitle = destination.title
+                    }
+                } else {
+                    clearPendingGoogleAssets()
+                    activity = "No active sync. Review your selection and try again."
+                }
+                return
+            } catch {
+                activity = "Reconnecting to the local sync service. Your upload may still be running…"
+            }
+        }
+    }
+
+    func momentWasUploaded(_ assetIDs: [String]) -> Bool {
+        !assetIDs.isEmpty && Set(assetIDs).isSubset(of: googleUploadedAssetIDs)
+    }
+
+    private func clearPendingGoogleAssets() {
+        pendingGoogleAssetIDs = []
+        preparedGoogleItems = []
+        UserDefaults.standard.removeObject(forKey: "google.pendingAssetIDs.v1")
+    }
+
+    private func fetchCSRFToken() async throws -> String {
+        let (data, _) = try await backend.data(
+            from: backend.dashboardURL.appendingPathComponent("auth-state")
+        )
+        return try JSONDecoder().decode(AuthState.self, from: data).csrfToken
+    }
+
+    private static func prepareGoogleCredentials(defaults: UserDefaults) -> String {
+        if let saved = defaults.string(forKey: "googleCredentials"),
+           FileManager.default.fileExists(atPath: saved) {
+            return saved
+        }
+        let supportDirectory = FileManager.default.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        )[0].appendingPathComponent("Photo Relay", isDirectory: true)
+        let destination = supportDirectory.appendingPathComponent("google_credentials.json")
+        if !FileManager.default.fileExists(atPath: destination.path),
+           let bundled = Bundle.main.resourceURL?
+               .appendingPathComponent("Google", isDirectory: true)
+               .appendingPathComponent("google_credentials.json"),
+           FileManager.default.fileExists(atPath: bundled.path) {
+            try? FileManager.default.createDirectory(
+                at: supportDirectory,
+                withIntermediateDirectories: true
+            )
+            try? FileManager.default.copyItem(at: bundled, to: destination)
+        }
+        return FileManager.default.fileExists(atPath: destination.path) ? destination.path : ""
+    }
+
+    private static func hasGoogleToken(for credentials: String) -> Bool {
+        guard !credentials.isEmpty else { return false }
+        let url = URL(fileURLWithPath: credentials)
+        let token = url.deletingLastPathComponent().appendingPathComponent(
+            "\(url.deletingPathExtension().lastPathComponent)_token.\(url.pathExtension)"
+        )
+        guard let data = try? Data(contentsOf: token),
+              let contents = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let refreshToken = contents["refresh_token"] as? String else { return false }
+        return !refreshToken.isEmpty
+    }
+}
+
+private struct AuthState: Decodable {
+    let csrfToken: String
+    enum CodingKeys: String, CodingKey { case csrfToken = "csrf_token" }
+}
+
+private struct GoogleAlbumsResponse: Decodable {
+    let albums: [GoogleAlbum]?
+    let error: String?
+}
+
+private struct ControlState: Decodable {
+    let running: Bool
+    let lastExitCode: Int?
+    let error: String?
+    let progress: TransferProgress?
+    enum CodingKeys: String, CodingKey {
+        case running, error, progress
+        case lastExitCode = "last_exit_code"
+    }
+}
+
+private struct ServiceError: Decodable {
+    let error: String?
+}
+
+private enum RelayError: LocalizedError {
+    case noResponse
+    case message(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noResponse: "The local Photo Relay service did not respond."
+        case .message(let message): message
+        }
+    }
+}

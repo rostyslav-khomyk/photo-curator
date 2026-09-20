@@ -121,3 +121,12 @@ class StatusExchange:
     def clear_current_user(self) -> None:
         with self.lock:
             self._current_user = None
+
+    def reset_for_run(self) -> None:
+        """Clear transient authentication and progress state before a new run."""
+        with self.lock:
+            self._status = Status.NO_INPUT_NEEDED
+            self._payload = None
+            self._error = None
+            self._current_user = None
+            self._progress.reset()

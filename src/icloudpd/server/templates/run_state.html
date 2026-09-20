@@ -1,0 +1,10 @@
+{% if control and control.running %}
+<span class="run-pill active"><span></span> Running</span>
+{% elif control and control.last_exit_code == 0 %}
+<span class="run-pill complete"><span></span> Complete</span>
+{% elif control and control.last_exit_code != None %}
+<span class="run-pill failed"><span></span> Needs attention</span>
+{% if control.error %}<p class="run-error">{{ control.error }}</p>{% endif %}
+{% else %}
+<span class="run-pill"><span></span> Ready</span>
+{% endif %}
