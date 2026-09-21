@@ -1,5 +1,22 @@
 # Background Curator: Development Record
 
+## Architecture stabilization review (2026-09-21)
+
+- Reviewed the full development record, product plan, evaluation documents, current Swift source,
+  real application storage, compiler concurrency diagnostics, and current Apple/Swift guidance.
+- The real catalog contains 108,999 photos and 5,224 Moments. Curator state occupies about 2.7 GB,
+  including 1.37 GB of Vision results, a 57 MB all-in-one Moments snapshot, and more than 340,000
+  small context/OCR files. Decoding the catalog alone peaked at about 227 MB in an independent probe.
+- Complete strict-concurrency checking succeeds with four unique warning sites. The recurring failures
+  are therefore diagnosed primarily as ownership and consistency failures above the data-race level:
+  fragmented durable state, whole-catalog projections, implicit timer scheduling, and nontransactional
+  PhotoKit effects coordinated through refreshes and timing flags.
+- Wrote [`ARCHITECTURE_STABILIZATION_PLAN.md`](ARCHITECTURE_STABILIZATION_PLAN.md), proposing one
+  SQLite authority, compact Moment summaries with detail-on-demand, explicit subsystem actors,
+  event-driven durable jobs, recoverable publication sagas, a nondestructive migration, a safe
+  nuclear reset, measured responsiveness gates, and closed-alpha qualification. No application
+  behavior was changed.
+
 ## Full-History Catalog and Background Progress Fix (2026-09-21)
 
 Resolved the apparent 2021 cutoff after a seven-day unattended run. The SQLite index
@@ -1899,3 +1916,24 @@ Photos access, network research or private-photo inspection in this subchunk.
   selected app-created album and verifies the result. Photos remain in the Google Photos library;
   inaccessible items remain untouched. The supported Google Photos API does not offer account-wide
   media deletion, so Photo Curator does not claim to provide it.
+
+## Holistic library curation audit (2026-09-21)
+
+- Audited the full current catalog as one family photographic history: 108,999 photos, 5,224 Moments,
+  and 14,279 highlights.
+- The flat catalog is polarized. Moments of at most three photos are 56.6% of all Moments but only
+  4.3% of photos; Moments over 100 photos are 5.1% of Moments but hold 63.9% of photos.
+- Capture density is strongly seasonal. July and August hold 41.1% of photos and average about 49-62
+  photos per active shooting day, versus about 12-16 in several quieter months. Historical GPS
+  availability also varies sharply and cannot be treated as a stable absence signal.
+- Added `HOLISTIC_LIBRARY_AUDIT_2026-09-21.md` and expanded the stabilization plan with a minimal
+  `Story -> Moment -> Highlight` hierarchy, adaptive local-density boundaries, hierarchical highlight
+  budgets, a Library Overview, and measurable shadow curation generations.
+- Maintenance is now separated into a normal versioned curation rebuild, full evidence reanalysis,
+  and the destructive clean-room reset. This preserves a convenient full rerun without making catalog
+  deletion the algorithm-development workflow.
+- Research-alignment review tightened the plan: Stories are optional and evidence-gated; calendar,
+  season, and place are views rather than semantic Stories; seasonality cannot change event
+  boundaries; false joins cost more than false splits; highlight dimensions remain separately
+  visible; and an owner-reviewed benchmark is frozen in Phase 0 before migration. Alpha owners judge
+  family meaning while independent reviewers judge engineering and usability.

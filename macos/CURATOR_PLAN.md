@@ -1,5 +1,17 @@
 # Curator Plan
 
+## Architecture stabilization proposal (2026-09-21)
+
+The current product plan is now complemented by
+[`ARCHITECTURE_STABILIZATION_PLAN.md`](ARCHITECTURE_STABILIZATION_PLAN.md). That proposal is the
+authoritative next-work plan for persistence, concurrency ownership, UI responsiveness, migration,
+performance gates, versioned full-library curation, a safe nuclear reset, and closed-alpha
+qualification. The measured family-library baseline and proposed optional
+`Story -> Moment -> Highlight` model are documented in
+[`HOLISTIC_LIBRARY_AUDIT_2026-09-21.md`](HOLISTIC_LIBRARY_AUDIT_2026-09-21.md). Feature work should
+remain paused until the stabilization plan has been independently reviewed and its Phase 0 baseline
+is accepted.
+
 ## Current Checkpoint: Full-Library Moments Are Reachable (2026-09-21)
 
 - The persistent index covers 108,999 Photos assets and is not rebuilt after ordinary app
