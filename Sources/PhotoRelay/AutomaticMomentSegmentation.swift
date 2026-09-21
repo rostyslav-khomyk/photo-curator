@@ -8,7 +8,7 @@ struct AutomaticMomentSegment: Codable {
     var kind: AutomaticMomentSegmentKind? = nil
 }
 
-enum AutomaticMomentSegmentKind: String, Codable { case scene, unresolved }
+enum AutomaticMomentSegmentKind: String, Codable, Sendable { case scene, unresolved }
 
 struct AutomaticMomentRecord: Codable {
     var version = 1

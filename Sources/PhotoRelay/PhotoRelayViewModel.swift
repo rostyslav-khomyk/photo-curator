@@ -178,25 +178,24 @@ final class PhotoRelayViewModel: ObservableObject {
         albumLoadError = nil
         isLoadingAlbums = true
         activity = "Reading your Photos library…"
-        photosSource.listAlbums { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let albums = try await photosSource.listAlbums()
                 self.isLoadingAlbums = false
-                switch result {
-                case .success(let albums):
-                    let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-                    guard status == .authorized || status == .limited else {
-                        self.refreshPhotosAccess()
-                        return
-                    }
-                    self.albums = albums
-                    self.hadPhotosAccess = true
-                    self.selectedAlbumIDs.formIntersection(Set(albums.map(\.id)))
-                    if !self.isWorking { self.activity = "Choose the albums you want to export." }
-                case .failure(let error):
-                    self.albumLoadError = error.localizedDescription
-                    if !self.isWorking { self.activity = "Could not load Photos albums. Retry in the sidebar." }
+                let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+                guard status == .authorized || status == .limited else {
+                    self.refreshPhotosAccess()
+                    return
                 }
+                self.albums = albums
+                self.hadPhotosAccess = true
+                self.selectedAlbumIDs.formIntersection(Set(albums.map(\.id)))
+                if !self.isWorking { self.activity = "Choose the albums you want to export." }
+            } catch {
+                self.isLoadingAlbums = false
+                self.albumLoadError = error.localizedDescription
+                if !self.isWorking { self.activity = "Could not load Photos albums. Retry in the sidebar." }
             }
         }
     }
@@ -289,28 +288,24 @@ final class PhotoRelayViewModel: ObservableObject {
         transferProgress = nil
         UserDefaults.standard.set(destinationMode == .frame, forKey: "usesDeskFrame")
         activity = "Preparing your Photos library…"
-        photosSource.export(
-            selections: selections,
-            directory: exportDirectory,
-            skipVideos: skipVideos,
-            skipLivePhotos: skipLivePhotos,
-            recent: nil,
-            dryRun: false,
-            progress: { [weak self] message in
-                DispatchQueue.main.async { self?.activity = message }
-            }
-        ) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self else { return }
-                switch result {
-                case .success(let items):
-                    self.activity = "Exported \(items.count) item(s). Preparing destination…"
-                    Task { await self.startUpload(items: items) }
-                case .failure(let error):
-                    self.isWorking = false
-                    self.errorMessage = error.localizedDescription
-                    self.activity = "Export failed."
-                }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let items = try await photosSource.export(
+                    selections: selections,
+                    directory: exportDirectory,
+                    skipVideos: skipVideos,
+                    skipLivePhotos: skipLivePhotos,
+                    recent: nil,
+                    dryRun: false,
+                    progress: { [weak self] message in self?.activity = message }
+                )
+                self.activity = "Exported \(items.count) item(s). Preparing destination…"
+                await self.startUpload(items: items)
+            } catch {
+                self.isWorking = false
+                self.errorMessage = error.localizedDescription
+                self.activity = "Export failed."
             }
         }
     }
@@ -361,20 +356,24 @@ final class PhotoRelayViewModel: ObservableObject {
         activity = "Preparing selected Moments for Google Photos…"
         let cache = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Photo Curator/Google Staging", isDirectory: true).path
-        photosSource.export(assetIDs: ids, albumTitle: "Selected Moments", directory: cache,
-            skipVideos: skipVideos, skipLivePhotos: skipLivePhotos,
-            progress: { [weak self] message in DispatchQueue.main.async { self?.activity = message } }) { [weak self] result in
-                DispatchQueue.main.async {
-                    guard let self else { return }
-                    switch result {
-                    case .success(let items): Task { await self.startUpload(items: items) }
-                    case .failure(let error):
-                        self.isWorking = false
-                        self.errorMessage = error.localizedDescription
-                        self.activity = "Could not prepare selected Moments."
-                    }
-                }
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let items = try await photosSource.export(
+                    assetIDs: ids,
+                    albumTitle: "Selected Moments",
+                    directory: cache,
+                    skipVideos: skipVideos,
+                    skipLivePhotos: skipLivePhotos,
+                    progress: { [weak self] message in self?.activity = message }
+                )
+                await self.startUpload(items: items)
+            } catch {
+                self.isWorking = false
+                self.errorMessage = error.localizedDescription
+                self.activity = "Could not prepare selected Moments."
             }
+        }
     }
 
     func clearGoogleAlbum(id: String) {
@@ -598,6 +597,8 @@ final class PhotoRelayViewModel: ObservableObject {
     func momentWasUploaded(_ assetIDs: [String]) -> Bool {
         !assetIDs.isEmpty && Set(assetIDs).isSubset(of: googleUploadedAssetIDs)
     }
+
+    var uploadedGoogleAssetIDs: Set<String> { googleUploadedAssetIDs }
 
     private func clearPendingGoogleAssets() {
         pendingGoogleAssetIDs = []

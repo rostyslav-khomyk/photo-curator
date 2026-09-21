@@ -27,7 +27,7 @@ enum CuratorLocationCoverage {
     }
 }
 
-struct MomentSelection: Codable {
+struct MomentSelection: Codable, Sendable {
     let selected: [String]
     let pending: [String]
     let similar: [String]

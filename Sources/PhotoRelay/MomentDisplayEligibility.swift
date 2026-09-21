@@ -1,7 +1,7 @@
 import Foundation
 
-struct PhotoDisplayEvidence: Codable, Equatable {
-    enum Reason: String, Codable { case screenshot, map, menu, document }
+struct PhotoDisplayEvidence: Codable, Equatable, Sendable {
+    enum Reason: String, Codable, Sendable { case screenshot, map, menu, document }
     static let version = "display-evidence-v1-" + NarrativeVisualContext.version + MomentTextEvidenceStore.engine + CuratorVisionAnalyzer.version
     let revision: String
     let engine: String

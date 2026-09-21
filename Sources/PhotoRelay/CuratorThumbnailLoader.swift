@@ -100,13 +100,28 @@ final class PhotoKitThumbnailProvider: CuratorThumbnailProvider {
         var usingOriginal = false
     }
 
-    private let manager = PHImageManager()
+    private static let gridManager = PHCachingImageManager()
+    private let manager: PHImageManager
     private let allowsNetworkAccess: Bool
     private var reviewRequests: [Int32: ReviewRequest] = [:]
     private var nextReviewRequestID: Int32 = -1000
 
     init(allowsNetworkAccess: Bool = false) {
         self.allowsNetworkAccess = allowsNetworkAccess
+        manager = allowsNetworkAccess ? PHImageManager() : Self.gridManager
+    }
+
+    static func setCaching(_ enabled: Bool, assetIDs: [String], edge: Int) {
+        guard !assetIDs.isEmpty else { return }
+        let assets = PHAsset.fetchAssets(withLocalIdentifiers: assetIDs, options: nil)
+        var values: [PHAsset] = []
+        assets.enumerateObjects { asset, _, _ in values.append(asset) }
+        let size = CGSize(width: edge, height: edge)
+        if enabled {
+            gridManager.startCachingImages(for: values, targetSize: size, contentMode: .aspectFit, options: nil)
+        } else {
+            gridManager.stopCachingImages(for: values, targetSize: size, contentMode: .aspectFit, options: nil)
+        }
     }
 
     func request(assetID: String, edge: Int,

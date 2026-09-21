@@ -1,7 +1,8 @@
 import Foundation
 import SQLite3
+import CryptoKit
 
-struct MomentSummary: Equatable, Sendable {
+struct MomentSummary: Equatable, Sendable, Identifiable {
     let id: String
     let revision: Int
     let start: Date
@@ -10,11 +11,15 @@ struct MomentSummary: Equatable, Sendable {
     let photoCount: Int
     let highlightCount: Int
     let coverAssetID: String?
+    let fallbackCoverAssetIDs: [String]
     let customized: Bool
     let inPhotos: Bool
+    let inGoogle: Bool
+    let narrativeReady: Bool
+    let groupingReady: Bool
 }
 
-struct CatalogV2MigrationInput: @unchecked Sendable {
+struct CatalogV2MigrationInput: Sendable {
     let legacyIndex: URL
     let moments: [PhotoMoment]
     let titles: [String: String]
@@ -77,7 +82,7 @@ enum CatalogV2Migrator {
 }
 
 /// Shadow Phase 1 catalog. It is not read by the shipping workspace until cutover is validated.
-private final class CatalogV2Connection: @unchecked Sendable {
+private final class CatalogV2Connection {
     let db: OpaquePointer
 
     init(url: URL, schema: String) throws {
@@ -97,6 +102,22 @@ private final class CatalogV2Connection: @unchecked Sendable {
                 throw NSError(domain: "PhotoCurator.CatalogV2", code: 1,
                     userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(opened))])
             }
+            for column in ["selection BLOB", "context_source TEXT", "reviewed_group_title TEXT",
+                           "grouping_source TEXT", "grouping_reason TEXT", "grouping_state TEXT",
+                           "grouping_kind TEXT", "display_evidence BLOB", "continuity_reason TEXT",
+                           "fallback_covers BLOB", "fallback_cover_2 TEXT", "fallback_cover_3 TEXT"] {
+                if sqlite3_exec(opened, "ALTER TABLE moments ADD COLUMN \(column);", nil, nil, nil) != SQLITE_OK {
+                    let message = String(cString: sqlite3_errmsg(opened))
+                    guard message.contains("duplicate column name") else {
+                        throw NSError(domain: "PhotoCurator.CatalogV2", code: 1,
+                            userInfo: [NSLocalizedDescriptionKey: message])
+                    }
+                }
+            }
+            guard sqlite3_exec(opened, "PRAGMA user_version=4;", nil, nil, nil) == SQLITE_OK else {
+                throw NSError(domain: "PhotoCurator.CatalogV2", code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(opened))])
+            }
         } catch {
             sqlite3_close(opened)
             throw error
@@ -108,10 +129,13 @@ private final class CatalogV2Connection: @unchecked Sendable {
 }
 
 actor CatalogV2Store {
-    static let schemaVersion = 1
+    static let schemaVersion = 4
     private let connection: CatalogV2Connection
     private var db: OpaquePointer? { connection.db }
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+    private var cachedGoogleAssets = Set<String>()
+    private var cachedReviewDecisions: [String: ReviewDecision] = [:]
+    private var cachedGoogleMoments = Set<String>()
 
     init(url: URL) throws {
         connection = try CatalogV2Connection(url: url, schema: Self.schemaSQL)
@@ -152,29 +176,65 @@ actor CatalogV2Store {
         }
     }
 
-    func summaries() throws -> [MomentSummary] {
+    func prepareWorkspace(_ input: CatalogV2MigrationInput) throws {
+        guard try scalar("SELECT COUNT(*) FROM schema_migrations WHERE name='workspace-v4' AND completed=1") == 0 else {
+            return
+        }
+        try synchronize(moments: input.moments, activeMomentIDs: Set(input.moments.map(\.id)))
+        try execute("INSERT INTO schema_migrations(name,completed_at,completed) VALUES('workspace-v4',strftime('%s','now'),1)")
+    }
+
+    func summaries(googleUploadedAssetIDs: Set<String> = [],
+                   reviewDecisions: [String: ReviewDecision] = [:]) throws -> [MomentSummary] {
         let statement = try prepare("""
             SELECT m.id,m.revision,m.start,m.end,COALESCE(e.title,m.headline),m.photo_count,m.highlight_count,
-                   m.cover_asset_id,e.moment_id IS NOT NULL,p.moment_id IS NOT NULL
+                   m.cover_asset_id,m.fallback_cover_2,m.fallback_cover_3,
+                   e.moment_id IS NOT NULL,p.moment_id IS NOT NULL,
+                   m.narrative IS NOT NULL,COALESCE(m.grouping_state,'') NOT IN ('','preparing')
             FROM moments m LEFT JOIN moment_edits e ON e.moment_id=m.id
             LEFT JOIN publications p ON p.moment_id=m.id ORDER BY m.start DESC,m.id
             """)
         defer { sqlite3_finalize(statement) }
         var result: [MomentSummary] = []
         while sqlite3_step(statement) == SQLITE_ROW {
-            result.append(MomentSummary(id: text(statement, 0), revision: Int(sqlite3_column_int64(statement, 1)),
+            let id = text(statement, 0)
+            result.append(MomentSummary(id: id, revision: Int(sqlite3_column_int64(statement, 1)),
                 start: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)),
                 end: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3)),
                 headline: optionalText(statement, 4), photoCount: Int(sqlite3_column_int64(statement, 5)),
                 highlightCount: Int(sqlite3_column_int64(statement, 6)), coverAssetID: optionalText(statement, 7),
-                customized: sqlite3_column_int(statement, 8) != 0, inPhotos: sqlite3_column_int(statement, 9) != 0))
+                fallbackCoverAssetIDs: [optionalText(statement, 7), optionalText(statement, 8),
+                    optionalText(statement, 9)].compactMap { $0 },
+                customized: sqlite3_column_int(statement, 10) != 0, inPhotos: sqlite3_column_int(statement, 11) != 0,
+                inGoogle: false, narrativeReady: sqlite3_column_int(statement, 12) != 0,
+                groupingReady: sqlite3_column_int(statement, 13) != 0))
         }
-        return result
+        guard !googleUploadedAssetIDs.isEmpty else { return result }
+        let uploadedMomentIDs: Set<String>
+        if googleUploadedAssetIDs == cachedGoogleAssets, reviewDecisions == cachedReviewDecisions {
+            uploadedMomentIDs = cachedGoogleMoments
+        } else {
+            uploadedMomentIDs = try googleUploadedMoments(assetIDs: googleUploadedAssetIDs,
+                                                          decisions: reviewDecisions)
+            cachedGoogleAssets = googleUploadedAssetIDs
+            cachedReviewDecisions = reviewDecisions
+            cachedGoogleMoments = uploadedMomentIDs
+        }
+        return result.map { value in
+            MomentSummary(id: value.id, revision: value.revision, start: value.start, end: value.end,
+                headline: value.headline, photoCount: value.photoCount, highlightCount: value.highlightCount,
+                coverAssetID: value.coverAssetID, fallbackCoverAssetIDs: value.fallbackCoverAssetIDs,
+                customized: value.customized, inPhotos: value.inPhotos,
+                inGoogle: uploadedMomentIDs.contains(value.id), narrativeReady: value.narrativeReady,
+                groupingReady: value.groupingReady)
+        }
     }
 
     func detail(momentID: String) throws -> PhotoMoment? {
         let moment = try prepare("""
-            SELECT m.start,m.end,m.narrative,p.album_id,p.published_at FROM moments m
+            SELECT m.start,m.end,m.narrative,p.album_id,p.published_at,m.selection,m.context_source,
+                   m.reviewed_group_title,m.grouping_source,m.grouping_reason,m.grouping_state,m.grouping_kind,
+                   m.display_evidence,m.continuity_reason FROM moments m
             LEFT JOIN publications p ON p.moment_id=m.id WHERE m.id=?
             """)
         defer { sqlite3_finalize(moment) }
@@ -192,11 +252,63 @@ actor CatalogV2Store {
         }
         let narrative: MomentNarrative? = sqlite3_column_type(moment, 2) == SQLITE_NULL
             ? nil : try JSONDecoder().decode(MomentNarrative.self, from: blob(moment, 2))
+        let decoder = JSONDecoder()
+        let selection: MomentSelection? = sqlite3_column_type(moment, 5) == SQLITE_NULL
+            ? nil : try decoder.decode(MomentSelection.self, from: blob(moment, 5))
+        let evidence: [String: PhotoDisplayEvidence]? = sqlite3_column_type(moment, 12) == SQLITE_NULL
+            ? nil : try decoder.decode([String: PhotoDisplayEvidence].self, from: blob(moment, 12))
         return PhotoMoment(id: momentID,
             start: Date(timeIntervalSince1970: sqlite3_column_double(moment, 0)),
             end: Date(timeIntervalSince1970: sqlite3_column_double(moment, 1)), photos: photos,
-            narrative: narrative, publishedAlbumID: optionalText(moment, 3),
+            selection: selection, narrative: narrative, contextSource: optionalText(moment, 6),
+            reviewedGroupTitle: optionalText(moment, 7), groupingSource: optionalText(moment, 8),
+            groupingReason: optionalText(moment, 9),
+            groupingState: optionalText(moment, 10).flatMap(MomentGroupingState.init(rawValue:)),
+            groupingKind: optionalText(moment, 11).flatMap(AutomaticMomentSegmentKind.init(rawValue:)),
+            displayEvidence: evidence, continuityReason: optionalText(moment, 13),
+            publishedAlbumID: optionalText(moment, 3),
             publishedDate: sqlite3_column_type(moment, 4) == SQLITE_NULL ? nil : Date(timeIntervalSince1970: sqlite3_column_double(moment, 4)))
+    }
+
+    /// Mirrors a committed legacy projection while Catalog v2 is the workspace read model.
+    /// The legacy writer is removed in Phase 3; until then this transaction is the cutover boundary.
+    func synchronize(moments: [PhotoMoment], activeMomentIDs: Set<String>? = nil) throws {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            if let activeMomentIDs {
+                let statement = try prepare("SELECT id FROM moments")
+                var stale: [String] = []
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    let id = text(statement, 0)
+                    if !activeMomentIDs.contains(id) { stale.append(id) }
+                }
+                sqlite3_finalize(statement)
+                let remove = try prepare("DELETE FROM moments WHERE id=?")
+                defer { sqlite3_finalize(remove) }
+                for id in stale {
+                    sqlite3_reset(remove); sqlite3_clear_bindings(remove)
+                    sqlite3_bind_text(remove, 1, id, -1, transient)
+                    guard sqlite3_step(remove) == SQLITE_DONE else { throw failure() }
+                }
+            }
+            try upsertMoments(moments)
+            try execute("COMMIT")
+            cachedGoogleAssets.removeAll()
+            cachedReviewDecisions.removeAll()
+            cachedGoogleMoments.removeAll()
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    func markPublished(momentID: String, albumID: String, date: Date) throws {
+        let statement = try prepare("INSERT OR REPLACE INTO publications VALUES(?,?,?)")
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, momentID, -1, transient)
+        sqlite3_bind_text(statement, 2, albumID, -1, transient)
+        sqlite3_bind_double(statement, 3, date.timeIntervalSince1970)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }
     }
 
     func reconcileMomentIdentities(groups: [Set<String>], newID: () -> String = { UUID().uuidString }) throws -> MomentIdentityResolution {
@@ -255,7 +367,10 @@ actor CatalogV2Store {
             CREATE TABLE IF NOT EXISTS moments(
               id TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 1, start REAL NOT NULL, end REAL NOT NULL,
               headline TEXT, narrative BLOB, photo_count INTEGER NOT NULL, highlight_count INTEGER NOT NULL,
-              cover_asset_id TEXT REFERENCES assets(id));
+              cover_asset_id TEXT REFERENCES assets(id),selection BLOB,context_source TEXT,
+              reviewed_group_title TEXT,grouping_source TEXT,grouping_reason TEXT,grouping_state TEXT,
+              grouping_kind TEXT,display_evidence BLOB,continuity_reason TEXT,fallback_covers BLOB,
+              fallback_cover_2 TEXT,fallback_cover_3 TEXT);
             CREATE INDEX IF NOT EXISTS moments_start ON moments(start DESC,id);
             CREATE TABLE IF NOT EXISTS moment_assets(
               moment_id TEXT NOT NULL REFERENCES moments(id) ON DELETE CASCADE,
@@ -279,7 +394,7 @@ actor CatalogV2Store {
               moment_id TEXT PRIMARY KEY REFERENCES moments(id) ON DELETE CASCADE,
               album_id TEXT NOT NULL,published_at REAL);
             CREATE TABLE IF NOT EXISTS schema_migrations(name TEXT PRIMARY KEY,completed_at REAL NOT NULL,completed INTEGER NOT NULL);
-            PRAGMA user_version=1;
+            PRAGMA user_version=4;
             """
 
     private func importAssets() throws {
@@ -295,11 +410,15 @@ actor CatalogV2Store {
     }
 
     private func importMoments(_ moments: [PhotoMoment]) throws {
-        let insertMoment = try prepare("INSERT INTO moments VALUES(?,1,?,?,?,?,?,?,?)")
+        let insertMoment = try prepare("INSERT INTO moments VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         let insertMember = try prepare("INSERT OR IGNORE INTO moment_assets VALUES(?,?,?,?)")
         let insertPublication = try prepare("INSERT INTO publications VALUES(?,?,?)")
-        defer { sqlite3_finalize(insertMoment); sqlite3_finalize(insertMember); sqlite3_finalize(insertPublication) }
-        let encoder = JSONEncoder()
+        let updateRevision = try prepare("UPDATE moments SET revision=? WHERE id=?")
+        defer {
+            sqlite3_finalize(insertMoment); sqlite3_finalize(insertMember)
+            sqlite3_finalize(insertPublication); sqlite3_finalize(updateRevision)
+        }
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
         for moment in moments {
             guard moment.photos.count == Set(moment.photos.map(\.id)).count else {
                 throw failure("Moment \(moment.id) contains duplicate assets")
@@ -314,7 +433,29 @@ actor CatalogV2Store {
             sqlite3_bind_int64(insertMoment, 6, Int64(moment.photos.count))
             sqlite3_bind_int64(insertMoment, 7, Int64(moment.selection?.selected.count ?? 0))
             bind(moment.selection?.selected.first ?? moment.photos.first?.id, to: insertMoment, at: 8)
+            if let selection = moment.selection { bind(try encoder.encode(selection), to: insertMoment, at: 9) }
+            else { sqlite3_bind_null(insertMoment, 9) }
+            bind(moment.contextSource, to: insertMoment, at: 10)
+            bind(moment.reviewedGroupTitle, to: insertMoment, at: 11)
+            bind(moment.groupingSource, to: insertMoment, at: 12)
+            bind(moment.groupingReason, to: insertMoment, at: 13)
+            bind(moment.groupingState?.rawValue, to: insertMoment, at: 14)
+            bind(moment.groupingKind?.rawValue, to: insertMoment, at: 15)
+            if let evidence = moment.displayEvidence { bind(try encoder.encode(evidence), to: insertMoment, at: 16) }
+            else { sqlite3_bind_null(insertMoment, 16) }
+            bind(moment.continuityReason, to: insertMoment, at: 17)
+            let selected = moment.selection?.selected ?? []
+            let fallbackCovers = Array((selected + moment.photos.map(\.id).filter { !selected.contains($0) }).prefix(3))
+            bind(try encoder.encode(fallbackCovers), to: insertMoment, at: 18)
+            bind(fallbackCovers.count > 1 ? fallbackCovers[1] : nil, to: insertMoment, at: 19)
+            bind(fallbackCovers.count > 2 ? fallbackCovers[2] : nil, to: insertMoment, at: 20)
             guard sqlite3_step(insertMoment) == SQLITE_DONE else { throw failure() }
+            let revision = SHA256.hash(data: try encoder.encode(moment)).prefix(8)
+                .reduce(UInt64(0)) { ($0 << 8) | UInt64($1) } & UInt64(Int64.max)
+            sqlite3_reset(updateRevision); sqlite3_clear_bindings(updateRevision)
+            sqlite3_bind_int64(updateRevision, 1, Int64(revision))
+            sqlite3_bind_text(updateRevision, 2, moment.id, -1, transient)
+            guard sqlite3_step(updateRevision) == SQLITE_DONE else { throw failure() }
             let highlights = Set(moment.selection?.selected ?? [])
             for (sequence, photo) in moment.photos.enumerated() {
                 sqlite3_reset(insertMember); sqlite3_clear_bindings(insertMember)
@@ -333,6 +474,65 @@ actor CatalogV2Store {
                 guard sqlite3_step(insertPublication) == SQLITE_DONE else { throw failure() }
             }
         }
+    }
+
+    private func upsertMoments(_ moments: [PhotoMoment]) throws {
+        let encoder = JSONEncoder()
+        let asset = try prepare("""
+            INSERT INTO assets VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(id) DO UPDATE SET
+              created=excluded.created,modified=excluded.modified,latitude=excluded.latitude,
+              longitude=excluded.longitude,favorite=excluded.favorite,width=excluded.width,
+              height=excluded.height,similarity_category=excluded.similarity_category,
+              source_revision=excluded.source_revision,payload=excluded.payload
+            """)
+        let removeMoment = try prepare("DELETE FROM moments WHERE id=?")
+        defer { sqlite3_finalize(asset); sqlite3_finalize(removeMoment) }
+        for moment in moments {
+            for photo in moment.photos {
+                sqlite3_reset(asset); sqlite3_clear_bindings(asset)
+                sqlite3_bind_text(asset, 1, photo.id, -1, transient)
+                if let created = photo.created { sqlite3_bind_double(asset, 2, created.timeIntervalSince1970) } else { sqlite3_bind_null(asset, 2) }
+                if let modified = photo.modified { sqlite3_bind_double(asset, 3, modified.timeIntervalSince1970) } else { sqlite3_bind_null(asset, 3) }
+                if let latitude = photo.latitude { sqlite3_bind_double(asset, 4, latitude) } else { sqlite3_bind_null(asset, 4) }
+                if let longitude = photo.longitude { sqlite3_bind_double(asset, 5, longitude) } else { sqlite3_bind_null(asset, 5) }
+                sqlite3_bind_int(asset, 6, photo.favorite ? 1 : 0)
+                sqlite3_bind_int64(asset, 7, Int64(photo.width)); sqlite3_bind_int64(asset, 8, Int64(photo.height))
+                bind(photo.similarityCategory?.rawValue, to: asset, at: 9)
+                sqlite3_bind_text(asset, 10, photo.analysisRevision, -1, transient)
+                bind(try encoder.encode(photo), to: asset, at: 11)
+                guard sqlite3_step(asset) == SQLITE_DONE else { throw failure() }
+            }
+            sqlite3_reset(removeMoment); sqlite3_clear_bindings(removeMoment)
+            sqlite3_bind_text(removeMoment, 1, moment.id, -1, transient)
+            guard sqlite3_step(removeMoment) == SQLITE_DONE else { throw failure() }
+        }
+        try importMoments(moments)
+    }
+
+    private func googleUploadedMoments(assetIDs: Set<String>, decisions: [String: ReviewDecision]) throws -> Set<String> {
+        let statement = try prepare("""
+            SELECT ma.moment_id,ma.asset_id,ma.display_role,m.selection IS NOT NULL
+            FROM moment_assets ma JOIN moments m ON m.id=ma.moment_id ORDER BY ma.moment_id,ma.sequence
+            """)
+        defer { sqlite3_finalize(statement) }
+        var selected: [String: (count: Int, uploaded: Int)] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let momentID = text(statement, 0), assetID = text(statement, 1)
+            let isSelected: Bool
+            switch decisions[assetID] {
+            case .include: isSelected = true
+            case .exclude: isSelected = false
+            case nil: isSelected = sqlite3_column_int(statement, 3) == 0 || text(statement, 2) == "highlight"
+            }
+            guard isSelected else { continue }
+            let uploaded = assetIDs.contains(assetID) ? 1 : 0
+            selected[momentID, default: (0, 0)].count += 1
+            selected[momentID, default: (0, 0)].uploaded += uploaded
+        }
+        return Set(selected.compactMap { id, values in
+            values.count > 0 && values.count == values.uploaded ? id : nil
+        })
     }
 
     private func importUserState(_ input: CatalogV2MigrationInput) throws {

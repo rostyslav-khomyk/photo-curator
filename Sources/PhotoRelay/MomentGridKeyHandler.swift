@@ -1,4 +1,4 @@
-import AppKit
+@preconcurrency import AppKit
 import SwiftUI
 
 /// A local key monitor for the Moments canvas. Controls and text editors retain
@@ -8,7 +8,10 @@ struct MomentGridKeyHandler: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator(handle: handle) }
     func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
+        let view = WindowTrackingView(frame: .zero)
+        view.windowChanged = { [weak coordinator = context.coordinator] number in
+            coordinator?.windowNumber = number
+        }
         context.coordinator.install(for: view)
         return view
     }
@@ -17,13 +20,13 @@ struct MomentGridKeyHandler: NSViewRepresentable {
 
     final class Coordinator {
         var handle: (NSEvent) -> Bool
+        var windowNumber: Int?
         private var monitor: Any?
-        private weak var view: NSView?
         init(handle: @escaping (NSEvent) -> Bool) { self.handle = handle }
-        func install(for view: NSView) {
-            self.view = view
+        @MainActor func install(for view: NSView) {
+            windowNumber = view.window?.windowNumber
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                guard let self, event.window === self.view?.window else { return event }
+                guard let self, event.windowNumber == self.windowNumber else { return event }
                 return self.handle(event) ? nil : event
             }
         }
@@ -32,5 +35,13 @@ struct MomentGridKeyHandler: NSViewRepresentable {
             monitor = nil
         }
         deinit { remove() }
+    }
+
+    final class WindowTrackingView: NSView {
+        var windowChanged: ((Int?) -> Void)?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            windowChanged?(window?.windowNumber)
+        }
     }
 }

@@ -1988,3 +1988,22 @@ Photos access, network research or private-photo inspection in this subchunk.
 - Verification: 206 native tests passed, 11 opt-in tests skipped, zero failures; 47 Google helper
   tests passed; the complete-concurrency production build passed with zero warnings. No packaged app
   rebuild, deployment, Photos mutation, or private-photo evaluation was performed in this phase.
+
+## Architecture stabilization Phase 2 compact read model (2026-09-22)
+
+- The Moments workspace now renders compact Catalog v2 summaries and hydrates complete Moments only
+  for review, merge, Photos publication, or Google export. The manual Load Older control and the
+  unbounded full-Moment workspace array are removed.
+- Summary rows carry Photos/Google filter state, readiness, revision, and bounded cover fallbacks.
+  Visible cards preheat through one `PHCachingImageManager`; stale revisions are rejected while an
+  existing valid thumbnail remains visible, and the image cache is capped at 96 MB.
+- A real 5,222-Moment/108,999-membership workspace synchronization takes 9.755 seconds. Its warm
+  all-summary query takes 0.041 seconds, below the 50 ms target. A true UPSERT removed an accidental
+  foreign-key cascade that made the first rehearsal take about 27 minutes.
+- PhotoKit export now uses structured async operations instead of global completion queues and a
+  semaphore. Publication adapters have explicit Sendable ownership, and the window keyboard monitor
+  no longer crosses AppKit objects between executors.
+- Verification: 210 native tests passed, 12 opt-in tests skipped, zero failures; a clean production
+  build with complete strict-concurrency checking emitted zero warnings. No catalog wipe or Photos
+  mutation occurred. Packaged-app scroll/RSS qualification and oldest-supported-Mac measurements
+  remain open.

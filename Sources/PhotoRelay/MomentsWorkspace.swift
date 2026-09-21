@@ -6,7 +6,6 @@ struct CuratorView: View {
     @ObservedObject var curator: CuratorController
     @ObservedObject var model: PhotoRelayViewModel
     @StateObject private var decisions = MomentReviewDecisions()
-    @State private var reviewing: PhotoMoment?
     @State private var prioritizing = false
     @State private var selecting = false
     @State private var selection = MomentMultiSelection()
@@ -14,8 +13,6 @@ struct CuratorView: View {
     @State private var showWorkspaceHelp = false
     @State private var googleExportMoments: [PhotoMoment] = []
     @State private var showingGoogleExport = false
-    @State private var places: [String: ResolvedPlace] = [:]
-    @State private var placeResolutionTask: Task<Void, Never>?
     @State private var activeMomentID: String?
     @AppStorage("curator.hidePublishedMoments.v1") private var hidePublishedMoments = false
     @AppStorage("curator.hideGoogleUploadedMoments.v1") private var hideGoogleUploadedMoments = false
@@ -25,10 +22,10 @@ struct CuratorView: View {
     @State private var scrollRestoreID: String?
     @ObservedObject private var meaningfulPlaces = MeaningfulPlacesStore.shared
 
-    private var visibleMoments: [PhotoMoment] {
-        curator.moments.filter { moment in
-            (!hidePublishedMoments || moment.publishedAlbumID == nil)
-                && (!hideGoogleUploadedMoments || !momentWasUploaded(moment))
+    private var visibleMoments: [MomentSummary] {
+        curator.momentSummaries.filter { moment in
+            (!hidePublishedMoments || !moment.inPhotos)
+                && (!hideGoogleUploadedMoments || !moment.inGoogle)
         }
     }
 
@@ -36,12 +33,7 @@ struct CuratorView: View {
         visibleMoments.map(\.id)
     }
 
-    private func contextOnly(_ moment: PhotoMoment) -> Bool {
-        MomentDisplayEligibility.isSupportingCollection(moment, decisions: decisions.values,
-            userAuthored: decisions.titles[moment.id] != nil || decisions.descriptions[moment.id] != nil)
-    }
-
-    private func cards(_ moments: [PhotoMoment]) -> some View {
+    private func cards(_ moments: [MomentSummary]) -> some View {
         LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 380), spacing: 20)], spacing: 24) {
             ForEach(moments) { moment in
                 Button {
@@ -49,17 +41,12 @@ struct CuratorView: View {
                         selection.click(moment.id, ordered: displayedIDs, range: NSEvent.modifierFlags.contains(.shift))
                     } else {
                         activeMomentID = moment.id
-                        MomentReviewWindowManager.shared.open(moment: moment, decisions: decisions, curator: curator) {
-                            Task {
-                                await curator.refreshOverview()
-                                schedulePlaceResolution()
-                            }
-                        }
+                        openMoment(moment.id)
                     }
                 } label: {
-                    MomentCoverCard(moment: moment, decisions: decisions, place: places[moment.id],
-                                    uploadedToGoogle: momentWasUploaded(moment),
-                                    loadPreview: restoredScrollPosition)
+                    MomentSummaryCard(moment: moment, customTitle: decisions.titles[moment.id],
+                                      customDescription: decisions.descriptions[moment.id],
+                                      loadPreview: restoredScrollPosition)
                         .overlay(alignment: .topTrailing) {
                             if selecting {
                                 Image(systemName: selection.ids.contains(moment.id) ? "checkmark.circle.fill" : "circle")
@@ -76,19 +63,20 @@ struct CuratorView: View {
                 }.buttonStyle(.plain)
                     .id(moment.id)
                     .task(id: moment.id) {
-                        let applied = moment.selection.map {
-                            MomentReviewDecisions.apply(decisions.values, to: $0, photos: moment.photos)
+                        guard let detail = await curator.momentDetail(moment.id) else { return }
+                        let applied = detail.selection.map {
+                            MomentReviewDecisions.apply(decisions.values, to: $0, photos: detail.photos)
                         }
                         let priority = MomentDisplayEligibility.viewportPriorityPhotos(
-                            moment, decisions: decisions.values, selected: applied?.selected ?? [])
-                        await curator.prioritizeVisibleMoment(moment, photos: priority)
+                            detail, decisions: decisions.values, selected: applied?.selected ?? [])
+                        await curator.prioritizeVisibleMoment(detail, photos: priority)
                     }
                     .background(GeometryReader { geometry in
                         Color.clear.preference(key: MomentViewportPreferenceKey.self,
                                                value: [moment.id: geometry.frame(in: .named("moments-scroll")).minY])
                     })
                     .accessibilityValue(selecting ? (selection.ids.contains(moment.id) ? "Selected" : "Not selected") : "")
-                    .accessibilityLabel("Open Moment, \(MomentPresentation.title(moment, custom: decisions.titles[moment.id], place: places[moment.id]))")
+                    .accessibilityLabel("Open Moment, \(summaryTitle(moment))")
             }
         }.padding(.horizontal, 24).padding(.bottom, 24)
     }
@@ -154,14 +142,6 @@ struct CuratorView: View {
                         }.frame(maxWidth: .infinity).padding(60)
                     } else {
                         cards(visibleMoments)
-                        if curator.availableMoments > curator.moments.count {
-                            HStack(spacing: 8) {
-                                ProgressView().controlSize(.small)
-                                Text("Loading more Moments…").foregroundStyle(.secondary)
-                            }
-                            .padding(.bottom, 24)
-                            .task(id: curator.moments.count) { await curator.loadMoreMoments() }
-                        }
                     }
                 }
                 .coordinateSpace(name: "moments-scroll")
@@ -190,7 +170,8 @@ struct CuratorView: View {
             }.padding(14).background(.bar)
         }
         .task {
-            await curator.refreshOverview(reusingVisibleMoments: true)
+            await curator.reloadMomentSummaries(googleUploadedAssetIDs: model.uploadedGoogleAssetIDs,
+                                                 reviewDecisions: decisions.values)
             if activeMomentID == nil {
                 activeMomentID = displayedIDs.contains(savedActiveMomentID) ? savedActiveMomentID : displayedIDs.first
             }
@@ -199,7 +180,14 @@ struct CuratorView: View {
             } else {
                 restoredScrollPosition = true
             }
-            schedulePlaceResolution()
+        }
+        .onChange(of: model.uploadedGoogleAssetIDs) { ids in
+            Task { await curator.reloadMomentSummaries(googleUploadedAssetIDs: ids,
+                                                        reviewDecisions: decisions.values) }
+        }
+        .onChange(of: decisions.values) { values in
+            Task { await curator.reloadMomentSummaries(googleUploadedAssetIDs: model.uploadedGoogleAssetIDs,
+                                                        reviewDecisions: values) }
         }
         .onChange(of: displayedIDs) { ids in
             if activeMomentID.flatMap({ ids.contains($0) }) != true { activeMomentID = ids.first }
@@ -232,8 +220,10 @@ struct CuratorView: View {
                 .help(selecting ? "Finish selecting Moments" : "Select Moments")
 
                 Button {
-                    googleExportMoments = curator.moments.filter { selection.ids.contains($0.id) }
-                    showingGoogleExport = true
+                    Task {
+                        googleExportMoments = await curator.momentDetails(selection.ids)
+                        showingGoogleExport = true
+                    }
                 } label: {
                     Label("Save to Google Photos", systemImage: "icloud.and.arrow.up")
                 }
@@ -243,13 +233,7 @@ struct CuratorView: View {
                       : "Review selected Moment highlights or Favorites for Google Photos")
 
                 Button {
-                    let chosen = curator.moments.filter { selection.ids.contains($0.id) }
-                    guard chosen.count == selection.ids.count else {
-                        curator.errorMessage = "Collections changed. Please select them again."; return
-                    }
-                    do {
-                        mergeDraft = MomentMergeDraft(moments: chosen, revision: try MomentMergeDraft.store.load().revision)
-                    } catch { curator.errorMessage = "Could not open the saved grouping record. No changes were made." }
+                    openMergeDraft()
                 } label: {
                     Label("Merge Moments", systemImage: "rectangle.stack.badge.plus")
                 }
@@ -263,35 +247,21 @@ struct CuratorView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: Notification.Name("PhotoRelayGroupReviewChanged"))) { _ in
-            Task {
-                await curator.refreshOverview()
-                schedulePlaceResolution()
-            }
+            Task { await curator.refreshOverview() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .photoRelayPhotosAccessChanged)) { _ in
-            Task {
-                await curator.refreshOverview()
-                schedulePlaceResolution()
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .meaningfulPlacesChanged)) { _ in
-            schedulePlaceResolution()
+            Task { await curator.refreshOverview() }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             if PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized {
-                Task {
-                    await curator.refreshOverview()
-                    schedulePlaceResolution()
-                }
+                Task { await curator.reloadMomentSummaries(googleUploadedAssetIDs: model.uploadedGoogleAssetIDs,
+                                                            reviewDecisions: decisions.values) }
             }
         }
         .sheet(item: $mergeDraft) { draft in
             MomentMergeView(draft: draft, decisions: decisions, curator: curator) {
                 selection = MomentMultiSelection(); selecting = false
-                Task {
-                    await curator.refreshOverview()
-                    schedulePlaceResolution()
-                }
+                Task { await curator.refreshOverview() }
             }
         }
         .sheet(isPresented: $showingGoogleExport) {
@@ -352,10 +322,7 @@ struct CuratorView: View {
             return true
         case 36, 76:
             if selecting, selection.ids.count >= 2 { openMergeDraft(); return true }
-            guard let moment = curator.moments.first(where: { $0.id == displayedIDs[current] }) else { return true }
-            MomentReviewWindowManager.shared.open(moment: moment, decisions: decisions, curator: curator) {
-                Task { await curator.refreshOverview(); schedulePlaceResolution() }
-            }
+            openMoment(displayedIDs[current])
             return true
         default: return false
         }
@@ -364,59 +331,134 @@ struct CuratorView: View {
     }
 
     private func openMergeDraft() {
-        let chosen = curator.moments.filter { selection.ids.contains($0.id) }
-        guard chosen.count == selection.ids.count else {
-            curator.errorMessage = "Collections changed. Please select them again."
-            return
-        }
-        do {
-            mergeDraft = MomentMergeDraft(moments: chosen, revision: try MomentMergeDraft.store.load().revision)
-        } catch {
-            curator.errorMessage = "Could not open the saved grouping record. No changes were made."
-        }
-    }
-
-    private func momentWasUploaded(_ moment: PhotoMoment) -> Bool {
-        let assetIDs: [String]
-        if let selection = moment.selection {
-            assetIDs = MomentReviewDecisions.apply(decisions.values, to: selection,
-                                                   photos: moment.photos).selected
-        } else {
-            assetIDs = moment.photos.map(\.id)
-        }
-        return model.momentWasUploaded(assetIDs)
-    }
-
-    private func schedulePlaceResolution() {
-        placeResolutionTask?.cancel()
-        let snapshot = curator.moments
-        placeResolutionTask = Task { await resolvePlaces(snapshot) }
-    }
-
-    private func resolvePlaces(_ moments: [PhotoMoment]) async {
-        let calendar = Calendar.current
-        var gpsByDay: [Date: [IndexedPhoto]] = [:]
-        for photo in moments.lazy.flatMap(\.photos) where photo.latitude != nil && photo.longitude != nil {
-            guard let created = photo.created else { continue }
-            gpsByDay[calendar.startOfDay(for: created), default: []].append(photo)
-        }
-        for key in gpsByDay.keys {
-            gpsByDay[key]?.sort { ($0.created ?? .distantPast) < ($1.created ?? .distantPast) }
-        }
-
-        for moment in moments {
-            guard !Task.isCancelled else { return }
-            if let resolved = await CuratorGeocodingService.shared.place(for: moment) {
-                guard !Task.isCancelled else { return }
-                places[moment.id] = resolved
-            } else if let created = moment.photos.first?.created,
-                      let extrapolated = CuratorLocationExtrapolator.extrapolate(
-                        moment: moment,
-                        allDayPhotos: gpsByDay[calendar.startOfDay(for: created)] ?? [],
-                        calendar: calendar) {
-                guard !Task.isCancelled else { return }
-                places[moment.id] = await CuratorGeocodingService.shared.place(for: extrapolated.latitude, longitude: extrapolated.longitude)
+        Task {
+            let chosen = await curator.momentDetails(selection.ids)
+            guard chosen.count == selection.ids.count else {
+                curator.errorMessage = "Collections changed. Please select them again."
+                return
             }
+            do {
+                mergeDraft = MomentMergeDraft(moments: chosen, revision: try MomentMergeDraft.store.load().revision)
+            } catch {
+                curator.errorMessage = "Could not open the saved grouping record. No changes were made."
+            }
+        }
+    }
+
+    private func openMoment(_ id: String) {
+        Task {
+            guard let moment = await curator.momentDetail(id) else {
+                curator.errorMessage = "This Moment is no longer available."
+                return
+            }
+            MomentReviewWindowManager.shared.open(moment: moment, decisions: decisions, curator: curator) {
+                Task { await curator.refreshOverview() }
+            }
+        }
+    }
+
+    private func summaryTitle(_ moment: MomentSummary) -> String {
+        decisions.titles[moment.id] ?? moment.headline
+            ?? moment.start.formatted(.dateTime.month(.abbreviated).day().year())
+    }
+}
+
+struct MomentSummaryCard: View {
+    let moment: MomentSummary
+    let customTitle: String?
+    let customDescription: String?
+    var loadPreview = true
+    @AppStorage("curator.fontSizeScale") private var fontSizeScale: Double = 1.0
+
+    private var title: String {
+        customTitle ?? moment.headline
+            ?? moment.start.formatted(.dateTime.month(.abbreviated).day().year())
+    }
+
+    private var status: String {
+        if customTitle != nil || customDescription != nil || moment.customized { return "✓ Customized" }
+        if !moment.groupingReady { return "Preparing grouping…" }
+        if !moment.narrativeReady { return "Title preparation is in progress…" }
+        return ""
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            ZStack(alignment: .bottomLeading) {
+                Rectangle().fill(.quaternary)
+                if moment.coverAssetID != nil || !moment.fallbackCoverAssetIDs.isEmpty {
+                    if loadPreview {
+                        MomentSummaryThumbnail(moment: moment)
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
+                } else {
+                    VStack(spacing: 8) {
+                        Image(systemName: "doc.text.image").font(.largeTitle)
+                        Text("No preview photo").font(.caption)
+                    }.foregroundStyle(.secondary)
+                }
+                if moment.inPhotos || moment.inGoogle {
+                    HStack(spacing: 8) {
+                        if moment.inGoogle {
+                            Label("In Google", systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.blue)
+                        }
+                        if moment.inPhotos {
+                            Label("In Photos", systemImage: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        }
+                    }
+                    .font(.system(size: 11 * fontSizeScale, weight: .semibold))
+                    .padding(.horizontal, 8).padding(.vertical, 4)
+                    .background(.ultraThinMaterial, in: Capsule()).padding(8)
+                }
+            }.frame(height: 190).clipped()
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title).font(.system(size: 16 * fontSizeScale, weight: .semibold))
+                    .lineLimit(2).help(title).textSelection(.enabled)
+                Text("\(moment.highlightCount) \(moment.highlightCount == 1 ? "highlight" : "highlights") · \(moment.photoCount) \(moment.photoCount == 1 ? "photo" : "photos")")
+                    .font(.system(size: 14 * fontSizeScale, weight: .medium)).foregroundStyle(.secondary)
+                if !status.isEmpty {
+                    Text(status).font(.system(size: 13 * fontSizeScale,
+                        weight: status.hasPrefix("Title preparation") ? .medium : .regular))
+                        .foregroundStyle(status.hasPrefix("Title preparation") ? Color.orange : Color.secondary)
+                }
+            }.padding(14).frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: 12))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .onAppear { PhotoKitThumbnailProvider.setCaching(true, assetIDs: moment.fallbackCoverAssetIDs, edge: 480) }
+        .onDisappear { PhotoKitThumbnailProvider.setCaching(false, assetIDs: moment.fallbackCoverAssetIDs, edge: 480) }
+    }
+}
+
+private struct MomentSummaryThumbnail: View {
+    let moment: MomentSummary
+    @State private var candidateIndex = 0
+
+    private var candidates: [String] {
+        var result: [String] = []
+        for id in [moment.coverAssetID].compactMap({ $0 }) + moment.fallbackCoverAssetIDs where !result.contains(id) {
+            result.append(id)
+        }
+        return result
+    }
+
+    var body: some View {
+        if candidates.indices.contains(candidateIndex) {
+            let assetID = candidates[candidateIndex]
+            SimilarityThumbnail(photo: IndexedPhoto(id: assetID, created: moment.start,
+                modified: nil, latitude: nil, longitude: nil, favorite: false, width: 1, height: 1),
+                height: 190, requestedEdge: 480, showsTimestamp: false,
+                cacheRevision: "\(moment.id)-\(moment.revision)-\(assetID)") { _ in
+                    if candidateIndex + 1 < candidates.count { candidateIndex += 1 }
+                }
+        } else {
+            VStack(spacing: 8) {
+                Image(systemName: "photo.badge.exclamationmark")
+                Text("Preview unavailable").font(.caption)
+            }.foregroundStyle(.secondary)
         }
     }
 }

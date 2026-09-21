@@ -1,6 +1,6 @@
 import Photos
 
-enum SimilarityCategory: String, CaseIterable, Codable, Identifiable {
+enum SimilarityCategory: String, CaseIterable, Codable, Identifiable, Sendable {
     case photos, selfies, portraits, panoramas, livePhotos, raw, bursts, animated, screenshots
     var id: Self { self }
     var title: String {

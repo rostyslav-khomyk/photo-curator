@@ -50,12 +50,12 @@ struct PublicationRecord: Codable, Equatable {
     var uploadReceipt: String?
 }
 
-protocol CuratedAlbumAdapter {
+protocol CuratedAlbumAdapter: Sendable {
     func publish(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumReceipt
     func recover(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumReceipt?
 }
 
-protocol CuratedUploadAdapter {
+protocol CuratedUploadAdapter: Sendable {
     func upload(_ album: CuratedAlbumReceipt, operationID: UUID) async throws -> String
     func recover(operationID: UUID) async throws -> String?
 }

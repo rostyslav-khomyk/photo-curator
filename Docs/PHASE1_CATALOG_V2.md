@@ -1,6 +1,6 @@
 # Phase 1 Catalog v2
 
-Status: shadow catalog implemented and validated; no application cutover or catalog wipe  
+Status: validated; compact read-model cutover completed in Phase 2, no catalog wipe
 Prepared: 2026-09-21
 
 ## Implementation
@@ -21,8 +21,9 @@ and protected-membership anchors feed the stable identity resolver. A unique anc
 inherits the old UUID even when its surrounding membership changes; split or conflicting anchors
 fail closed.
 
-The shipping workspace still reads the legacy stores. There is no dual-write, UI change, Photos
-mutation, automatic launch migration, or cutover in this phase.
+Phase 1 ended with the shipping workspace still reading the legacy stores. Phase 2 subsequently
+cut the workspace over to compact Catalog v2 summaries and detail-on-demand hydration. The legacy
+generator remains the temporary writer until Phase 3 centralizes scheduling and PhotoKit ingestion.
 
 ## Real-Catalog Rehearsal
 

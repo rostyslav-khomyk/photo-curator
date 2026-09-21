@@ -21,8 +21,8 @@ struct MomentNarrativeText: Codable, Equatable {
     let description: String
 }
 
-struct MomentNarrative: Codable, Equatable {
-    enum State: String, Codable { case preparing, automatic, customized }
+struct MomentNarrative: Codable, Equatable, Sendable {
+    enum State: String, Codable, Sendable { case preparing, automatic, customized }
     static let version = "moment-narrative-v1"
     let version: String
     let headline: String

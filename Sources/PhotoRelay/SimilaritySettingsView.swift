@@ -134,7 +134,10 @@ struct SimilarityThumbnail: View {
     var requestedEdge = 1024
     var showsTimestamp = true
     var allowsNetworkAccess = false
+    var cacheRevision: String? = nil
+    var onFailure: ((ThumbnailFailure) -> Void)? = nil
     @State private var image: CGImage?
+    @State private var imageAssetID: String?
     @State private var failure: ThumbnailFailure?
     @State private var refreshCount = 0
 
@@ -165,18 +168,28 @@ struct SimilarityThumbnail: View {
                     .font(.caption2)
             }
         }
-        .task(id: "\(photo.id)-\(photo.analysisRevision)-\(requestedEdge)-\(refreshCount)") {
-            image = nil
+        .task(id: "\(photo.id)-\(cacheRevision ?? photo.analysisRevision)-\(requestedEdge)-\(refreshCount)") {
+            let key = "\(photo.id)|\(cacheRevision ?? photo.analysisRevision)|\(requestedEdge)"
+            if let cached = MomentThumbnailCache.shared.image(for: key) {
+                image = cached
+                imageAssetID = photo.id
+                failure = nil
+                return
+            }
+            if imageAssetID != photo.id { image = nil }
             failure = nil
             for attempt in 0..<2 {
                 let loader = CuratorThumbnailLoader(provider: PhotoKitThumbnailProvider(
                     allowsNetworkAccess: allowsNetworkAccess))
                 do {
-                    image = try await loader.load(
+                    let loaded = try await loader.load(
                         assetID: photo.id,
                         timeout: allowsNetworkAccess ? 120 : 20,
                         edge: requestedEdge
                     )
+                    MomentThumbnailCache.shared.insert(loaded, for: key)
+                    image = loaded
+                    imageAssetID = photo.id
                     break
                 } catch {
                     guard !Task.isCancelled else { return }
@@ -186,6 +199,7 @@ struct SimilarityThumbnail: View {
                         continue
                     }
                     failure = current
+                    onFailure?(current)
                     if current == .missing {
                         NotificationCenter.default.post(name: .photoRelayPhotosAccessChanged, object: nil)
                     }
@@ -204,6 +218,7 @@ struct SimilarityThumbnail: View {
         }
         .onDisappear {
             image = nil
+            imageAssetID = nil
             failure = nil
         }
     }
@@ -217,6 +232,29 @@ struct SimilarityThumbnail: View {
         case .busy: "Preview is busy"
         case .cancelled, .unavailable: "Preview unavailable"
         }
+    }
+}
+
+@MainActor
+private final class MomentThumbnailCache {
+    static let shared = MomentThumbnailCache()
+    private let values = NSCache<NSString, ImageBox>()
+
+    private init() {
+        values.countLimit = 360
+        values.totalCostLimit = 96 * 1024 * 1024
+    }
+
+    func image(for key: String) -> CGImage? { values.object(forKey: key as NSString)?.image }
+
+    func insert(_ image: CGImage, for key: String) {
+        values.setObject(ImageBox(image), forKey: key as NSString,
+                         cost: image.bytesPerRow * image.height)
+    }
+
+    private final class ImageBox {
+        let image: CGImage
+        init(_ image: CGImage) { self.image = image }
     }
 }
 

@@ -13,7 +13,12 @@ final class CatalogV2Tests: XCTestCase {
         XCTAssertGreaterThan(result.moments, 1_000)
         XCTAssertEqual(result.foreignKeyViolations, 0)
         let store = try CatalogV2Store(url: URL(fileURLWithPath: path).appendingPathComponent(CatalogV2Migrator.catalogName))
+        try await store.prepareWorkspace(CatalogV2Migrator.loadInput(root: URL(fileURLWithPath: path), defaults: defaults))
+        let summaryStart = Date()
         let summaries = try await store.summaries()
+        let summaryDuration = Date().timeIntervalSince(summaryStart)
+        print("Catalog v2 warm summary query: \(String(format: "%.3f", summaryDuration))s")
+        XCTAssertLessThan(summaryDuration, 0.5)
         XCTAssertEqual(summaries.count, result.moments)
         let first = try XCTUnwrap(summaries.first)
         let detail = try await store.detail(momentID: first.id)
@@ -56,16 +61,28 @@ final class CatalogV2Tests: XCTestCase {
         XCTAssertEqual(summaries[1].headline, "Our title")
         XCTAssertEqual(summaries[1].photoCount, 2)
         XCTAssertEqual(summaries[1].highlightCount, 1)
+        XCTAssertEqual(summaries[1].fallbackCoverAssetIDs, ["a", "b"])
         XCTAssertTrue(summaries[1].customized)
         XCTAssertTrue(summaries[1].inPhotos)
+        let uploaded = try await store.summaries(googleUploadedAssetIDs: ["a"])
+        XCTAssertTrue(try XCTUnwrap(uploaded.first(where: { $0.id == "moment-a" })).inGoogle)
         let loadedDetail = try await store.detail(momentID: "moment-a")
         let detail = try XCTUnwrap(loadedDetail)
         XCTAssertEqual(detail.photos.map(\.id), ["a", "b"])
+        XCTAssertEqual(detail.selection?.selected, ["a"])
         XCTAssertEqual(detail.narrative?.headline, "A day together")
         XCTAssertEqual(detail.publishedAlbumID, "album-a")
         let identities = try await store.reconcileMomentIdentities(groups: [["a", "b", "c"]]) { "new" }
         XCTAssertEqual(identities.current.first?.id, "moment-a")
         XCTAssertEqual(identities.retiredIDs, ["moment-b"])
+
+        var changed = moment
+        changed.narrative = MomentNarrative(version: MomentNarrative.version, headline: "Updated", deck: nil,
+            story: nil, place: nil, date: "Today", confidence: 1, provenance: ["test"], state: .automatic)
+        try await store.synchronize(moments: [changed], activeMomentIDs: ["moment-a"])
+        let refreshed = try await store.summaries()
+        XCTAssertEqual(refreshed.map(\.id), ["moment-a"])
+        XCTAssertEqual(refreshed.first?.headline, "Our title")
     }
 
     func testFailedMigrationRollsBackWithoutCompletionMarker() async throws {

@@ -1,6 +1,6 @@
 import SwiftUI
 
-enum ReviewDecision: String, Codable { case include, exclude }
+enum ReviewDecision: String, Codable, Sendable { case include, exclude }
 
 @MainActor
 final class MomentReviewDecisions: ObservableObject {

@@ -1,6 +1,6 @@
 # Photo Curator Architecture Stabilization Plan
 
-Status: accepted; Phase 0 guardrails in progress
+Status: accepted; Phase 2 compact read model implemented, interactive qualification pending
 Prepared: 2026-09-21
 Baseline: `fdca2bae` on `codex/photo-curator-full-history-snapshot`
 
@@ -589,7 +589,8 @@ guardrails are present; packaged-app traces and approval of the private owner be
 ### Phase 1: Catalog v2 and migration, 5-8 days
 
 Shadow implementation and validation are tracked in [`PHASE1_CATALOG_V2.md`](PHASE1_CATALOG_V2.md).
-The real-catalog rehearsal passes, but the shipping app has not cut over and no legacy data was
+The real-catalog rehearsal passes. Phase 2 now uses the compact Catalog v2 projection as the
+workspace read model while the legacy generator remains the temporary writer; no legacy data was
 removed.
 
 - Add schema, constraints, migrations, stable Moment reconciliation, and summary/detail queries.
@@ -598,6 +599,10 @@ removed.
 - Exit gate: migration passes on a copied real catalog and all user edits/publication markers match.
 
 ### Phase 2: Compact Moments read model, 4-6 days
+
+Implementation and measurements are tracked in
+[`PHASE2_COMPACT_READ_MODEL.md`](PHASE2_COMPACT_READ_MODEL.md). Automated gates pass; packaged-app
+Instruments and oldest-supported-Mac checks remain open.
 
 - Switch the workspace to `[MomentSummary]` and detail-on-open.
 - Restore anchor/cursor, remove `Load Older Moments`, and make filters summary-based.

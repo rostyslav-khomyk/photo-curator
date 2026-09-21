@@ -1,6 +1,7 @@
 import XCTest
 @testable import PhotoRelay
 
+@MainActor
 private final class FakeAlbums: CuratedAlbumAdapter {
     var calls = 0
     var receipt: CuratedAlbumReceipt?
@@ -15,6 +16,7 @@ private final class FakeAlbums: CuratedAlbumAdapter {
     func recover(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumReceipt? { receipt }
 }
 
+@MainActor
 private final class FakeUpload: CuratedUploadAdapter {
     var calls = 0
     var receipt: String?
@@ -28,6 +30,7 @@ private final class FakeUpload: CuratedUploadAdapter {
     func recover(operationID: UUID) async throws -> String? { receipt }
 }
 
+@MainActor
 final class CuratedPublicationTests: XCTestCase {
     func testSidecarLockRejectsSecondOwnerAndReleases() throws {
         let path = url(); defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }

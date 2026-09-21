@@ -403,6 +403,10 @@ actor CuratorWorker {
         try MomentsCatalog.load(from: url.deletingLastPathComponent().appendingPathComponent("moments-catalog.json"))?.moments ?? []
     }
 
+    func catalogMigrationInput() throws -> CatalogV2MigrationInput {
+        try CatalogV2Migrator.loadInput(root: url.deletingLastPathComponent())
+    }
+
     func markPublished(momentID: String, albumID: String, date: Date) throws {
         let catalogURL = url.deletingLastPathComponent().appendingPathComponent("moments-catalog.json")
         guard var catalog = try MomentsCatalog.load(from: catalogURL) else {
@@ -444,7 +448,7 @@ actor CuratorWorker {
     }
 
     func overview(range: DateInterval, thresholds: [SimilarityCategory: Float], balanced: Bool, limit: Int = 200,
-                  protection: MomentGroupingProtection = .init(), preparedPrefix: [PhotoMoment] = []) async throws -> (moments: [PhotoMoment], total: Int, undated: Int, available: Int) {
+                  protection: MomentGroupingProtection = .init(), preparedPrefix: [PhotoMoment] = []) async throws -> (moments: [PhotoMoment], total: Int, undated: Int, available: Int, activeIDs: Set<String>) {
         let db = try database()
         let counts = try db.counts()
         let grouped = try preparedCatalog(protection: protection)
@@ -511,7 +515,7 @@ actor CuratorWorker {
         }
         moments = reused + moments
         try MomentsCatalog(updated: Date(), moments: moments).save(to: url.deletingLastPathComponent().appendingPathComponent("moments-catalog.json"))
-        return (moments, counts.total, counts.undated, grouped.count)
+        return (moments, counts.total, counts.undated, grouped.count, Set(grouped.map(\.id)))
     }
 
     /// Refreshes cached narrative and selection for one already-projected card.
@@ -631,20 +635,10 @@ final class CuratorController: ObservableObject {
     @Published private(set) var indexedCount = 0
     @Published private(set) var undatedCount = 0
     @Published private(set) var moments: [PhotoMoment] = []
+    @Published private(set) var momentSummaries: [MomentSummary] = []
     @Published private(set) var availableMoments = 0
     @Published private(set) var overviewLoading = false
-    private var momentLimit = max(200, UserDefaults.standard.integer(forKey: "curator.momentLimit.v1"))
-
-    func loadMoreMoments() async {
-        guard momentLimit < availableMoments else { return }
-        while overviewLoading {
-            try? await Task.sleep(nanoseconds: 100_000_000)
-            if Task.isCancelled { return }
-        }
-        momentLimit += 200
-        UserDefaults.standard.set(momentLimit, forKey: "curator.momentLimit.v1")
-        await refreshOverview(reusingVisibleMoments: true)
-    }
+    private let momentLimit = 200
     @Published private(set) var scanned = 0
     @Published private(set) var scanTotal = 0
     @Published private(set) var foregroundActive = false
@@ -660,6 +654,7 @@ final class CuratorController: ObservableObject {
     private var syncSubscription: AnyCancellable?
 
     private let worker: CuratorWorker
+    private let catalog: CatalogV2Store?
     private var timer: Timer?
     private var observer: CuratorLibraryObserver?
     private var batchRunning = false
@@ -711,6 +706,8 @@ final class CuratorController: ObservableObject {
         let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Photo Relay/curator/index.sqlite3")
         worker = CuratorWorker(url: url)
+        catalog = try? CatalogV2Store(url: url.deletingLastPathComponent()
+            .appendingPathComponent(CatalogV2Migrator.catalogName))
         if let pilot = CuratorPilot.range() {
             customStart = pilot.start
             customEnd = pilot.end.addingTimeInterval(-1)
@@ -719,6 +716,16 @@ final class CuratorController: ObservableObject {
         CuratorTelemetry.shared.record(.launch, counts: ["enabled": enabled ? 1 : 0, "boundedPilot": CuratorPilot.range() == nil ? 0 : 1])
         StorageMaintenance.run()
         Task {
+            if let catalog {
+                do {
+                    let input = try await worker.catalogMigrationInput()
+                    _ = try await catalog.migrate(input)
+                    try await catalog.prepareWorkspace(input)
+                    await reloadMomentSummaries(googleUploadedAssetIDs: model.uploadedGoogleAssetIDs)
+                } catch {
+                    CuratorTelemetry.shared.record(.failure, counts: ["code": (error as NSError).code])
+                }
+            }
             try? await worker.maintainStorage()
             let indexed = (try? await worker.indexedPhotoCount()) ?? 0
             let checkpointRequiresReconciliation = await worker.startupRequiresFullReconciliation(indexedCount: indexed)
@@ -936,9 +943,7 @@ final class CuratorController: ObservableObject {
         defer { overviewLoading = false }
         let range = DateInterval(start: .distantPast, end: .distantFuture)
         do {
-            if moments.isEmpty { moments = try await worker.savedMoments() }
-            // Keep the saved projection until PhotoKit can supply its public categories.
-            // Otherwise a permission prompt temporarily changes and persists selections.
+            // A permission prompt must not change or persist selection state.
             guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else { return }
             MomentGroupingProtection.captureLegacy(moments, defaults: .standard)
             var protection = MomentGroupingProtection.load(.standard)
@@ -957,6 +962,10 @@ final class CuratorController: ObservableObject {
                   protection == MomentGroupingProtection.load(.standard) else { return }
             MomentGroupingProtection.captureLegacy(overview.moments, defaults: .standard)
             moments = overview.moments
+            if let catalog {
+                try await catalog.synchronize(moments: overview.moments, activeMomentIDs: overview.activeIDs)
+                await reloadMomentSummaries()
+            }
             availableMoments = overview.available
             indexedCount = overview.total
             undatedCount = overview.undated
@@ -976,6 +985,37 @@ final class CuratorController: ObservableObject {
         }
     }
 
+    func reloadMomentSummaries(googleUploadedAssetIDs: Set<String> = [],
+                               reviewDecisions: [String: ReviewDecision] = [:]) async {
+        guard let catalog else { return }
+        let interval = CuratorPerformance.begin("Moment summary query")
+        defer { CuratorPerformance.end("Moment summary query", interval) }
+        do {
+            momentSummaries = try await catalog.summaries(googleUploadedAssetIDs: googleUploadedAssetIDs,
+                                                          reviewDecisions: reviewDecisions)
+            availableMoments = momentSummaries.count
+        } catch is CancellationError {
+            return
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func momentDetail(_ id: String) async -> PhotoMoment? {
+        let interval = CuratorPerformance.begin("Moment detail query")
+        defer { CuratorPerformance.end("Moment detail query", interval) }
+        if let catalog, let detail = try? await catalog.detail(momentID: id) { return detail }
+        return moments.first(where: { $0.id == id })
+    }
+
+    func momentDetails(_ ids: Set<String>) async -> [PhotoMoment] {
+        var result: [PhotoMoment] = []
+        for id in ids {
+            if let detail = await momentDetail(id) { result.append(detail) }
+        }
+        return result.sorted { $0.start > $1.start }
+    }
+
     func prioritizeVisibleMoment(_ moment: PhotoMoment, photos: [IndexedPhoto]) async {
         guard enabled, !photos.isEmpty else { return }
         let revisions = photos.map { "\($0.id):\($0.analysisRevision)" }.joined(separator: "|")
@@ -991,15 +1031,16 @@ final class CuratorController: ObservableObject {
     }
 
     private func refreshVisibleMoment(_ id: String) async {
-        guard let index = moments.firstIndex(where: { $0.id == id }) else { return }
+        guard let original = await momentDetail(id) else { return }
         let thresholds = similarityThresholds
         let balanced = balancedSelection
         do {
-            let updated = try await worker.refreshedPresentation(moments[index], thresholds: thresholds,
+            let updated = try await worker.refreshedPresentation(original, thresholds: thresholds,
                                                                  balanced: balanced)
-            guard similarityThresholds == thresholds, balancedSelection == balanced,
-                  moments.indices.contains(index), moments[index].id == id else { return }
-            moments[index] = updated
+            guard similarityThresholds == thresholds, balancedSelection == balanced else { return }
+            if let index = moments.firstIndex(where: { $0.id == id }) { moments[index] = updated }
+            try await catalog?.synchronize(moments: [updated])
+            await reloadMomentSummaries()
         } catch is CancellationError {
             return
         } catch {
@@ -1385,6 +1426,8 @@ final class CuratorController: ObservableObject {
 
         let publishedDate = Date()
         try await worker.markPublished(momentID: moment.id, albumID: receipt.albumID, date: publishedDate)
+        try await catalog?.markPublished(momentID: moment.id, albumID: receipt.albumID, date: publishedDate)
+        await reloadMomentSummaries()
         if let idx = moments.firstIndex(where: { $0.id == moment.id }) {
             moments[idx].publishedAlbumID = receipt.albumID
             moments[idx].publishedDate = publishedDate

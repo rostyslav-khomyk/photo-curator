@@ -2,7 +2,7 @@ import Foundation
 import CoreLocation
 import CryptoKit
 
-struct IndexedPhoto: Codable, Equatable, Identifiable {
+struct IndexedPhoto: Codable, Equatable, Identifiable, Sendable {
     let id: String
     let created: Date?
     let modified: Date?
@@ -18,7 +18,7 @@ struct IndexedPhoto: Codable, Equatable, Identifiable {
     }
 }
 
-struct PhotoMoment: Identifiable, Codable {
+struct PhotoMoment: Identifiable, Codable, Sendable {
     let id: String
     let start: Date
     let end: Date
@@ -40,7 +40,7 @@ struct PhotoMoment: Identifiable, Codable {
     var favorites: Int { photos.filter(\.favorite).count }
 }
 
-enum MomentGroupingState: String, Codable {
+enum MomentGroupingState: String, Codable, Sendable {
     case preparing, conservative, ready, reviewed
 }
 

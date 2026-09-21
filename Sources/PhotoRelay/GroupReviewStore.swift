@@ -1,13 +1,13 @@
 import Foundation
 
-struct SavedReviewGroup: Codable, Equatable {
+struct SavedReviewGroup: Codable, Equatable, Sendable {
     let id: String
     var title: String
     var members: Set<String>
     var sourceText: [String: String]? = nil
 }
 
-struct GroupReviewArchive: Codable {
+struct GroupReviewArchive: Codable, Sendable {
     var version = 1
     var revision = 0
     var groups: [SavedReviewGroup] = []
