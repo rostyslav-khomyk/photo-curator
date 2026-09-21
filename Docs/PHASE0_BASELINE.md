@@ -95,7 +95,8 @@ Each case records expected joins/splits, optional Story membership, title, and r
 - [x] Production signposts and repeatable capture script exist.
 - [x] Deterministic 100,000-photo time/memory fixture exists.
 - [x] Privacy-safe diagnostic export exists and is tested.
-- [x] Complete strict-concurrency production build has zero warnings.
+- [ ] A clean complete strict-concurrency production build has zero warnings. The original
+  incremental check missed existing PhotoKit/publication warnings; Catalog v2 adds none.
 - [x] Automatic Photos publication defaults off for a fresh alpha install while preserving an existing choice.
 - [ ] Packaged-app launch/scroll/analysis/publication/restart traces are recorded.
 - [ ] The private owner benchmark is versioned and approved.

@@ -18,6 +18,15 @@ final class MomentIdentityTests: XCTestCase {
         XCTAssertEqual(merged.retiredIDs, Set(split.current.map(\.id)))
     }
 
+    func testDurableAnchorsDominateOverlapAndFailClosedWhenSplit() throws {
+        let old = [MomentIdentityEntry(id: "trip", members: ["a", "b", "c", "d"])]
+        let inherited = try MomentIdentityResolver.resolve(previous: old,
+            groups: [["a"], ["b", "c", "d", "new"]], anchors: ["trip": ["b", "c"]])
+        XCTAssertEqual(inherited.current[1].id, "trip")
+        XCTAssertThrowsError(try MomentIdentityResolver.resolve(previous: old,
+            groups: [["a", "b"], ["c", "d"]], anchors: ["trip": ["b", "c"]]))
+    }
+
     func testScopePersistenceAndAmbiguousInputRejection() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("identities.json")
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }

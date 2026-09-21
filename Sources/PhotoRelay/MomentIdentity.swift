@@ -13,20 +13,32 @@ struct MomentIdentityResolution {
 enum MomentIdentityResolver {
     /// Call only with complete snapshots of the same scope. Ambiguous split/merge titles
     /// stay with retired identities instead of silently moving to a different moment.
-    static func resolve(previous: [MomentIdentityEntry], groups: [Set<String>],
+    static func resolve(previous: [MomentIdentityEntry], groups: [Set<String>], anchors: [String: Set<String>] = [:],
                         newID: () -> String = { UUID().uuidString }) throws -> MomentIdentityResolution {
         guard groups.allSatisfy({ !$0.isEmpty }),
               Set(previous.map(\.id)).count == previous.count,
               Set(groups.flatMap { $0 }).count == groups.reduce(0, { $0 + $1.count }),
-              Set(previous.flatMap(\.members)).count == previous.reduce(0, { $0 + $1.members.count }) else {
+              Set(previous.flatMap(\.members)).count == previous.reduce(0, { $0 + $1.members.count }),
+              anchors.allSatisfy({ id, members in
+                  !members.isEmpty && previous.first(where: { $0.id == id })?.members.isSuperset(of: members) == true
+              }) else {
             throw PublicationFailure.invalidRequest
+        }
+        var anchoredGroup: [Int: String] = [:]
+        for (id, members) in anchors {
+            let matches = groups.indices.filter { members.isSubset(of: groups[$0]) }
+            guard matches.count == 1, anchoredGroup[matches[0]] == nil else {
+                throw PublicationFailure.conflictingOperation
+            }
+            anchoredGroup[matches[0]] = id
         }
         let overlaps = groups.map { group in previous.indices.filter { !previous[$0].members.isDisjoint(with: group) } }
         var used = Set<String>()
         let current = try groups.indices.map { index -> MomentIdentityEntry in
             let group = groups[index]
-            var inherited: String?
-            if overlaps[index].count == 1, let old = overlaps[index].first,
+            var inherited = anchoredGroup[index]
+            if inherited == nil, overlaps[index].count == 1, let old = overlaps[index].first,
+               anchors[previous[old].id] == nil,
                overlaps.filter({ $0.contains(old) }).count == 1 {
                 let shared = group.intersection(previous[old].members).count
                 if Double(shared) / Double(group.count) >= 0.5,

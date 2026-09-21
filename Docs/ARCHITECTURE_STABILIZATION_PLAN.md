@@ -588,6 +588,10 @@ guardrails are present; packaged-app traces and approval of the private owner be
 
 ### Phase 1: Catalog v2 and migration, 5-8 days
 
+Shadow implementation and validation are tracked in [`PHASE1_CATALOG_V2.md`](PHASE1_CATALOG_V2.md).
+The real-catalog rehearsal passes, but the shipping app has not cut over and no legacy data was
+removed.
+
 - Add schema, constraints, migrations, stable Moment reconciliation, and summary/detail queries.
 - Import current SQLite/JSON/UserDefaults state idempotently.
 - Keep algorithms and UI behavior unchanged.
