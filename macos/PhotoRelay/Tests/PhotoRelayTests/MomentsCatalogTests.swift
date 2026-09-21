@@ -18,6 +18,20 @@ final class MomentsCatalogTests: XCTestCase {
         XCTAssertEqual(reopened.moments.count, 2)
     }
 
+    func testMarkPublishedPersistsAlbumState() throws {
+        let moment = PhotoMoment(id: "moment", start: Date(), end: Date(), photos: [
+            IndexedPhoto(id: "photo", created: Date(), modified: Date(), latitude: nil, longitude: nil,
+                         favorite: false, width: 100, height: 100)
+        ])
+        var catalog = MomentsCatalog(updated: .distantPast, moments: [moment])
+        let date = Date()
+
+        XCTAssertTrue(catalog.markPublished(momentID: moment.id, albumID: "album", date: date))
+        XCTAssertEqual(catalog.moments[0].publishedAlbumID, "album")
+        XCTAssertEqual(catalog.moments[0].publishedDate, date)
+        XCTAssertFalse(catalog.markPublished(momentID: "missing", albumID: "album", date: date))
+    }
+
     func testNewestPhotoClaimedBeforeAlphabeticalID() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

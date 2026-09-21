@@ -403,6 +403,17 @@ actor CuratorWorker {
         try MomentsCatalog.load(from: url.deletingLastPathComponent().appendingPathComponent("moments-catalog.json"))?.moments ?? []
     }
 
+    func markPublished(momentID: String, albumID: String, date: Date) throws {
+        let catalogURL = url.deletingLastPathComponent().appendingPathComponent("moments-catalog.json")
+        guard var catalog = try MomentsCatalog.load(from: catalogURL) else {
+            throw PublicationFailure.invalidRequest
+        }
+        guard catalog.markPublished(momentID: momentID, albumID: albumID, date: date) else {
+            throw PublicationFailure.invalidRequest
+        }
+        try catalog.save(to: catalogURL)
+    }
+
     /// Uses only existing evidence caches; shared by presentation and isolated evaluation.
     func prepareDisplaySelection(_ moment: PhotoMoment, results: [String: CuratorVisionResult],
                                  thresholds: [SimilarityCategory: Float] = [:], balanced: Bool = true) async throws -> PhotoMoment {
@@ -576,7 +587,6 @@ private final class CuratorLibraryObserver: NSObject, PHPhotoLibraryChangeObserv
     }
 
     func photoLibraryDidChange(_ changeInstance: PHChange) {
-        NotificationCenter.default.post(name: .photoRelayPhotosAccessChanged, object: nil)
         lock.lock()
         defer { lock.unlock() }
         guard let details = changeInstance.changeDetails(for: assets) else {
@@ -955,6 +965,9 @@ final class CuratorController: ObservableObject {
                 "pending": moments.reduce(0) { $0 + ($1.selection?.pending.count ?? 0) }])
             lastOverview = Date()
         } catch is CancellationError {
+            return
+        } catch PublicationFailure.conflictingOperation {
+            // Another serialized catalog update won. The next worker tick will use it.
             return
         } catch {
             errorMessage = error.localizedDescription
@@ -1362,13 +1375,12 @@ final class CuratorController: ObservableObject {
         let receipt = try await publication.publish(request, adapter: PhotoKitAlbumAdapter.shared,
             retryAfterConfirmedAbsence: true)
 
-        await MainActor.run {
-            if let idx = moments.firstIndex(where: { $0.id == moment.id }) {
-                moments[idx].publishedAlbumID = receipt.albumID
-                moments[idx].publishedDate = Date()
-            }
+        let publishedDate = Date()
+        try await worker.markPublished(momentID: moment.id, albumID: receipt.albumID, date: publishedDate)
+        if let idx = moments.firstIndex(where: { $0.id == moment.id }) {
+            moments[idx].publishedAlbumID = receipt.albumID
+            moments[idx].publishedDate = publishedDate
         }
-        try? MomentsCatalog(updated: Date(), moments: moments).save(to: catalogURL)
         return receipt
     }
 }
