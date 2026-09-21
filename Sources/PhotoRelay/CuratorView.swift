@@ -1,10 +1,14 @@
+import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct CuratorDiagnosticsView: View {
     @ObservedObject var curator: CuratorController
     @State private var similaritySettings = false
     @State private var reviewing: PhotoMoment?
     @StateObject private var reviewDecisions = MomentReviewDecisions()
+    @State private var exportingDiagnostics = false
+    @State private var diagnosticExportStatus: String?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -18,9 +22,9 @@ struct CuratorDiagnosticsView: View {
                     GroupBox {
                         VStack(alignment: .leading, spacing: 12) {
                             Toggle("Analyze my Photos library while this Mac is idle", isOn: Binding(
-                                get: { curator.enabled }, set: curator.setEnabled))
+                                get: { curator.enabled }, set: { curator.setEnabled($0) }))
                             Toggle("Open Photo Relay at login", isOn: Binding(
-                                get: { curator.loginEnabled }, set: curator.setLoginEnabled))
+                                get: { curator.loginEnabled }, set: { curator.setLoginEnabled($0) }))
                             Text("Metadata and local visual analysis. No iCloud downloads, internet lookups, or album changes. Pauses between photos during activity, sync, Low Power Mode, or thermal pressure.")
                                 .font(.caption).foregroundStyle(.secondary)
                             Divider()
@@ -41,6 +45,23 @@ struct CuratorDiagnosticsView: View {
                                     .disabled(curator.syncBusy || curator.foregroundActive || curator.selectedRange == nil)
                             }
                         }.padding(8).frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    GroupBox("Support diagnostics") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("Exports app and macOS versions, aggregate catalog sizes, and counts-only activity history. It never includes photos, identifiers, filenames, titles, locations, OCR, or account credentials.")
+                                .font(.callout).foregroundStyle(.secondary)
+                            HStack {
+                                Button(exportingDiagnostics ? "Preparing Diagnostics..." : "Export Diagnostics...") {
+                                    exportDiagnostics()
+                                }
+                                .disabled(exportingDiagnostics)
+                                if let diagnosticExportStatus {
+                                    Text(diagnosticExportStatus).font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .padding(8).frame(maxWidth: .infinity, alignment: .leading)
                     }
 
                     HStack(alignment: .center) {
@@ -73,7 +94,8 @@ struct CuratorDiagnosticsView: View {
                     }
 
                     VStack(alignment: .leading, spacing: 5) {
-                        Toggle("Balanced shortlist (experimental)", isOn: Binding(get: { curator.balancedSelection }, set: curator.setBalancedSelection))
+                        Toggle("Balanced shortlist (experimental)", isOn: Binding(
+                            get: { curator.balancedSelection }, set: { curator.setBalancedSelection($0) }))
                         Text("Keeps Favorites and representatives across photo types, half-hours and GPS areas. Unknown locations are kept in a separate group. Other shots remain available as alternatives.")
                             .font(.caption).foregroundStyle(.secondary)
                         Button("Similar Photos Settings...") { similaritySettings = true }
@@ -143,5 +165,37 @@ struct CuratorDiagnosticsView: View {
         .alert("Photo Relay Curator", isPresented: Binding(get: { curator.errorMessage != nil }, set: { if !$0 { curator.errorMessage = nil } })) {
             Button("OK") { curator.errorMessage = nil }
         } message: { Text(curator.errorMessage ?? "") }
+    }
+
+    private func exportDiagnostics() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = "Photo Curator Diagnostics.json"
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+
+        let context = DiagnosticExportContext(
+            indexedPhotos: curator.indexedCount,
+            availableMoments: curator.availableMoments,
+            visibleMoments: curator.moments.count,
+            analyzedThisSession: curator.analyzedThisSession,
+            deferredThisSession: curator.deferredThisSession,
+            backgroundCurationEnabled: curator.enabled,
+            automaticPublicationEnabled: curator.autoPublishEnabled
+        )
+        exportingDiagnostics = true
+        diagnosticExportStatus = nil
+        Task {
+            do {
+                try await Task.detached(priority: .utility) {
+                    try DiagnosticBundleExporter.export(context: context, to: destination)
+                }.value
+                diagnosticExportStatus = "Saved"
+            } catch {
+                diagnosticExportStatus = "Export failed"
+                curator.errorMessage = error.localizedDescription
+            }
+            exportingDiagnostics = false
+        }
     }
 }

@@ -707,7 +707,7 @@ final class CuratorController: ObservableObject {
             UserDefaults.standard.set(true, forKey: "curatorPilotLifted")
         }
         enabled = UserDefaults.standard.bool(forKey: "curatorEnabled")
-        autoPublishEnabled = UserDefaults.standard.object(forKey: "curatorAutoPublish") as? Bool ?? true
+        autoPublishEnabled = CuratorPolicy.automaticPublicationEnabled()
         let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Photo Relay/curator/index.sqlite3")
         worker = CuratorWorker(url: url)
@@ -930,6 +930,8 @@ final class CuratorController: ObservableObject {
 
     func refreshOverview(reusingVisibleMoments: Bool = false) async {
         guard !overviewLoading else { return }
+        let interval = CuratorPerformance.begin("Moment overview")
+        defer { CuratorPerformance.end("Moment overview", interval) }
         overviewLoading = true
         defer { overviewLoading = false }
         let range = DateInterval(start: .distantPast, end: .distantFuture)
@@ -1005,7 +1007,7 @@ final class CuratorController: ObservableObject {
         }
     }
 
-    private func authorize(_ action: @escaping () -> Void) {
+    private func authorize(_ action: @MainActor @escaping @Sendable () -> Void) {
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         if status == .authorized { action(); return }
         guard status == .notDetermined else {
@@ -1117,6 +1119,8 @@ final class CuratorController: ObservableObject {
             restartRequested = false
             batchRunning = true
             Task {
+                let interval = CuratorPerformance.begin("Metadata batch")
+                defer { CuratorPerformance.end("Metadata batch", interval) }
                 defer { batchRunning = false }
                 do {
                     // Keep foreground review responsive; accelerate metadata-only reconciliation
@@ -1168,15 +1172,17 @@ final class CuratorController: ObservableObject {
         }
         batchRunning = true
         analysisTask = Task(priority: .utility) {
+            let interval = CuratorPerformance.begin("Analysis step")
+            defer { CuratorPerformance.end("Analysis step", interval) }
             var caughtUp = false
             var failedBeforeClaim = false
             defer {
                 batchRunning = false
                 analysisTask = nil
                 if CuratorPolicy.shouldContinueAnalysis(caughtUp: caughtUp, failedBeforeClaim: failedBeforeClaim) {
-                    Task { @MainActor [weak self] in
+                    Task { @MainActor in
                         await Task.yield()
-                        guard let self, token == self.revision else { return }
+                        guard token == self.revision else { return }
                         self.tick()
                     }
                 }
@@ -1331,6 +1337,8 @@ final class CuratorController: ObservableObject {
     }
 
     func publishToPhotos(moment: PhotoMoment, decisions: MomentReviewDecisions) async throws -> CuratedAlbumReceipt {
+        let interval = CuratorPerformance.begin("Photos publication")
+        defer { CuratorPerformance.end("Photos publication", interval) }
         publicationChangeInProgress = true
         defer {
             publicationChangeInProgress = false

@@ -9,6 +9,7 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+/Artifacts/
 
 # Local credentials and Google upload state
 /google_credentials*.json

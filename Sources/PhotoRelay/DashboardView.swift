@@ -11,6 +11,7 @@ struct DashboardView: View {
             CuratorView(curator: curator, model: model)
         }
         .navigationTitle("Photo Curator")
+        .onAppear { CuratorLaunchPerformance.shared.finish() }
         .alert("Photo Curator", isPresented: Binding(
             get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })) {
             Button("OK") { model.errorMessage = nil }

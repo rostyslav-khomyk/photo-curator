@@ -2,18 +2,18 @@ import Foundation
 import Vision
 import ImageIO
 
-enum VisionSignal<Value: Codable & Equatable>: Codable, Equatable {
+enum VisionSignal<Value: Codable & Equatable & Sendable>: Codable, Equatable, Sendable {
     case available(Value)
     case unavailable
     case failed
 }
 
-struct AestheticSignal: Codable, Equatable {
+struct AestheticSignal: Codable, Equatable, Sendable {
     let score: Float
     let utility: Bool
 }
 
-struct CuratorVisionResult: Codable, Equatable {
+struct CuratorVisionResult: Codable, Equatable, Sendable {
     let version: String
     let faces: VisionSignal<Int>
     let aesthetics: VisionSignal<AestheticSignal>

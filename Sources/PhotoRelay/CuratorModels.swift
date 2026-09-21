@@ -111,6 +111,10 @@ enum CuratorPeriod: String, CaseIterable, Identifiable {
 }
 
 enum CuratorPolicy {
+    static func automaticPublicationEnabled(defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: "curatorAutoPublish") as? Bool ?? false
+    }
+
     static func shouldContinueAnalysis(caughtUp: Bool, failedBeforeClaim: Bool) -> Bool {
         !caughtUp && !failedBeforeClaim
     }

@@ -40,8 +40,8 @@ struct MomentNarrativeSuggestion {
     let source: String
 }
 
-protocol LocalNarrativeModel {
-    var version: String { get }
+protocol LocalNarrativeModel: Sendable {
+    var version: String { get async }
     func isAvailable() async -> Bool
     func choose(from candidates: [MomentNarrativeText]) async throws -> Int
     func choose(from candidates: [MomentNarrativeText], evidence: MomentCaptionEvidence?) async throws -> Int
@@ -194,7 +194,7 @@ actor LocalMomentNarrative {
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
         var input = try encoder.encode(metadata)
-        input.append(Data((promptVersion + model.version).utf8))
+        input.append(Data((promptVersion + (await model.version)).utf8))
         let key = SHA256.hash(data: input).map { String(format: "%02x", $0) }.joined()
         let forbidden = ["photos from", "in pictures", "possible", "scenes from"]
         let ranked = options.enumerated().sorted { lhs, rhs in

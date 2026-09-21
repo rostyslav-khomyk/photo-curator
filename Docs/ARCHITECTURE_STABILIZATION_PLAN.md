@@ -1,6 +1,6 @@
 # Photo Curator Architecture Stabilization Plan
 
-Status: proposed for independent review
+Status: accepted; Phase 0 guardrails in progress
 Prepared: 2026-09-21
 Baseline: `fdca2bae` on `codex/photo-curator-full-history-snapshot`
 
@@ -571,6 +571,9 @@ The migration must estimate required free space before starting and refuse safel
 Feature work should pause until Phases 0 through 5 pass their gates.
 
 ### Phase 0: Baseline and stop-the-line guardrails, 2-3 days
+
+Implementation and gate status are tracked in [`PHASE0_BASELINE.md`](PHASE0_BASELINE.md). Automated
+guardrails are present; packaged-app traces and approval of the private owner benchmark remain open.
 
 - Add signposts, performance fixtures, repeatable Instruments scripts/checklists, and a diagnostic bundle exporter.
 - Record launch, scroll, analysis, storage, publication, and restart baselines on the current build.

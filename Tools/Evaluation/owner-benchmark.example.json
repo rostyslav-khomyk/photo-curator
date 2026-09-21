@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "benchmarkVersion": "example-v1",
+  "reviewedAt": "2026-09-21T00:00:00Z",
+  "cases": [
+    {
+      "id": "dense-trip-day",
+      "description": "Synthetic dense travel day with two distinct venues",
+      "assetKeys": ["sha256:example-a", "sha256:example-b", "sha256:example-c"],
+      "expectedMomentCount": 2,
+      "maximumFalseJoins": 0,
+      "maximumFalseSplits": 1,
+      "requiredHighlightKeys": ["sha256:example-a"]
+    },
+    {
+      "id": "quiet-everyday-period",
+      "description": "Synthetic sparse everyday captures with no invented story",
+      "assetKeys": ["sha256:example-d", "sha256:example-e"],
+      "expectedMomentCount": 2,
+      "maximumFalseJoins": 0,
+      "maximumFalseSplits": 0,
+      "requiredHighlightKeys": []
+    }
+  ]
+}

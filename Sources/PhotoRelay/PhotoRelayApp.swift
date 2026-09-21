@@ -19,6 +19,7 @@ struct PhotoRelayApp: App {
     @StateObject private var curator: CuratorController
 
     init() {
+        CuratorLaunchPerformance.shared.start()
         let model = PhotoRelayViewModel(backend: BackendController.shared)
         _model = StateObject(wrappedValue: model)
         _curator = StateObject(wrappedValue: CuratorController(model: model))
@@ -55,7 +56,7 @@ private struct MenuContent: View {
     var body: some View {
         Text(model.activity)
         Text(curator.activity)
-        Toggle("Curate While Idle", isOn: Binding(get: { curator.enabled }, set: curator.setEnabled))
+        Toggle("Curate While Idle", isOn: Binding(get: { curator.enabled }, set: { curator.setEnabled($0) }))
         if curator.foregroundActive { Button("Stop Range Scan") { curator.stopForeground() } }
         if let progress = model.transferProgress, progress.isTransferring, model.isWorking {
             Text(progress.transferSummary)
@@ -92,21 +93,19 @@ private struct DashboardActivationBridge: NSViewRepresentable {
 }
 
 private final class DashboardActivationView: NSView {
-    private var tokens: [NSObjectProtocol] = []
-
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        tokens.forEach(NotificationCenter.default.removeObserver)
-        tokens.removeAll()
+        NotificationCenter.default.removeObserver(self)
         guard let window else { return }
         NSApp.setActivationPolicy(.regular)
-        tokens.append(NotificationCenter.default.addObserver(forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main) { _ in
-            NSApp.setActivationPolicy(.regular)
-        })
-        tokens.append(NotificationCenter.default.addObserver(forName: NSWindow.willCloseNotification, object: window, queue: .main) { _ in
-            NSApp.setActivationPolicy(.accessory)
-        })
+        NotificationCenter.default.addObserver(self, selector: #selector(dashboardBecameKey),
+                                               name: NSWindow.didBecomeKeyNotification, object: window)
+        NotificationCenter.default.addObserver(self, selector: #selector(dashboardWillClose),
+                                               name: NSWindow.willCloseNotification, object: window)
     }
 
-    deinit { tokens.forEach(NotificationCenter.default.removeObserver) }
+    @objc private func dashboardBecameKey() { NSApp.setActivationPolicy(.regular) }
+    @objc private func dashboardWillClose() { NSApp.setActivationPolicy(.accessory) }
+
+    deinit { NotificationCenter.default.removeObserver(self) }
 }

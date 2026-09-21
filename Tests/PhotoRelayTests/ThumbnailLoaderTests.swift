@@ -4,12 +4,16 @@ import CoreGraphics
 
 @MainActor
 private final class FakeThumbnailProvider: CuratorThumbnailProvider {
-    var callback: ((ThumbnailEvent) -> Void)?
+    var callback: (@MainActor @Sendable (ThumbnailEvent) -> Void)?
     var immediate: ThumbnailEvent?
     var cancellations: [Int32] = []
     var requests = 0
     var requestedEdge = 0
-    func request(assetID: String, edge: Int, completion: @escaping (ThumbnailEvent) -> Void) -> Int32 {
+    func request(
+        assetID: String,
+        edge: Int,
+        completion: @MainActor @escaping @Sendable (ThumbnailEvent) -> Void
+    ) -> Int32 {
         requests += 1
         requestedEdge = edge
         callback = completion

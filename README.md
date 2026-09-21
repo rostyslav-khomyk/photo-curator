@@ -30,6 +30,15 @@ swift test
 uv run pytest
 ```
 
+Run the warning gate and deterministic 100,000-photo performance baseline with:
+
+```bash
+./Scripts/phase0_baseline.sh
+```
+
+Settings includes a privacy-safe **Export Diagnostics** action for alpha support. It exports only
+aggregate versions, counts, sizes, and whitelisted activity counters.
+
 Ad-hoc signing can cause macOS to request Photos permission again after a rebuild. A stable Developer ID signature is required to preserve the installed application's identity across distributed builds.
 
 ## Local Data
@@ -50,8 +59,9 @@ On 2026-09-21, the complete live library was verified with:
 - 5,224 Moments
 - Oldest Moment dated 1998-08-25
 - 56.5 MB persisted Moments catalog
-- 203 native tests passed, 10 skipped, 0 failed
+- 206 native tests passed, 11 skipped, 0 failed
 - 47 Google helper tests passed
 
 See [CURATOR_PLAN.md](Docs/CURATOR_PLAN.md) for the product direction and
-[CURATOR_DEVELOPMENT.md](Docs/CURATOR_DEVELOPMENT.md) for implementation history and verification details.
+[CURATOR_DEVELOPMENT.md](Docs/CURATOR_DEVELOPMENT.md) for implementation history, and
+[PHASE0_BASELINE.md](Docs/PHASE0_BASELINE.md) for stabilization measurements and open gates.

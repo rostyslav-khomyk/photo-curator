@@ -15,7 +15,7 @@ enum PhotoKitAssetEditFailure: LocalizedError {
     }
 }
 
-final class PhotoKitAssetEditor {
+struct PhotoKitAssetEditor: Sendable {
     static let shared = PhotoKitAssetEditor()
 
     func setFavorite(_ favorite: Bool, assetID: String) async throws {

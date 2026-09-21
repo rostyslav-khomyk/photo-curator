@@ -1,5 +1,10 @@
 # Exported Reference Evaluation
 
+`owner-benchmark.example.json` defines the public, synthetic shape of the versioned owner benchmark.
+Keep the real reviewed fixture in the private report folder selected by
+`PHOTO_RELAY_REFERENCE_REPORT`; never place stable photo identifiers, titles, or judgments in source
+control. Phase 1 cannot cut over until that private fixture is versioned and owner-approved.
+
 For a large-visit-only rerun, add `PHOTO_RELAY_VALIDATION_LARGE_ONLY=1` to the structural
 gate command below. It does not rerun or overwrite the holdout report. Reports now retain
 the exact production selection and display evidence in each catalog entry, not only counts.

@@ -1,7 +1,7 @@
 import Foundation
 import Photos
 
-final class PhotoKitAlbumAdapter: CuratedAlbumAdapter {
+struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
     static let shared = PhotoKitAlbumAdapter()
     let rootFolderName = "Photo Curator"
 

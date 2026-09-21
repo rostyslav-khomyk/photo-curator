@@ -13,7 +13,8 @@ enum ThumbnailEvent {
 
 @MainActor
 protocol CuratorThumbnailProvider {
-    func request(assetID: String, edge: Int, completion: @escaping (ThumbnailEvent) -> Void) -> Int32
+    func request(assetID: String, edge: Int,
+                 completion: @MainActor @escaping @Sendable (ThumbnailEvent) -> Void) -> Int32
     func cancel(_ requestID: Int32)
 }
 
@@ -30,6 +31,8 @@ final class CuratorThumbnailLoader {
     init(provider: CuratorThumbnailProvider) { self.provider = provider }
 
     func load(assetID: String, timeout: TimeInterval = 20, edge: Int = 1024) async throws -> CGImage {
+        let interval = CuratorPerformance.begin("Thumbnail request")
+        defer { CuratorPerformance.end("Thumbnail request", interval) }
         try Task.checkCancellation()
         guard active == nil else { throw ThumbnailFailure.busy }
         let requestedEdge = min(4096, max(1, edge))
@@ -106,7 +109,8 @@ final class PhotoKitThumbnailProvider: CuratorThumbnailProvider {
         self.allowsNetworkAccess = allowsNetworkAccess
     }
 
-    func request(assetID: String, edge: Int, completion: @escaping (ThumbnailEvent) -> Void) -> Int32 {
+    func request(assetID: String, edge: Int,
+                 completion: @MainActor @escaping @Sendable (ThumbnailEvent) -> Void) -> Int32 {
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         if status == .notDetermined {
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { newStatus in
@@ -127,7 +131,8 @@ final class PhotoKitThumbnailProvider: CuratorThumbnailProvider {
         return performFetch(assetID: assetID, edge: edge, completion: completion)
     }
 
-    private func performFetch(assetID: String, edge: Int, completion: @escaping (ThumbnailEvent) -> Void) -> Int32 {
+    private func performFetch(assetID: String, edge: Int,
+                              completion: @MainActor @escaping @Sendable (ThumbnailEvent) -> Void) -> Int32 {
         guard let asset = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil).firstObject,
               !asset.isHidden else {
             completion(.failure(.missing)); return PHInvalidImageRequestID
@@ -158,7 +163,7 @@ final class PhotoKitThumbnailProvider: CuratorThumbnailProvider {
         for asset: PHAsset,
         assetID: String,
         edge: Int,
-        completion: @escaping (ThumbnailEvent) -> Void
+        completion: @MainActor @escaping @Sendable (ThumbnailEvent) -> Void
     ) -> Int32 {
         let requestID = nextReviewRequestID
         nextReviewRequestID -= 1
@@ -183,15 +188,14 @@ final class PhotoKitThumbnailProvider: CuratorThumbnailProvider {
         assetID: String,
         edge: Int,
         version: PHImageRequestOptionsVersion,
-        completion: @escaping (ThumbnailEvent) -> Void
+        completion: @MainActor @escaping @Sendable (ThumbnailEvent) -> Void
     ) {
         let options = PHImageRequestOptions()
         options.isNetworkAccessAllowed = true
         options.isSynchronous = false
         options.deliveryMode = .highQualityFormat
         options.version = version
-        request.photoKitID = manager.requestImageDataAndOrientation(for: asset, options: options) {
-            data, _, _, info in
+        request.photoKitID = manager.requestImageDataAndOrientation(for: asset, options: options) { [weak self, weak request] data, _, _, info in
             Task { @MainActor [weak self, weak request] in
                 guard let self, let request, self.reviewRequests[requestID] === request else { return }
                 if (info?[PHImageCancelledKey] as? Bool) == true {
@@ -237,7 +241,7 @@ final class PhotoKitThumbnailProvider: CuratorThumbnailProvider {
         asset: PHAsset,
         assetID: String,
         edge: Int,
-        completion: @escaping (ThumbnailEvent) -> Void
+        completion: @MainActor @escaping @Sendable (ThumbnailEvent) -> Void
     ) {
         guard reviewRequests[requestID] === request, !request.usingOriginal else { return }
         request.usingOriginal = true
@@ -254,7 +258,7 @@ final class PhotoKitThumbnailProvider: CuratorThumbnailProvider {
         _ requestID: Int32,
         request: ReviewRequest,
         event: ThumbnailEvent,
-        completion: @escaping (ThumbnailEvent) -> Void
+        completion: @MainActor @escaping @Sendable (ThumbnailEvent) -> Void
     ) {
         guard reviewRequests.removeValue(forKey: requestID) === request else { return }
         request.fallbackTask?.cancel()

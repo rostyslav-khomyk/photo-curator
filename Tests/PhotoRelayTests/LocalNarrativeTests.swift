@@ -2,13 +2,19 @@ import XCTest
 import ImageIO
 @testable import PhotoRelay
 
-private final class FakeNarrativeModel: LocalNarrativeModel {
+private actor FakeNarrativeModel: LocalNarrativeModel {
     var version = "test1"
     var available = true
     var calls = 0
     var choice = 1
     var fail = false
     var receivedEvidence: MomentCaptionEvidence?
+    func setVersion(_ value: String) { version = value }
+    func setAvailable(_ value: Bool) { available = value }
+    func setChoice(_ value: Int) { choice = value }
+    func setFailure(_ value: Bool) { fail = value }
+    func callCount() -> Int { calls }
+    func evidence() -> MomentCaptionEvidence? { receivedEvidence }
     func isAvailable() async -> Bool { available }
     func choose(from candidates: [MomentNarrativeText]) async throws -> Int {
         calls += 1
@@ -92,23 +98,27 @@ final class LocalNarrativeTests: XCTestCase {
         let first = try await LocalMomentNarrative(cacheURL: url).suggest(metadata, model: model)
         XCTAssertFalse(first.text.title.localizedCaseInsensitiveContains("photos from"))
         _ = try await LocalMomentNarrative(cacheURL: url).suggest(metadata, model: model)
-        XCTAssertEqual(model.calls, 1)
-        model.version = "test2"
+        var calls = await model.callCount()
+        XCTAssertEqual(calls, 1)
+        await model.setVersion("test2")
         _ = try await LocalMomentNarrative(cacheURL: url).suggest(metadata, model: model)
-        XCTAssertEqual(model.calls, 2)
+        calls = await model.callCount()
+        XCTAssertEqual(calls, 2)
     }
 
     func testUnavailableAndMalformedResponsesFallBack() async throws {
         let url = url(); defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
         let engine = LocalMomentNarrative(cacheURL: url), model = FakeNarrativeModel()
-        model.available = false
+        await model.setAvailable(false)
         let unavailable = try await engine.suggest(metadata, model: model)
         XCTAssertEqual(unavailable.source, "Deterministic fallback")
-        XCTAssertEqual(model.calls, 0)
-        model.available = true; model.choice = 999
+        let unavailableCalls = await model.callCount()
+        XCTAssertEqual(unavailableCalls, 0)
+        await model.setAvailable(true)
+        await model.setChoice(999)
         let invalid = try await engine.suggest(metadata, model: model)
         XCTAssertEqual(invalid.text, unavailable.text)
-        model.fail = true
+        await model.setFailure(true)
         let failed = try await engine.suggest(metadata, model: model)
         XCTAssertEqual(failed.source, "Deterministic fallback")
     }
@@ -120,7 +130,8 @@ final class LocalNarrativeTests: XCTestCase {
         let unknown = MomentNarrativeMetadata(dateLabel: "21 July 2026", photoCount: 3, favoriteCount: 0, verifiedPlace: nil)
         let value = try await engine.suggest(unknown, model: model)
         XCTAssertFalse(value.text.title.contains("Delft"))
-        XCTAssertEqual(model.calls, 2)
+        let calls = await model.callCount()
+        XCTAssertEqual(calls, 2)
         XCTAssertThrowsError(try LocalMomentNarrative.candidates(MomentNarrativeMetadata(dateLabel: "", photoCount: -1, favoriteCount: 0, verifiedPlace: nil)))
     }
 
@@ -131,13 +142,16 @@ final class LocalNarrativeTests: XCTestCase {
         enriched.contextEvidence = MomentCaptionEvidence(inspected: 3, total: 12, excludedScreenshots: 0, mixedTimeline: false,
             activities: [CaptionActivityEvidence(activity: .dining, assets: ["a", "b"])], textClues: [])
         _ = try await engine.suggest(enriched, model: model)
-        XCTAssertEqual(model.receivedEvidence, enriched.contextEvidence)
+        let evidence = await model.evidence()
+        XCTAssertEqual(evidence, enriched.contextEvidence)
         _ = try await engine.suggest(enriched, model: model)
-        XCTAssertEqual(model.calls, 1)
+        var calls = await model.callCount()
+        XCTAssertEqual(calls, 1)
         enriched.contextEvidence = MomentCaptionEvidence(inspected: 3, total: 12, excludedScreenshots: 0, mixedTimeline: true,
             activities: [], textClues: [])
         let changed = try await engine.suggest(enriched, model: model)
-        XCTAssertEqual(model.calls, 2)
+        calls = await model.callCount()
+        XCTAssertEqual(calls, 2)
         XCTAssertEqual(changed.text.title, "20 July 2026 in Delft")
     }
 

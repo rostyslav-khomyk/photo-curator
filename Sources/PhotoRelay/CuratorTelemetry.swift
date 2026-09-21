@@ -1,10 +1,12 @@
 import Foundation
 
 /// Counts-only local pilot telemetry. Never accepts asset IDs, OCR, coordinates or tokens.
-final class CuratorTelemetry {
+struct CuratorTelemetry: Sendable {
     static let shared = CuratorTelemetry(directory: FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Library/Logs/Photo Relay"))
-    enum Event: String { case launch, enabled, paused, metadata, analysis, catalog, caughtUp, failure, waiting, publication, libraryChange }
+    enum Event: String, CaseIterable, Sendable {
+        case launch, enabled, paused, metadata, analysis, catalog, caughtUp, failure, waiting, publication, libraryChange
+    }
     let directory: URL
     let maximumBytes: Int
     private let queue = DispatchQueue(label: "PhotoCurator.telemetry")

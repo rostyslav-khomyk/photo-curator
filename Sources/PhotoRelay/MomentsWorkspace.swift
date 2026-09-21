@@ -498,7 +498,7 @@ struct MomentCoverCard: View {
 }
 
 private struct MomentViewportPreferenceKey: PreferenceKey {
-    static var defaultValue: [String: CGFloat] = [:]
+    static let defaultValue: [String: CGFloat] = [:]
     static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
         value.merge(nextValue(), uniquingKeysWith: { _, new in new })
     }
@@ -598,9 +598,12 @@ struct CuratorSettingsView: View {
             }
 
             Section("Background Curation") {
-                Toggle("Prepare Moments while this Mac is idle", isOn: Binding(get: { curator.enabled }, set: curator.setEnabled))
-                Toggle("Auto-save ready albums to Photos", isOn: Binding(get: { curator.autoPublishEnabled }, set: curator.setAutoPublishEnabled))
-                Toggle("Open Photo Curator at login", isOn: Binding(get: { curator.loginEnabled }, set: curator.setLoginEnabled))
+                Toggle("Prepare Moments while this Mac is idle", isOn: Binding(
+                    get: { curator.enabled }, set: { curator.setEnabled($0) }))
+                Toggle("Auto-save ready albums to Photos", isOn: Binding(
+                    get: { curator.autoPublishEnabled }, set: { curator.setAutoPublishEnabled($0) }))
+                Toggle("Open Photo Curator at login", isOn: Binding(
+                    get: { curator.loginEnabled }, set: { curator.setLoginEnabled($0) }))
                 Text("Moments are organized privately on this Mac while idle. Albums reference your existing library under 'Photo Curator'; titles and stories remain editable in Photo Curator.")
                     .font(.caption).foregroundStyle(.secondary)
             }

@@ -1963,3 +1963,28 @@ Photos access, network research or private-photo inspection in this subchunk.
   boundaries; false joins cost more than false splits; highlight dimensions remain separately
   visible; and an owner-reviewed benchmark is frozen in Phase 0 before migration. Alpha owners judge
   family meaning while independent reviewers judge engineering and usability.
+
+## Architecture stabilization Phase 0 guardrails (2026-09-21)
+
+- Added `OSSignposter` intervals for launch-to-interactive, overview preparation, thumbnail requests,
+  metadata batches, visual-analysis steps, and Photos publication. These intervals have no photo IDs,
+  titles, OCR, or coordinates.
+- Added `Scripts/capture_instruments.sh` and `Scripts/phase0_baseline.sh`. The baseline script fails on
+  any production strict-concurrency warning and runs an opt-in deterministic 100,000-photo grouping
+  time/memory fixture without accessing Photos.
+- The initial synthetic baseline averages 0.347 seconds and 78,142 kB peak physical memory over three
+  grouping runs on the development Mac. It is a grouping baseline, not a full-app responsiveness claim.
+- Added a Settings diagnostic exporter that writes mode-0600 JSON containing only aggregate versions,
+  file/byte counts, controller counts, and whitelisted telemetry counters. Tests prove private session
+  values, filenames, unknown fields, and titles are excluded.
+- A fresh closed-alpha install now defaults automatic Photos publication off. Existing users' explicit
+  enabled or disabled choices are preserved.
+- Production code builds with `-strict-concurrency=complete` and zero warnings. Callback and model
+  values crossing concurrency boundaries now have explicit Sendable contracts; test doubles were
+  updated to match.
+- Added `PHASE0_BASELINE.md` and a synthetic public owner-benchmark format. Packaged-app Instruments
+  traces, oldest-supported-Mac measurements, and owner approval of the private benchmark remain open
+  exit-gate items; they are not represented as completed evidence.
+- Verification: 206 native tests passed, 11 opt-in tests skipped, zero failures; 47 Google helper
+  tests passed; the complete-concurrency production build passed with zero warnings. No packaged app
+  rebuild, deployment, Photos mutation, or private-photo evaluation was performed in this phase.
