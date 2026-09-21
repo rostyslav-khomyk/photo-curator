@@ -1,5 +1,18 @@
 # Background Curator: Development Record
 
+## Independent architecture review incorporated (2026-09-21)
+
+- Made SQLite ownership explicit: write transactions are synchronous, nonescaping, and never cross
+  an `await`; asynchronous PhotoKit and analysis inputs are gathered before `BEGIN`.
+- Added persisted, bounded-backoff verification to the PhotoKit publication saga. Observer callbacks
+  wake verification early but are not treated as sole proof of an external effect.
+- Added protected user-anchor assets to stable Moment reconciliation so manual curation dominates
+  ordinary membership drift and conflicting anchors fail closed.
+- Moved user-prioritized analysis ahead of ordinary PhotoKit ingestion and added bounded ingestion
+  quanta so continuous iCloud changes cannot starve active user intent.
+- Specified revision-safe thumbnail presentation: stale callbacks are no-ops, while a still-eligible
+  displayed image remains visible until its current replacement succeeds.
+
 ## Native repository cleanup (2026-09-21)
 
 - Promoted the Swift package, sources, tests, and `Info.plist` to the repository root.

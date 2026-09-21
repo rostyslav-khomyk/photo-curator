@@ -127,6 +127,8 @@ The implementation must enforce these rules:
 11. Photo volume controls available detail, not presumed emotional importance.
 12. A candidate curation generation cannot replace the active generation until its whole-library
     report is complete and user decisions have been reconciled.
+13. A SQLite transaction is synchronous from begin through commit or rollback. No transaction may
+    suspend, call PhotoKit, perform image work, or cross an actor boundary.
 
 ## 5. Target architecture
 
@@ -147,7 +149,7 @@ Application coordinators
     v
 CatalogStore
     |- one serialized writer connection
-    |- one read-only connection for short UI queries
+    |- bounded read-only connections for short UI queries
     |- WAL, migrations, constraints, transactions
     |
     +---- durable catalog.sqlite in Application Support
@@ -158,6 +160,12 @@ Pure domain code
 ```
 
 There should be no generic application event bus. Coordinators call explicit commands and expose typed `AsyncStream` changes where observation is needed. System-level notifications remain appropriate for window activation and OS lifecycle only.
+
+`CatalogStore` owns every SQLite connection. Its writer actor submits a synchronous, nonescaping
+transaction closure to the serialized SQLite connection; a read connection is never shared by
+concurrent queries. Callers gather PhotoKit, Vision, and other asynchronous inputs before opening a
+transaction, then publish typed changes only after commit. Transaction closures cannot `await`, call
+external APIs, or invoke callbacks. Signposts and debug assertions flag unexpectedly long writes.
 
 ## 6. Durable data model
 
@@ -231,9 +239,13 @@ Moment identity cannot be a fresh hash of the latest grouping. When grouping cha
 
 1. The engine produces candidate segments with deterministic membership fingerprints.
 2. A transactional reconciliation matches candidates to existing Moments using exact membership first, then a conservative overlap rule.
-3. Reviewed/protected Moments are never silently reassigned.
-4. Ambiguous matches create new Moments and retain the old record for explicit reconciliation rather than guessing.
-5. User edits and publication history stay attached to the stable Moment UUID.
+3. Durable user anchors -- explicitly included/highlighted assets, protected grouping members, and a
+   user-selected cover -- receive dominant inheritance weight. A candidate containing a uniquely
+   matching anchor set normally inherits the existing UUID even when surrounding membership shifts.
+4. Reviewed/protected Moments are never silently reassigned. If anchors split across candidates,
+   conflict, or disappear, reconciliation fails closed rather than guessing.
+5. Ambiguous matches create new Moments and retain the old record for explicit reconciliation.
+6. User edits and publication history stay attached to the stable Moment UUID.
 
 The existing `MomentIdentityResolver` can inform this logic, but it must be connected to the primary database path rather than maintained as another sidecar archive.
 
@@ -342,7 +354,16 @@ Stories or alter event boundaries by themselves.
 - Maintain a cost-limited `NSCache` of decoded card images.
 - Move `CGContext` resizing and image decoding off the MainActor through a nonisolated async function or bounded detached work.
 - Keep review-quality image requests separate from grid thumbnails and allow iCloud access only for explicit review.
-- Cancel requests for reused/disappeared cards and reject stale completions by request token.
+- Key each request by Moment ID, summary revision, cover asset ID, target size, and display scale.
+- Cancel requests for reused/disappeared cards. A completion whose full request key no longer matches
+  performs no presentation-state mutation.
+- Separate the displayed image from the pending request. While a replacement is pending, retain the
+  last valid image if its cover asset is still eligible, then replace or crossfade it only after the
+  current request succeeds. This prevents a rejected stale completion from blanking the card.
+- If there is no valid prior image, keep one stable skeleton. If the prior cover was deleted, hidden,
+  or removed from the Moment, discard it immediately and show the skeleton rather than stale content.
+- Show an unavailable state only after the current cover is confirmed ineligible or bounded retries
+  for the current request are exhausted.
 - Choose cover IDs during curation and persist them. Thumbnail loading must not decide Moment semantics.
 
 ## 9. Background scheduling
@@ -366,8 +387,8 @@ When no work is eligible, it suspends on an `AsyncStream` or clock deadline. It 
 Priority order:
 
 1. User-requested detail and visible cover preparation.
-2. Small PhotoKit change ingestion.
-3. User-prioritized range analysis.
+2. User-prioritized range analysis.
+3. Small PhotoKit change ingestion, including dependency slices required by priority 2.
 4. Narrative and grouping updates needed by visible summaries.
 5. Ordinary analysis and full verification.
 6. Automatic publication, only under its explicit policy.
@@ -375,6 +396,11 @@ Priority order:
 Start with one Vision/OCR worker because the present analyzer and PhotoKit loader are designed for single flight. Add bounded parallelism only after Instruments proves it improves throughput without memory or UI regressions.
 
 Every long operation works in bounded transactions, yields between units, and checks policy. No coordinator is represented by an open-ended set of unretained `Task` values.
+
+PhotoKit ingestion runs in bounded quanta, initially no more than 100 changes or 500 milliseconds,
+then returns to scheduler arbitration. If user-prioritized work is waiting, ingestion cannot receive
+two consecutive quanta unless that ingestion is a declared dependency of the user request. Continuous
+iCloud changes therefore make progress without starving explicit user work.
 
 A full-library candidate generation runs below visible thumbnails, user commands, publication, and
 new-photo curation. It processes bounded date partitions, commits checkpoints, and can pause without
@@ -412,9 +438,15 @@ Rules:
 - Only `PublicationCoordinator` may execute a publication for a Moment.
 - All UI and automatic requests route through the same command.
 - After PhotoKit returns, verify album identity and membership, then commit the receipt and Moment status in one SQLite transaction.
-- If the app stops in `applying`, recover by inspecting managed albums and exact requested membership.
-- If absence is confirmed, retry. If an effect is ambiguous, require reconciliation and never create another album blindly.
-- Treat the matching PhotoKit observer event as confirmation, not as interference.
+- Persist verification attempt count and `not_before`, then re-fetch album identity and exact requested
+  membership with bounded exponential backoff and jitter. This covers cold-launch and batched PhotoKit
+  visibility delays.
+- If the app stops in `applying`, recover through the same verification schedule. Do not reapply after
+  one empty fetch; require stable absence across fresh fetches before retrying the mutation.
+- Treat a matching PhotoKit observer event as an early wake-up hint and expected evidence, not as the
+  sole proof of success. Verification still reads the resulting PhotoKit state.
+- If an effect remains ambiguous or verification exhausts its retry budget, enter
+  `needsReconciliation` and never create another album blindly.
 - Make `PublicationFailure` a `LocalizedError` with stable categories, recovery suggestions, and an operation ID suitable for logs.
 - Default automatic publication to off during closed alpha until restart, sleep/wake, and forced-termination soak tests pass.
 
@@ -440,6 +472,9 @@ Google sync is a separate product boundary and must not own or refresh the curat
 - A `Task` created inside `@MainActor` inherits that isolation. Heavy functions must be explicitly nonisolated or run as bounded detached work before returning small values to the UI.
 - Each coordinator retains and cancels its own long-lived task.
 - Avoid callbacks that mutate shared state after their owning request has been superseded; compare stable tokens and revisions.
+- Keep every database transaction closure synchronous and nonescaping. Complete asynchronous
+  preparation before `BEGIN`, emit observations after `COMMIT`, and never hold a transaction across
+  an `await`.
 - Move to Swift 6 language mode only after behavior is stable and the strict build remains warning-free.
 
 ## 14. Observability and performance gates
@@ -496,12 +531,20 @@ Keep private photos out of CI. Retain the existing exported-photo quality set as
 - Scroll entire history repeatedly while analysis runs.
 - Open/edit/delete/favorite/merge during ingestion and analysis.
 - Quit or force-terminate before, during, and after PhotoKit publication.
+- Delay and coalesce PhotoKit observer delivery, delay cold-launch visibility, and terminate at every
+  publication phase to exercise persisted verification backoff.
 - Self-authored PhotoKit changes interleaved with external edits from Photos.
+- Sustain continuous PhotoKit changes while visible-cover and user-prioritized work wait; assert
+  bounded scheduler latency and continued ingestion progress.
 - Sleep/wake, thermal pressure, Low Power Mode, denied/limited/revoked Photos access.
 - Cloud-only and damaged assets, missing thumbnails, and low disk space.
+- Race thumbnail revisions, cover replacements, deletion, view reuse, cancellation, and failure;
+  assert that stale completions never mutate a card and a valid displayed frame never flickers away.
 - Google append/replace interruption and restart.
 - Candidate-generation interruption, comparison, activation, and rollback.
 - Dense trip decomposition into scene Moments under one Story without fragmenting sparse milestones.
+- Regroup dense capture periods around user anchors; assert unique UUID inheritance and fail closed on
+  split or conflicting anchors.
 - Whole-library metrics remain identical across restart and incremental recomputation.
 - Migration from the current 2.7 GB installation without losing user edits or publication markers.
 - Apple Silicon and Intel Macs across macOS 13 through the newest supported release.
@@ -718,7 +761,8 @@ The external reviewer should challenge these points specifically:
 4. Can a PhotoKit callback re-enter publication or verification through an indirect UI refresh?
 5. Are all publication crash windows represented and tested, including success before local receipt persistence?
 6. Can migration fail or run out of disk without touching the old authority?
-7. Are summary revisions sufficient to reject stale asynchronous UI and thumbnail completions?
+7. Does the full thumbnail request key reject stale completions while retaining the last eligible
+   displayed frame, and does invalidating an old cover remove it without waiting for its replacement?
 8. Do the proposed memory and responsiveness budgets hold on the oldest supported Intel Mac?
 9. Does moving derived analysis to Caches create any unacceptable automatic-purge behavior for a week-long initial analysis?
 10. Can Google credentials and operation state be migrated to Keychain/SQLite without forcing unnecessary consent?
