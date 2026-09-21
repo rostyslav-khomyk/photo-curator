@@ -1,38 +1,19 @@
 .DS_Store
-build/
 .build/
-dist/
-wheelhouse/
-icloudpd.egg-info
-tests/fixtures/**
-__pycache__
-.pytest_cache
-.cache
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
 *.pyc
-.idea
-.coverage
-.coverage.*
-htmlcov
-*.whl
-.venv
-venv
 *.spec
-# docs
-docs/_build
-# exclude since there is no js development, just for local testing npm packaging
-node_modules/
-/package.json
-/package-lock.json
-# used for local troubleshooting
-.photos
-.cookies/
+*.egg-info/
+build/
+dist/
 
-# Local sync state and secrets
+# Local credentials and Google upload state
 /google_credentials*.json
-/icloud_photos_sync_config.json
-/album_mapping.json
-/icloud_photos/
+/photo_curator_uploads.sqlite3*
 
-.claude/
-
-*.har
+# Local development state
+/.claude/
+/*.har

@@ -1,74 +1,57 @@
-# iCloud Photos Downloader [![Quality Checks](https://github.com/icloud-photos-downloader/icloud_photos_downloader/workflows/Quality%20Checks/badge.svg)](https://github.com/icloud-photos-downloader/icloud_photos_downloader/actions/workflows/quality-checks.yml) [![Build and Package](https://github.com/icloud-photos-downloader/icloud_photos_downloader/workflows/Produce%20Artifacts/badge.svg)](https://github.com/icloud-photos-downloader/icloud_photos_downloader/actions/workflows/produce-artifacts.yml) [![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+# Photo Curator for macOS
 
-- A command-line tool to download all your iCloud photos.
-- Works on Linux, Windows, and macOS; laptop, desktop, and NAS
-- Available as an executable for direct downloading and through package managers/ecosystems ([Docker](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#docker), [PyPI](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#pypi), [AUR](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#aur), [npm](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#npm))
-- Developed and maintained by volunteers (we are always looking for [help](CONTRIBUTING.md)). 
+Photo Curator is the native macOS workspace for turning a large Photos library into persistent, reviewable Moments. It performs metadata indexing, visual analysis, grouping, title preparation, and representative-photo selection locally, while keeping the user's corrections separate from automatic recommendations.
 
-See [Documentation](https://icloud-photos-downloader.github.io/icloud_photos_downloader/) for more details. Also, check [Issues](https://github.com/icloud-photos-downloader/icloud_photos_downloader/issues)
+## Current Workflow
 
-We aim to release new versions once a week (Friday), if there is something worth delivering.
+- Browse a complete Moments catalog, with the last visible position restored when the app reopens.
+- Prioritize a time range without changing which Moments belong in the catalog.
+- Review a Moment, edit its title, select highlights, manage Favorites, and delete unwanted photos through PhotoKit.
+- Save curated Moments as albums in Photos, merge selected Moments, or export selected photos to Google Photos.
+- Add significant places such as Home and Work to improve local titles and grouping context.
+- Let background curation continue newest-to-oldest while foreground review remains responsive.
 
-## iCloud Prerequisites
+Google Photos integration is started only when requested. The small helper under
+`GooglePhotosHelper/` communicates through private local pipes and opens a temporary
+localhost callback only during OAuth; Photo Curator does not keep a web server running.
 
-To make iCloud Photo Downloader work, ensure the iCloud account is configured with the following settings, otherwise Apple Servers will return an ACCESS_DENIED error:
+## Build and Run
 
-- **Enable Access iCloud Data on the Web:** On your iPhone / iPad, enable `Settings > Apple ID > iCloud > Access iCloud Data on the Web`
-- **Disable Advanced Data Protection:** On your iPhone /iPad disable `Settings > Apple ID > iCloud > Advanced Data Protection`
-
-
-## Install and Run
-
-There are three ways to run `icloudpd`:
-1. Download executable for your platform from the GitHub [Release](https://github.com/icloud-photos-downloader/icloud_photos_downloader/releases/tag/v1.32.2) and run it
-1. Use package manager to install, update, and, in some cases, run ([Docker](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#docker), [PyPI](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#pypi), [AUR](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#aur), [npm](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html#npm))
-1. Build and run from the source
-
-See [Documentation](https://icloud-photos-downloader.github.io/icloud_photos_downloader/install.html) for more details
-
-## Features
-
-<!-- start features -->
-
-- Three modes of operation:
-  - **Copy** - download new photos from iCloud (default mode)
-  - **Sync** - download new photos from iCloud and delete local files that were removed in iCloud (`--auto-delete` option)
-  - **Move** - download new photos from iCloud and delete photos in iCloud (`--keep-icloud-recent-days` option)
-- Support for Live Photos (image and video as separate files) and RAW images (including RAW+JPEG)
-- Automatic de-duplication of photos with the same name
-- One time download and an option to monitor for iCloud changes continuously (`--watch-with-interval` option)
-- Optimizations for incremental runs (`--until-found` and `--recent` options)
-- Photo metadata (EXIF) updates (`--set-exif-datetime` option)
-- ... and many more (use `--help` option to get full list)
-
-<!-- end features -->
-
-## Experimental Mode
-
-Some changes are added to the experimental mode before they graduate into the main package. [Details](EXPERIMENTAL.md)
-
-## Usage
-
-To keep your iCloud photo collection synchronized to your local system:
-
-```
-icloudpd --directory /data --username my@email.address --watch-with-interval 3600
+```bash
+uv sync --group dev
+./Scripts/build_app.sh
+open "dist/Photo Curator.app"
 ```
 
-> [!IMPORTANT]
-> It is `icloudpd`, not `icloud` executable
+Run the native test suite with:
 
-> [!TIP]
-> Synchronization logic can be adjusted with command-line parameters. Run `icloudpd --help` to get full list.
-
-To independently create and authorize a session (and complete 2SA/2FA validation if needed) on your local system:
-
+```bash
+swift test
+uv run pytest
 ```
-icloudpd --username my@email.address --password my_password --auth-only
+
+Ad-hoc signing can cause macOS to request Photos permission again after a rebuild. A stable Developer ID signature is required to preserve the installed application's identity across distributed builds.
+
+## Local Data
+
+Photo Curator stores its durable catalog and corrections under:
+
+```text
+~/Library/Application Support/Photo Relay/curator/
 ```
-> [!TIP]
-> This feature can also be used to check and verify that the session is still authenticated. 
 
-## Contributing
+Supporting app state is stored under `~/Library/Application Support/Photo Relay/`, and rotating logs are written under `~/Library/Logs/Photo Relay/`. Temporary export and OAuth files use system-recommended temporary locations. Rebuilding the app does not intentionally erase the catalog.
 
-Want to contribute to iCloud Photos Downloader? Awesome! Check out the [contributing guidelines](CONTRIBUTING.md) to get involved.
+## Verified Checkpoint
+
+On 2026-09-21, the complete live library was verified with:
+
+- 108,999 indexed photos
+- 5,224 Moments
+- Oldest Moment dated 1998-08-25
+- 56.5 MB persisted Moments catalog
+- 203 native tests passed, 10 skipped, 0 failed
+- 47 Google helper tests passed
+
+See [CURATOR_PLAN.md](Docs/CURATOR_PLAN.md) for the product direction and
+[CURATOR_DEVELOPMENT.md](Docs/CURATOR_DEVELOPMENT.md) for implementation history and verification details.
