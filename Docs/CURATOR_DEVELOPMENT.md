@@ -2026,3 +2026,20 @@ Photos access, network research or private-photo inspection in this subchunk.
   build passed complete concurrency checking with zero warnings. Owner-library sleep/relaunch
   qualification remains open before the Phase 3 exit gate is closed. No catalog wipe, Photos
   mutation, deployment, or indexing restart occurred.
+
+## Architecture stabilization Phase 4 publication saga (2026-09-23)
+
+- Replaced per-Moment JSON publication journals and the legacy JSON marker write with a Catalog v2
+  saga: `requested -> applying -> verifying -> succeeded`.
+- `PublicationCoordinator` now owns both manual and automatic Photos saves. Startup reconciles
+  unfinished operations, and an immutable in-flight request cannot silently change selection or title.
+- The verified receipt and visible Photos marker commit atomically in SQLite. Moment regeneration
+  preserves operation and receipt rows rather than erasing them with derived membership.
+- PhotoKit verification distinguishes confirmed membership, absence, and conflicting membership;
+  it uses bounded backoff, retries only the idempotent managed-album path after repeated absence, and
+  fails closed on conflicts. Typed errors replace raw `PublicationFailure error N` dialogs.
+- The forced-interruption matrix covers cancellation and relaunch around every external-effect
+  boundary. The full native suite passes 214 tests with 12 opt-in skips and zero failures; the strict
+  production build passes complete concurrency checking with zero warnings.
+- Copied owner-library forced termination and packaged-app Instruments qualification remain open.
+  No catalog wipe, Photos mutation, deployment, or indexing restart occurred.

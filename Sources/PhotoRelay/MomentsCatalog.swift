@@ -19,15 +19,6 @@ struct MomentsCatalog: Codable {
         return value
     }
 
-    @discardableResult
-    mutating func markPublished(momentID: String, albumID: String, date: Date) -> Bool {
-        guard !albumID.isEmpty, let index = moments.firstIndex(where: { $0.id == momentID }) else { return false }
-        moments[index].publishedAlbumID = albumID
-        moments[index].publishedDate = date
-        updated = date
-        return true
-    }
-
     func save(to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true,
                                                attributes: [.posixPermissions: 0o700])

@@ -114,7 +114,7 @@ private final class CatalogV2Connection {
                     }
                 }
             }
-            guard sqlite3_exec(opened, "PRAGMA user_version=4;", nil, nil, nil) == SQLITE_OK else {
+            guard sqlite3_exec(opened, "PRAGMA user_version=5;", nil, nil, nil) == SQLITE_OK else {
                 throw NSError(domain: "PhotoCurator.CatalogV2", code: 1,
                     userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(opened))])
             }
@@ -129,7 +129,7 @@ private final class CatalogV2Connection {
 }
 
 actor CatalogV2Store {
-    static let schemaVersion = 4
+    static let schemaVersion = 5
     private let connection: CatalogV2Connection
     private var db: OpaquePointer? { connection.db }
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -302,13 +302,92 @@ actor CatalogV2Store {
         }
     }
 
-    func markPublished(momentID: String, albumID: String, date: Date) throws {
-        let statement = try prepare("INSERT OR REPLACE INTO publications VALUES(?,?,?)")
+    func preparePublication(_ request: CuratedPublicationRequest,
+                            now: Date = Date()) throws -> PublicationSagaRecord {
+        try request.validate()
+        let existing = try publicationRecord(momentID: request.momentID)
+        if let existing {
+            guard existing.request.title == request.title,
+                  existing.request.description == request.description,
+                  existing.request.keyAssetID == request.keyAssetID,
+                  existing.request.date == request.date,
+                  existing.request.assetIDs == request.assetIDs else {
+                throw PublicationFailure.conflictingOperation
+            }
+            return existing
+        }
+        let record = PublicationSagaRecord(request: request, phase: .requested, receipt: nil,
+            verificationAttempts: 0, nextVerificationAt: nil, lastError: nil, updatedAt: now)
+        try writePublicationRecord(record)
+        return record
+    }
+
+    func pendingPublications() throws -> [PublicationSagaRecord] {
+        let statement = try prepare("SELECT request,phase,receipt,verification_attempts,next_verification_at,last_error,updated_at FROM publication_operations WHERE phase != 'succeeded' ORDER BY updated_at")
         defer { sqlite3_finalize(statement) }
-        sqlite3_bind_text(statement, 1, momentID, -1, transient)
-        sqlite3_bind_text(statement, 2, albumID, -1, transient)
-        sqlite3_bind_double(statement, 3, date.timeIntervalSince1970)
-        guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }
+        var result: [PublicationSagaRecord] = []
+        while sqlite3_step(statement) == SQLITE_ROW { result.append(try decodePublication(statement)) }
+        return result
+    }
+
+    func markPublicationApplying(operationID: UUID, now: Date = Date()) throws {
+        try updatePublication(operationID: operationID, phase: .applying, receipt: nil,
+                              attempts: 0, next: nil, error: nil, now: now)
+    }
+
+    func markPublicationVerifying(operationID: UUID, receipt: CuratedAlbumReceipt?,
+                                  error: String?, now: Date = Date()) throws -> PublicationSagaRecord {
+        try updatePublication(operationID: operationID, phase: .verifying, receipt: receipt,
+                              attempts: 0, next: now, error: error, now: now)
+        return try requiredPublicationRecord(operationID: operationID)
+    }
+
+    func recordPublicationVerification(operationID: UUID, error: String,
+                                       now: Date = Date()) throws -> PublicationSagaRecord {
+        let statement = try prepare("UPDATE publication_operations SET verification_attempts=verification_attempts+1,next_verification_at=?,last_error=?,updated_at=? WHERE operation_id=? AND phase='verifying'")
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, now.addingTimeInterval(1).timeIntervalSince1970)
+        sqlite3_bind_text(statement, 2, error, -1, transient)
+        sqlite3_bind_double(statement, 3, now.timeIntervalSince1970)
+        sqlite3_bind_text(statement, 4, operationID.uuidString, -1, transient)
+        guard sqlite3_step(statement) == SQLITE_DONE, sqlite3_changes(db) == 1 else {
+            throw PublicationFailure.conflictingOperation
+        }
+        return try requiredPublicationRecord(operationID: operationID)
+    }
+
+    func resetPublicationForRetry(operationID: UUID, now: Date = Date()) throws {
+        try updatePublication(operationID: operationID, phase: .requested, receipt: nil,
+                              attempts: 0, next: nil, error: nil, now: now)
+    }
+
+    func completePublication(operationID: UUID, receipt: CuratedAlbumReceipt,
+                             date: Date) throws {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            let operation = try requiredPublicationRecord(operationID: operationID)
+            guard operation.request.assetIDs.count == receipt.assetIDs.count,
+                  Set(operation.request.assetIDs) == Set(receipt.assetIDs),
+                  !receipt.albumID.isEmpty else { throw PublicationFailure.invalidReceipt }
+            let update = try prepare("UPDATE publication_operations SET phase='succeeded',receipt=?,verification_attempts=verification_attempts+1,next_verification_at=NULL,last_error=NULL,updated_at=? WHERE operation_id=?")
+            defer { sqlite3_finalize(update) }
+            bind(try JSONEncoder().encode(receipt), to: update, at: 1)
+            sqlite3_bind_double(update, 2, date.timeIntervalSince1970)
+            sqlite3_bind_text(update, 3, operationID.uuidString, -1, transient)
+            guard sqlite3_step(update) == SQLITE_DONE, sqlite3_changes(db) == 1 else {
+                throw PublicationFailure.conflictingOperation
+            }
+            let marker = try prepare("INSERT OR REPLACE INTO publications VALUES(?,?,?)")
+            defer { sqlite3_finalize(marker) }
+            sqlite3_bind_text(marker, 1, operation.request.momentID, -1, transient)
+            sqlite3_bind_text(marker, 2, receipt.albumID, -1, transient)
+            sqlite3_bind_double(marker, 3, date.timeIntervalSince1970)
+            guard sqlite3_step(marker) == SQLITE_DONE else { throw failure() }
+            try execute("COMMIT")
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
     }
 
     func reconcileMomentIdentities(groups: [Set<String>], newID: () -> String = { UUID().uuidString }) throws -> MomentIdentityResolution {
@@ -393,8 +472,13 @@ actor CatalogV2Store {
             CREATE TABLE IF NOT EXISTS publications(
               moment_id TEXT PRIMARY KEY REFERENCES moments(id) ON DELETE CASCADE,
               album_id TEXT NOT NULL,published_at REAL);
+            CREATE TABLE IF NOT EXISTS publication_operations(
+              operation_id TEXT PRIMARY KEY,moment_id TEXT NOT NULL UNIQUE REFERENCES moments(id) ON DELETE CASCADE,
+              request BLOB NOT NULL,phase TEXT NOT NULL,receipt BLOB,verification_attempts INTEGER NOT NULL,
+              next_verification_at REAL,last_error TEXT,updated_at REAL NOT NULL);
+            CREATE INDEX IF NOT EXISTS publication_operations_phase ON publication_operations(phase,next_verification_at);
             CREATE TABLE IF NOT EXISTS schema_migrations(name TEXT PRIMARY KEY,completed_at REAL NOT NULL,completed INTEGER NOT NULL);
-            PRAGMA user_version=4;
+            PRAGMA user_version=5;
             """
 
     private func importAssets() throws {
@@ -478,6 +562,19 @@ actor CatalogV2Store {
 
     private func upsertMoments(_ moments: [PhotoMoment]) throws {
         let encoder = JSONEncoder()
+        let preservedOperations = try moments.compactMap { try publicationRecord(momentID: $0.id) }
+        var preservedMarkers: [(String, String, Date?)] = []
+        let readMarker = try prepare("SELECT album_id,published_at FROM publications WHERE moment_id=?")
+        for moment in moments {
+            sqlite3_reset(readMarker); sqlite3_clear_bindings(readMarker)
+            sqlite3_bind_text(readMarker, 1, moment.id, -1, transient)
+            if sqlite3_step(readMarker) == SQLITE_ROW {
+                preservedMarkers.append((moment.id, text(readMarker, 0),
+                    sqlite3_column_type(readMarker, 1) == SQLITE_NULL ? nil
+                        : Date(timeIntervalSince1970: sqlite3_column_double(readMarker, 1))))
+            }
+        }
+        sqlite3_finalize(readMarker)
         let asset = try prepare("""
             INSERT INTO assets VALUES(?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(id) DO UPDATE SET
@@ -508,6 +605,17 @@ actor CatalogV2Store {
             guard sqlite3_step(removeMoment) == SQLITE_DONE else { throw failure() }
         }
         try importMoments(moments)
+        let restoreMarker = try prepare("INSERT OR REPLACE INTO publications VALUES(?,?,?)")
+        defer { sqlite3_finalize(restoreMarker) }
+        for (momentID, albumID, date) in preservedMarkers {
+            sqlite3_reset(restoreMarker); sqlite3_clear_bindings(restoreMarker)
+            sqlite3_bind_text(restoreMarker, 1, momentID, -1, transient)
+            sqlite3_bind_text(restoreMarker, 2, albumID, -1, transient)
+            if let date { sqlite3_bind_double(restoreMarker, 3, date.timeIntervalSince1970) }
+            else { sqlite3_bind_null(restoreMarker, 3) }
+            guard sqlite3_step(restoreMarker) == SQLITE_DONE else { throw failure() }
+        }
+        for record in preservedOperations { try writePublicationRecord(record) }
     }
 
     private func googleUploadedMoments(assetIDs: Set<String>, decisions: [String: ReviewDecision]) throws -> Set<String> {
@@ -626,6 +734,76 @@ actor CatalogV2Store {
             guard dateMatches else {
                 throw failure("A Photos publication date did not round-trip")
             }
+        }
+    }
+
+    private func publicationRecord(momentID: String) throws -> PublicationSagaRecord? {
+        let statement = try prepare("SELECT request,phase,receipt,verification_attempts,next_verification_at,last_error,updated_at FROM publication_operations WHERE moment_id=?")
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, momentID, -1, transient)
+        let status = sqlite3_step(statement)
+        if status == SQLITE_DONE { return nil }
+        guard status == SQLITE_ROW else { throw failure() }
+        return try decodePublication(statement)
+    }
+
+    private func requiredPublicationRecord(operationID: UUID) throws -> PublicationSagaRecord {
+        let statement = try prepare("SELECT request,phase,receipt,verification_attempts,next_verification_at,last_error,updated_at FROM publication_operations WHERE operation_id=?")
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, operationID.uuidString, -1, transient)
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw PublicationFailure.conflictingOperation }
+        return try decodePublication(statement)
+    }
+
+    private func decodePublication(_ statement: OpaquePointer) throws -> PublicationSagaRecord {
+        let decoder = JSONDecoder()
+        let request = try decoder.decode(CuratedPublicationRequest.self, from: blob(statement, 0))
+        guard let phase = PublicationSagaPhase(rawValue: text(statement, 1)) else {
+            throw PublicationFailure.corruptJournal
+        }
+        let receipt = sqlite3_column_type(statement, 2) == SQLITE_NULL ? nil
+            : try decoder.decode(CuratedAlbumReceipt.self, from: blob(statement, 2))
+        return PublicationSagaRecord(request: request, phase: phase, receipt: receipt,
+            verificationAttempts: Int(sqlite3_column_int64(statement, 3)),
+            nextVerificationAt: sqlite3_column_type(statement, 4) == SQLITE_NULL ? nil
+                : Date(timeIntervalSince1970: sqlite3_column_double(statement, 4)),
+            lastError: optionalText(statement, 5),
+            updatedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 6)))
+    }
+
+    private func writePublicationRecord(_ record: PublicationSagaRecord) throws {
+        let statement = try prepare("INSERT OR REPLACE INTO publication_operations VALUES(?,?,?,?,?,?,?,?,?)")
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, record.request.operationID.uuidString, -1, transient)
+        sqlite3_bind_text(statement, 2, record.request.momentID, -1, transient)
+        bind(try JSONEncoder().encode(record.request), to: statement, at: 3)
+        sqlite3_bind_text(statement, 4, record.phase.rawValue, -1, transient)
+        if let receipt = record.receipt { bind(try JSONEncoder().encode(receipt), to: statement, at: 5) }
+        else { sqlite3_bind_null(statement, 5) }
+        sqlite3_bind_int64(statement, 6, Int64(record.verificationAttempts))
+        if let next = record.nextVerificationAt { sqlite3_bind_double(statement, 7, next.timeIntervalSince1970) }
+        else { sqlite3_bind_null(statement, 7) }
+        bind(record.lastError, to: statement, at: 8)
+        sqlite3_bind_double(statement, 9, record.updatedAt.timeIntervalSince1970)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }
+    }
+
+    private func updatePublication(operationID: UUID, phase: PublicationSagaPhase,
+                                   receipt: CuratedAlbumReceipt?, attempts: Int,
+                                   next: Date?, error: String?, now: Date) throws {
+        let statement = try prepare("UPDATE publication_operations SET phase=?,receipt=?,verification_attempts=?,next_verification_at=?,last_error=?,updated_at=? WHERE operation_id=? AND phase != 'succeeded'")
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, phase.rawValue, -1, transient)
+        if let receipt { bind(try JSONEncoder().encode(receipt), to: statement, at: 2) }
+        else { sqlite3_bind_null(statement, 2) }
+        sqlite3_bind_int64(statement, 3, Int64(attempts))
+        if let next { sqlite3_bind_double(statement, 4, next.timeIntervalSince1970) }
+        else { sqlite3_bind_null(statement, 4) }
+        bind(error, to: statement, at: 5)
+        sqlite3_bind_double(statement, 6, now.timeIntervalSince1970)
+        sqlite3_bind_text(statement, 7, operationID.uuidString, -1, transient)
+        guard sqlite3_step(statement) == SQLITE_DONE, sqlite3_changes(db) == 1 else {
+            throw PublicationFailure.conflictingOperation
         }
     }
 

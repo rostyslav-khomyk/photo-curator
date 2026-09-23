@@ -622,6 +622,11 @@ packaged-app responsiveness qualification remain open.
 
 ### Phase 4: Publication saga, 3-5 days
 
+Implementation and automated recovery coverage are tracked in
+[`PHASE4_PUBLICATION_SAGA.md`](PHASE4_PUBLICATION_SAGA.md). The SQLite saga, atomic receipt/marker
+commit, single coordinator, typed failures, and forced-interruption tests pass; copied owner-library
+and packaged-app Instruments qualification remain open.
+
 - Move journals and published markers into one database transaction boundary.
 - Route manual and automatic publication through one coordinator.
 - Add deterministic recovery and typed errors.

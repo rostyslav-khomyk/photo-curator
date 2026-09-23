@@ -1,217 +1,198 @@
 import XCTest
 @testable import PhotoRelay
 
-@MainActor
-private final class FakeAlbums: CuratedAlbumAdapter {
+private actor FakeAlbums: CuratedAlbumAdapter {
+    enum Recovery { case automatic, absent, conflicting }
     var calls = 0
     var receipt: CuratedAlbumReceipt?
     var failAfterEffect = false
+    var recovery: Recovery = .automatic
+
+    func configure(failAfterEffect: Bool = false, recovery: Recovery = .automatic,
+                   receipt: CuratedAlbumReceipt? = nil) {
+        self.failAfterEffect = failAfterEffect
+        self.recovery = recovery
+        self.receipt = receipt
+    }
+
     func publish(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumReceipt {
         calls += 1
         let value = CuratedAlbumReceipt(albumID: "managed", assetIDs: request.assetIDs)
         receipt = value
-        if failAfterEffect { throw PublicationFailure.uncertainPublication }
+        if failAfterEffect { throw PublicationFailure.verificationPending }
         return value
     }
-    func recover(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumReceipt? { receipt }
-}
 
-@MainActor
-private final class FakeUpload: CuratedUploadAdapter {
-    var calls = 0
-    var receipt: String?
-    var failAfterEffect = false
-    func upload(_ album: CuratedAlbumReceipt, operationID: UUID) async throws -> String {
-        calls += 1
-        receipt = "google-receipt"
-        if failAfterEffect { throw PublicationFailure.uncertainUpload }
-        return receipt!
+    func recover(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumRecovery {
+        switch recovery {
+        case .automatic:
+            return receipt.map(CuratedAlbumRecovery.confirmed) ?? .absent
+        case .absent: return .absent
+        case .conflicting: return .conflicting
+        }
     }
-    func recover(operationID: UUID) async throws -> String? { receipt }
+
+    func callCount() -> Int { calls }
 }
 
 @MainActor
 final class CuratedPublicationTests: XCTestCase {
-    func testSidecarLockRejectsSecondOwnerAndReleases() throws {
-        let path = url(); defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
-        var first: PublicationJournalLock? = try PublicationJournalLock(journal: path)
-        try withExtendedLifetime(first) {
-            XCTAssertThrowsError(try PublicationJournalLock(journal: path))
-        }
-        first = nil
-        XCTAssertNoThrow(try PublicationJournalLock(journal: path))
+    func testSuccessAndRestartNeverRepeatExternalEffect() async throws {
+        let fixture = try await makeFixture()
+        let albums = FakeAlbums()
+        let durableRequest = request()
+        _ = try await coordinator(fixture.store, albums).publish(durableRequest)
+        _ = try await coordinator(fixture.store, albums).publish(request(operationID: UUID()))
+
+        let calls = await albums.callCount()
+        let pending = try await fixture.store.pendingPublications()
+        let summaries = try await fixture.store.summaries()
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(pending.isEmpty)
+        XCTAssertTrue(summaries.first?.inPhotos == true)
     }
 
-    func testStaleInstanceReloadsConfirmedReceipt() async throws {
-        let path = url(); defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
-        let first = try CuratedPublication(journal: path), stale = try CuratedPublication(journal: path)
-        let albums = FakeAlbums(), request = request()
-        _ = try await first.publish(request, adapter: albums)
-        _ = try await stale.publish(request, adapter: albums)
-        XCTAssertEqual(albums.calls, 1)
-    }
+    func testLostPhotoKitResponseIsRecoveredWithoutDuplicateAlbum() async throws {
+        let fixture = try await makeFixture()
+        let albums = FakeAlbums()
+        await albums.configure(failAfterEffect: true)
 
-    func testCancellationBeforeExternalEffect() async throws {
-        let path = url(); defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
-        let workflow = try CuratedPublication(journal: path), albums = FakeAlbums(), request = request()
-        let task = Task {
-            withUnsafeCurrentTask { $0?.cancel() }
-            return try await workflow.publish(request, adapter: albums)
-        }
-        do { _ = try await task.value; XCTFail() } catch { XCTAssertTrue(error is CancellationError) }
-        XCTAssertEqual(albums.calls, 0)
-    }
-    func testCorruptJournalFailsClosed() throws {
-        let path = url(); defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
-        try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try Data("invalid".utf8).write(to: path)
-        XCTAssertThrowsError(try CuratedPublication(journal: path))
-    }
-
-    func testUnknownUploadIsNotRetried() async throws {
-        let path = url(); defer { try? FileManager.default.removeItem(at: path.deletingLastPathComponent()) }
-        let workflow = try CuratedPublication(journal: path), albums = FakeAlbums(), upload = FakeUpload()
-        _ = try await workflow.publish(request(), adapter: albums)
-        upload.failAfterEffect = true
-        do { _ = try await workflow.sync(adapter: upload) } catch {}
-        upload.receipt = nil
-        do { _ = try await workflow.sync(adapter: upload); XCTFail() }
-        catch { XCTAssertEqual(error as? PublicationFailure, .uncertainUpload) }
-        XCTAssertEqual(upload.calls, 1)
-    }
-    private func url() -> URL { FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("journal.json") }
-    private func request() -> CuratedPublicationRequest {
-        CuratedPublicationRequest(operationID: UUID(), momentID: "stable-test-moment", title: "Trip", assetIDs: ["a", "b"])
-    }
-
-    func testSuccessAndRestartNeverRepeatEffects() async throws {
-        let url = url(); defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-        let workflow = try CuratedPublication(journal: url), albums = FakeAlbums(), upload = FakeUpload()
-        let request = request()
-        _ = try await workflow.publish(request, adapter: albums)
-        _ = try await workflow.sync(adapter: upload)
-        let restored = try CuratedPublication(journal: url)
-        _ = try await restored.publish(request, adapter: albums)
-        _ = try await restored.sync(adapter: upload)
-        XCTAssertEqual(albums.calls, 1); XCTAssertEqual(upload.calls, 1)
-    }
-
-    func testPublicationLostResponseRecoversWithoutCreatingAgain() async throws {
-        let url = url(); defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-        let workflow = try CuratedPublication(journal: url), albums = FakeAlbums()
-        albums.failAfterEffect = true
-        let request = request()
-        do { _ = try await workflow.publish(request, adapter: albums); XCTFail() } catch {}
-        let restored = try CuratedPublication(journal: url)
-        _ = try await restored.publish(request, adapter: albums)
-        XCTAssertEqual(albums.calls, 1)
-    }
-
-    func testUncertainRecoveryDoesNotRecreate() async throws {
-        let url = url(); defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-        let workflow = try CuratedPublication(journal: url), albums = FakeAlbums()
-        albums.failAfterEffect = true
-        let request = request()
-        do { _ = try await workflow.publish(request, adapter: albums) } catch {}
-        albums.receipt = nil
-        do { _ = try await workflow.publish(request, adapter: albums); XCTFail() }
-        catch { XCTAssertEqual(error as? PublicationFailure, .uncertainPublication) }
-        XCTAssertEqual(albums.calls, 1)
-    }
-
-    func testConfirmedAbsentRecoveryRetriesOnce() async throws {
-        let url = url(); defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-        let workflow = try CuratedPublication(journal: url), albums = FakeAlbums()
-        albums.failAfterEffect = true
-        let request = request()
-        do { _ = try await workflow.publish(request, adapter: albums) } catch {}
-        albums.receipt = nil
-        albums.failAfterEffect = false
-
-        let receipt = try await CuratedPublication(journal: url).publish(request, adapter: albums,
-            retryAfterConfirmedAbsence: true)
+        let receipt = try await coordinator(fixture.store, albums).publish(request())
 
         XCTAssertEqual(receipt.albumID, "managed")
-        XCTAssertEqual(albums.calls, 2)
+        let calls = await albums.callCount()
+        let summaries = try await fixture.store.summaries()
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(summaries.first?.inPhotos == true)
     }
 
-    func testUploadFailureKeepsAlbumAndRecoversReceipt() async throws {
-        let url = url(); defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-        let workflow = try CuratedPublication(journal: url), albums = FakeAlbums(), upload = FakeUpload()
-        _ = try await workflow.publish(request(), adapter: albums)
-        upload.failAfterEffect = true
-        do { _ = try await workflow.sync(adapter: upload); XCTFail() } catch {}
-        let state = await workflow.snapshot()
-        XCTAssertEqual(state?.album?.albumID, "managed")
-        _ = try await CuratedPublication(journal: url).sync(adapter: upload)
-        XCTAssertEqual(upload.calls, 1)
-        XCTAssertEqual(albums.calls, 1)
+    func testForcedTerminationAfterApplyingRecoversConfirmedEffect() async throws {
+        let fixture = try await makeFixture()
+        let albums = FakeAlbums()
+        let durableRequest = request()
+        _ = try await fixture.store.preparePublication(durableRequest)
+        try await fixture.store.markPublicationApplying(operationID: durableRequest.operationID)
+        await albums.configure(receipt: CuratedAlbumReceipt(albumID: "managed", assetIDs: durableRequest.assetIDs))
+
+        _ = try await coordinator(fixture.store, albums).publish(request(operationID: UUID()))
+
+        let calls = await albums.callCount()
+        let summaries = try await fixture.store.summaries()
+        XCTAssertEqual(calls, 0)
+        XCTAssertTrue(summaries.first?.inPhotos == true)
     }
 
-    func testInvalidOrConflictingRequestIsRejected() async throws {
-        let url = url(); defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
-        let workflow = try CuratedPublication(journal: url), albums = FakeAlbums()
-        let invalid = CuratedPublicationRequest(operationID: UUID(), momentID: "m", title: "", assetIDs: [])
-        do { _ = try await workflow.publish(invalid, adapter: albums); XCTFail() } catch {}
-        XCTAssertEqual(albums.calls, 0)
-        _ = try await workflow.publish(request(), adapter: albums)
-        do { _ = try await workflow.publish(request(), adapter: albums); XCTFail() }
-        catch { XCTAssertEqual(error as? PublicationFailure, .conflictingOperation) }
-        XCTAssertEqual(albums.calls, 1)
+    func testConfirmedAbsenceAfterCrashRetriesThroughIdempotentAdapter() async throws {
+        let fixture = try await makeFixture()
+        let albums = FakeAlbums()
+        let durableRequest = request()
+        _ = try await fixture.store.preparePublication(durableRequest)
+        try await fixture.store.markPublicationApplying(operationID: durableRequest.operationID)
+
+        _ = try await coordinator(fixture.store, albums).publish(request(operationID: UUID()))
+
+        let calls = await albums.callCount()
+        let summaries = try await fixture.store.summaries()
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(summaries.first?.inPhotos == true)
     }
 
-    func testRequestWithDescriptionAndKeyAssetID() throws {
-        let valid = CuratedPublicationRequest(
-            operationID: UUID(),
-            momentID: "moment-1",
-            title: "LEGO Trip",
-            description: "2 photos featuring scenes of LEGO",
-            keyAssetID: "asset-1",
-            date: Date(),
-            assetIDs: ["asset-1", "asset-2"]
-        )
-        XCTAssertNoThrow(try valid.validate())
-        XCTAssertEqual(valid.description, "2 photos featuring scenes of LEGO")
-        XCTAssertEqual(valid.keyAssetID, "asset-1")
-    }
+    func testConflictingDestinationFailsWithoutApplyingAgain() async throws {
+        let fixture = try await makeFixture()
+        let albums = FakeAlbums()
+        let durableRequest = request()
+        _ = try await fixture.store.preparePublication(durableRequest)
+        try await fixture.store.markPublicationApplying(operationID: durableRequest.operationID)
+        await albums.configure(recovery: .conflicting)
 
-    func testKeyAssetIDMustBeMemberOfAssetIDs() {
-        let invalid = CuratedPublicationRequest(
-            operationID: UUID(),
-            momentID: "moment-1",
-            title: "Trip",
-            description: "Some story",
-            keyAssetID: "external-asset",
-            date: Date(),
-            assetIDs: ["asset-1", "asset-2"]
-        )
-        XCTAssertThrowsError(try invalid.validate()) { error in
-            XCTAssertEqual(error as? PublicationFailure, .invalidRequest)
+        do {
+            _ = try await coordinator(fixture.store, albums).publish(request(operationID: UUID()))
+            XCTFail("Expected destination conflict")
+        } catch {
+            XCTAssertEqual(error as? PublicationFailure, .destinationConflict)
         }
+        let calls = await albums.callCount()
+        let summaries = try await fixture.store.summaries()
+        XCTAssertEqual(calls, 0)
+        XCTAssertFalse(summaries.first?.inPhotos == true)
     }
 
-    func testAutoPublishEligibilityAndPreservation() throws {
-        let photo = IndexedPhoto(id: "photo-1", created: Date(), modified: Date(), latitude: 52.0, longitude: 4.0, favorite: false, width: 100, height: 100)
-        let readyMoment = PhotoMoment(id: "m-ready", start: Date(), end: Date(), photos: [photo], groupingState: .ready)
-        let reviewedMoment = PhotoMoment(id: "m-reviewed", start: Date(), end: Date(), photos: [photo], groupingState: .reviewed)
-        let preparingMoment = PhotoMoment(id: "m-prep", start: Date(), end: Date(), photos: [photo], groupingState: .preparing)
-        let publishedMoment = PhotoMoment(id: "m-pub", start: Date(), end: Date(), photos: [photo], groupingState: .ready, publishedAlbumID: "album-123", publishedDate: Date())
+    func testMomentRefreshPreservesSagaAndPublishedMarker() async throws {
+        let fixture = try await makeFixture()
+        let albums = FakeAlbums()
+        _ = try await coordinator(fixture.store, albums).publish(request())
 
-        XCTAssertFalse(MomentDisplayEligibility.isAutoPublishEligible(readyMoment, decisions: [:], userAuthored: false))
-        XCTAssertTrue(MomentDisplayEligibility.isAutoPublishEligible(reviewedMoment, decisions: [:], userAuthored: false))
-        XCTAssertFalse(MomentDisplayEligibility.isAutoPublishEligible(preparingMoment, decisions: [:], userAuthored: false))
-        XCTAssertFalse(MomentDisplayEligibility.isAutoPublishEligible(publishedMoment, decisions: [:], userAuthored: false))
+        try await fixture.store.synchronize(moments: [fixture.moment])
+        _ = try await coordinator(fixture.store, albums).publish(request(operationID: UUID()))
 
-        let secondPhoto = IndexedPhoto(id: "photo-2", created: Date(), modified: Date(), latitude: 52.0, longitude: 4.0, favorite: false, width: 100, height: 100)
-        let readyPair = PhotoMoment(id: "m-pair", start: Date(), end: Date(), photos: [photo, secondPhoto],
-            selection: MomentSelection(selected: [photo.id, secondPhoto.id], pending: [], similar: []), groupingState: .ready)
-        XCTAssertTrue(MomentDisplayEligibility.isAutoPublishEligible(readyPair, decisions: [:], userAuthored: false))
+        let calls = await albums.callCount()
+        let summaries = try await fixture.store.summaries()
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(summaries.first?.inPhotos == true)
+    }
 
-        // Ensure serialization preserves published state
-        let catalog = MomentsCatalog(updated: Date(), moments: [publishedMoment])
-        let encoded = try JSONEncoder().encode(catalog)
-        let decoded = try JSONDecoder().decode(MomentsCatalog.self, from: encoded)
-        XCTAssertEqual(decoded.moments.first?.publishedAlbumID, "album-123")
-        XCTAssertNotNil(decoded.moments.first?.publishedDate)
+    func testCancellationBeforeExternalEffectLeavesRecoverableOperation() async throws {
+        let fixture = try await makeFixture()
+        let albums = FakeAlbums()
+        let task = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await coordinator(fixture.store, albums).publish(request())
+        }
+        do { _ = try await task.value; XCTFail("Expected cancellation") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let calls = await albums.callCount()
+        let pending = try await fixture.store.pendingPublications()
+        XCTAssertEqual(calls, 0)
+        XCTAssertEqual(pending.count, 1)
+    }
+
+    func testChangedRequestCannotReplaceDurableIntent() async throws {
+        let fixture = try await makeFixture()
+        let albums = FakeAlbums()
+        let first = request()
+        _ = try await fixture.store.preparePublication(first)
+        let changed = CuratedPublicationRequest(operationID: UUID(), momentID: first.momentID,
+            title: "Different", assetIDs: first.assetIDs)
+
+        do { _ = try await coordinator(fixture.store, albums).publish(changed); XCTFail("Expected conflict") }
+        catch { XCTAssertEqual(error as? PublicationFailure, .conflictingOperation) }
+        let calls = await albums.callCount()
+        XCTAssertEqual(calls, 0)
+    }
+
+    func testRequestValidationAndAutoPublishEligibility() throws {
+        let invalid = CuratedPublicationRequest(operationID: UUID(), momentID: "moment-1", title: "Trip",
+            keyAssetID: "external", assetIDs: ["asset-1"])
+        XCTAssertThrowsError(try invalid.validate())
+
+        let photo = IndexedPhoto(id: "photo-1", created: Date(), modified: Date(), latitude: 52,
+            longitude: 4, favorite: false, width: 100, height: 100)
+        let ready = PhotoMoment(id: "ready", start: Date(), end: Date(), photos: [photo], groupingState: .ready)
+        let reviewed = PhotoMoment(id: "reviewed", start: Date(), end: Date(), photos: [photo], groupingState: .reviewed)
+        XCTAssertFalse(MomentDisplayEligibility.isAutoPublishEligible(ready, decisions: [:], userAuthored: false))
+        XCTAssertTrue(MomentDisplayEligibility.isAutoPublishEligible(reviewed, decisions: [:], userAuthored: false))
+    }
+
+    private func coordinator(_ store: CatalogV2Store, _ albums: FakeAlbums) -> PublicationCoordinator {
+        PublicationCoordinator(store: store, adapter: albums, delay: { _ in })
+    }
+
+    private func request(operationID: UUID = UUID()) -> CuratedPublicationRequest {
+        CuratedPublicationRequest(operationID: operationID, momentID: "stable-test-moment",
+            title: "Trip", assetIDs: ["a", "b"])
+    }
+
+    private func makeFixture() async throws -> (store: CatalogV2Store, moment: PhotoMoment) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        let store = try CatalogV2Store(url: root.appendingPathComponent("catalog.sqlite3"))
+        let photos = ["a", "b"].map { id in
+            IndexedPhoto(id: id, created: Date(), modified: Date(), latitude: nil, longitude: nil,
+                favorite: false, width: 100, height: 100)
+        }
+        let moment = PhotoMoment(id: "stable-test-moment", start: Date(), end: Date(), photos: photos,
+            selection: MomentSelection(selected: photos.map(\.id), pending: [], similar: []), groupingState: .reviewed)
+        try await store.synchronize(moments: [moment])
+        return (store, moment)
     }
 }

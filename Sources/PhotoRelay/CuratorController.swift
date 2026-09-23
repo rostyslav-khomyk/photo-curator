@@ -509,17 +509,6 @@ actor CuratorWorker {
         try CatalogV2Migrator.loadInput(root: url.deletingLastPathComponent())
     }
 
-    func markPublished(momentID: String, albumID: String, date: Date) throws {
-        let catalogURL = url.deletingLastPathComponent().appendingPathComponent("moments-catalog.json")
-        guard var catalog = try MomentsCatalog.load(from: catalogURL) else {
-            throw PublicationFailure.invalidRequest
-        }
-        guard catalog.markPublished(momentID: momentID, albumID: albumID, date: date) else {
-            throw PublicationFailure.invalidRequest
-        }
-        try catalog.save(to: catalogURL)
-    }
-
     /// Uses only existing evidence caches; shared by presentation and isolated evaluation.
     func prepareDisplaySelection(_ moment: PhotoMoment, results: [String: CuratorVisionResult],
                                  thresholds: [SimilarityCategory: Float] = [:], balanced: Bool = true) async throws -> PhotoMoment {
@@ -725,6 +714,9 @@ final class CuratorController: ObservableObject {
 
     private let worker: CuratorWorker
     private let catalog: CatalogV2Store?
+    private lazy var publicationCoordinator: PublicationCoordinator? = catalog.map {
+        PublicationCoordinator(store: $0, adapter: PhotoKitAlbumAdapter.shared)
+    }
     private let scheduler = CurationScheduler()
     private lazy var library = LibraryCoordinator { [scheduler] in
         Task { await scheduler.wake(.libraryChanged) }
@@ -829,6 +821,16 @@ final class CuratorController: ObservableObject {
                     let input = try await worker.catalogMigrationInput()
                     _ = try await catalog.migrate(input)
                     try await catalog.prepareWorkspace(input)
+                    if let publicationCoordinator {
+                        let recoveries = await publicationCoordinator.recoverPending()
+                        for result in recoveries.values {
+                            if case .failure(let error) = result,
+                               error as? PublicationFailure != .verificationPending {
+                                CuratorTelemetry.shared.record(.failure,
+                                    counts: ["code": (error as NSError).code])
+                            }
+                        }
+                    }
                     await reloadMomentSummaries(googleUploadedAssetIDs: model.uploadedGoogleAssetIDs)
                 } catch {
                     CuratorTelemetry.shared.record(.failure, counts: ["code": (error as NSError).code])
@@ -1511,6 +1513,10 @@ final class CuratorController: ObservableObject {
             CuratorTelemetry.shared.record(.publication, counts: ["photos": receipt.assetIDs.count])
             await refreshOverview(reusingVisibleMoments: true)
             return true
+        } catch PublicationFailure.verificationPending {
+            activity = "Photos is confirming the album for \(title)…"
+            await scheduler.wake(.retryDue, at: Date().addingTimeInterval(2))
+            return true
         } catch {
             failedAutoPublishMomentIDs.insert(candidate.id)
             CuratorTelemetry.shared.record(.failure, counts: ["code": (error as NSError).code])
@@ -1534,14 +1540,8 @@ final class CuratorController: ObservableObject {
         let cover = MomentDisplayEligibility.cover(moment, decisions: decisions.values, selected: assetIDs)
         let keyAssetID = cover?.id ?? assetIDs.first
 
-        let catalogURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Photo Relay/curator/moments-catalog.json")
-        let journalDir = catalogURL.deletingLastPathComponent().appendingPathComponent("journals")
-        try FileManager.default.createDirectory(at: journalDir, withIntermediateDirectories: true)
-        let journalURL = journalDir.appendingPathComponent("publish-\(moment.id).json")
-
-        let publication = try CuratedPublication(journal: journalURL)
-        var request = CuratedPublicationRequest(
+        guard let publicationCoordinator else { throw PublicationFailure.catalogUnavailable }
+        let request = CuratedPublicationRequest(
             operationID: UUID(),
             momentID: moment.id,
             title: title,
@@ -1551,18 +1551,9 @@ final class CuratorController: ObservableObject {
             assetIDs: assetIDs
         )
 
-        // A previous interruption must resume the immutable request already in the journal;
-        // generating a new operation UUID would make every recovery conflict permanently.
-        if let existing = await publication.snapshot(), existing.request.momentID == moment.id {
-            request = existing.request
-        }
-
-        let receipt = try await publication.publish(request, adapter: PhotoKitAlbumAdapter.shared,
-            retryAfterConfirmedAbsence: true)
+        let receipt = try await publicationCoordinator.publish(request)
 
         let publishedDate = Date()
-        try await worker.markPublished(momentID: moment.id, albumID: receipt.albumID, date: publishedDate)
-        try await catalog?.markPublished(momentID: moment.id, albumID: receipt.albumID, date: publishedDate)
         await reloadMomentSummaries()
         if let idx = moments.firstIndex(where: { $0.id == moment.id }) {
             moments[idx].publishedAlbumID = receipt.albumID

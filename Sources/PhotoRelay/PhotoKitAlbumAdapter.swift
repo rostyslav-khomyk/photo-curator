@@ -54,25 +54,23 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
 
         // If album was newly created, resolve its localIdentifier
         guard let finalAlbumID = createdAlbumID ?? existingAlbum?.localIdentifier, !finalAlbumID.isEmpty else {
-            throw PublicationFailure.uncertainPublication
+            throw PublicationFailure.verificationPending
         }
 
         return CuratedAlbumReceipt(albumID: finalAlbumID, assetIDs: request.assetIDs)
     }
 
-    func recover(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumReceipt? {
+    func recover(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumRecovery {
         try request.validate()
         let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
-        guard auth == .authorized || auth == .limited else { return nil }
+        guard auth == .authorized || auth == .limited else { throw PublicationFailure.invalidRequest }
 
         let yearString = resolveYear(for: request)
         let albumTitle = resolveAlbumTitle(for: request)
 
         guard let rootFolder = findRootFolder(),
               let yearFolder = findYearFolder(year: yearString, in: rootFolder),
-              let album = findAlbum(named: albumTitle, in: yearFolder) else {
-            return nil
-        }
+              let album = findAlbum(named: albumTitle, in: yearFolder) else { return .absent }
 
         let assets = PHAsset.fetchAssets(in: album, options: nil)
         var memberIDs: [String] = []
@@ -81,9 +79,9 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
         }
 
         if Set(memberIDs) == Set(request.assetIDs) {
-            return CuratedAlbumReceipt(albumID: album.localIdentifier, assetIDs: request.assetIDs)
+            return .confirmed(CuratedAlbumReceipt(albumID: album.localIdentifier, assetIDs: request.assetIDs))
         }
-        return nil
+        return .conflicting
     }
 
     /// Deletes only album containers proven to be direct children of Photo Curator year folders.
@@ -91,7 +89,7 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
     func deleteManagedAlbums(withIDs requestedIDs: Set<String>, keeping albumID: String) async throws {
         let ids = requestedIDs.subtracting([albumID])
         guard !ids.isEmpty else { return }
-        guard let root = findRootFolder() else { throw PublicationFailure.uncertainPublication }
+        guard let root = findRootFolder() else { throw PublicationFailure.destinationConflict }
 
         var managed: [String: PHAssetCollection] = [:]
         let rootChildren = PHCollection.fetchCollections(in: root, options: nil)
@@ -105,7 +103,7 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
         }
 
         guard ids.allSatisfy({ managed[$0] != nil }) else {
-            throw PublicationFailure.uncertainPublication
+            throw PublicationFailure.destinationConflict
         }
         let albums = ids.compactMap { managed[$0] }
         try await PHPhotoLibrary.shared().performChanges {
@@ -139,7 +137,7 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
             if let first = fetched.firstObject { return first }
         }
         if let root = findRootFolder() { return root }
-        throw PublicationFailure.uncertainPublication
+        throw PublicationFailure.verificationPending
     }
 
     private func findYearFolder(year: String, in root: PHCollectionList) -> PHCollectionList? {
@@ -170,7 +168,7 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
             if let first = fetched.firstObject { return first }
         }
         if let yearList = findYearFolder(year: year, in: root) { return yearList }
-        throw PublicationFailure.uncertainPublication
+        throw PublicationFailure.verificationPending
     }
 
     private func findAlbum(named title: String, in yearFolder: PHCollectionList) -> PHAssetCollection? {
