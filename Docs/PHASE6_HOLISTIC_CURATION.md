@@ -31,6 +31,10 @@
 - Large Moments split only on supported event boundaries, never because they exceed a photo-count
   threshold. Overlapping captures and near-duplicates from family phones remain in the shared event;
   highlight selection suppresses redundant alternatives without fragmenting the Moment.
+- A bounded second pass may combine uncurated singleton captures across days when they share a
+  user-defined habitual place and calendar month. Everyday photographs and reference-memory photos
+  remain separate roles. Favorites, reviewed/customized Moments, published Moments, and large event
+  visits are never changed by this pass.
 - Optional Story parents require repeated strong place identity across adjacent Moments. They do not
   replace Moments or infer meaning from busy months.
 - Hierarchical highlights first allocate representative photos per Moment, then allocate Story-level
@@ -74,8 +78,13 @@ pipeline. Candidate generation must reuse that pipeline rather than introduce a 
   test-process RSS. It was correctly rejected: Moments increased from 5,206 to 7,269, fragmented
   days from 28 to 316, and the candidate did not yet carry narratives or highlights. The isolated
   candidate snapshot grew the copied catalog from about 127 MB to 269 MB.
-- Integrate current evidence, narrative, and hierarchical-highlight pipelines, then rerun the copied
-  owner-corpus comparison until the structural gate passes.
+- A second candidate used the active catalog as its trusted event baseline and added only habitual-
+  place singleton refinement. On the same 109,007-photo corpus it staged in 2.85 seconds and reduced
+  Moments from 5,206 to 5,001, singletons from 1,677 to 1,385, small Moments from 2,952 to 2,719, and
+  fragmented days from 31 to 29. It preserved all 14,261 highlights, 266 large Moments, and 20 giant
+  Moments. The result contained 77 everyday rollups (269 photos) and 10 reference-memory rollups
+  (23 photos). It passes the structural gate but remains ineligible for activation without reviewed
+  false-join and false-split measurements.
 - Freeze and execute the private reviewed benchmark.
 - Measure generation time, peak RSS, WAL growth, and overview query latency on the owner library.
 - Connect the scheduler's bounded full-library generation job and candidate comparison sheet only

@@ -12,14 +12,17 @@ final class HolisticCurationGenerationTests: XCTestCase {
         let store = try CatalogV2Store(url: root.appendingPathComponent(CatalogV2Migrator.catalogName))
         _ = try await store.migrate(input)
         try await store.prepareWorkspace(input)
-        let activeMetrics = HolisticLibraryMetrics.measure(input.moments)
+        let evaluationCalendar = calendar()
+        let activeMetrics = HolisticLibraryMetrics.measure(input.moments, calendar: evaluationCalendar)
         _ = try await store.snapshotActiveGeneration(algorithmVersion: "shipping-v1",
             evidenceVersion: "owner-copy", metrics: activeMetrics, id: "owner-active-generation")
 
-        let photos = input.moments.flatMap(\.photos)
         let started = Date()
-        let candidateMoments = HolisticCurationGenerator.moments(photos, calendar: calendar())
-        let candidateMetrics = HolisticLibraryMetrics.measure(candidateMoments, calendar: calendar())
+        let protectedIDs = Set(input.titles.keys).union(input.descriptions.keys)
+            .union(input.protectedMembership.keys)
+        let candidateMoments = HolisticCurationGenerator.refiningRoutineSingletons(input.moments,
+            places: input.places, protectedMomentIDs: protectedIDs, calendar: evaluationCalendar)
+        let candidateMetrics = HolisticLibraryMetrics.measure(candidateMoments, calendar: evaluationCalendar)
         let generation = try await store.beginCandidateGeneration(
             algorithmVersion: HolisticCurationGenerator.algorithmVersion,
             evidenceVersion: "owner-copy", id: "owner-candidate-generation")
@@ -27,9 +30,16 @@ final class HolisticCurationGenerationTests: XCTestCase {
             metrics: candidateMetrics)
         let elapsed = Date().timeIntervalSince(started)
         let stagedSummaries = try await store.candidateSummaries(generationID: generation.id)
+        let comparison = CurationGenerationComparison.compare(active: activeMetrics, candidate: candidateMetrics)
 
         XCTAssertEqual(candidateMetrics.photoCount, activeMetrics.photoCount)
         XCTAssertEqual(stagedSummaries.count, candidateMetrics.momentCount)
+        XCTAssertLessThan(candidateMetrics.singletonCount, activeMetrics.singletonCount)
+        XCTAssertLessThanOrEqual(candidateMetrics.fragmentedDayCount, activeMetrics.fragmentedDayCount)
+        XCTAssertEqual(candidateMetrics.highlightCount, activeMetrics.highlightCount)
+        XCTAssertEqual(candidateMetrics.giantMomentCount, activeMetrics.giantMomentCount)
+        XCTAssertTrue(comparison.structuralQualityPassed)
+        XCTAssertFalse(comparison.canRecommendActivation)
         print("Phase 6 owner candidate: \(String(format: "%.3f", elapsed))s")
         print("Active: \(activeMetrics)")
         print("Candidate: \(candidateMetrics)")
@@ -40,6 +50,50 @@ final class HolisticCurationGenerationTests: XCTestCase {
         let candidates = HolisticCurationGenerator.candidates(photos, calendar: calendar())
         XCTAssertEqual(candidates.map { $0.members.map(\.id) }, [["a", "b", "c"], ["d"]])
         XCTAssertNotNil(candidates.last?.boundaryBefore)
+    }
+
+    func testRoutineSingletonsRollUpByHabitualPlaceMonthAndRole() {
+        let home = MeaningfulPlace(label: "Home", address: "Home", latitude: 52, longitude: 4, radius: 200)
+        let day: TimeInterval = 86_400
+        let everyday = [locatedMoment("a", 0), locatedMoment("b", 5 * day)]
+        let documentPhoto = photo("photo-c", 6 * day, latitude: 52.005, longitude: 4)
+        let documentEvidence = PhotoDisplayEvidence(revision: documentPhoto.analysisRevision,
+            engine: PhotoDisplayEvidence.version, reason: .document)
+        let document = PhotoMoment(id: "c", start: documentPhoto.created!, end: documentPhoto.created!,
+            photos: [documentPhoto], displayEvidence: [documentPhoto.id: documentEvidence])
+        let secondDocumentPhoto = photo("photo-d", 8 * day, latitude: 52.005, longitude: 4)
+        let secondDocumentEvidence = PhotoDisplayEvidence(revision: secondDocumentPhoto.analysisRevision,
+            engine: PhotoDisplayEvidence.version, reason: .document)
+        let secondDocument = PhotoMoment(id: "d", start: secondDocumentPhoto.created!,
+            end: secondDocumentPhoto.created!, photos: [secondDocumentPhoto],
+            displayEvidence: [secondDocumentPhoto.id: secondDocumentEvidence])
+
+        let refined = HolisticCurationGenerator.refiningRoutineSingletons(
+            everyday + [document, secondDocument], places: [home], calendar: calendar())
+
+        XCTAssertEqual(refined.count, 2)
+        XCTAssertEqual(Set(refined.map { $0.photos.count }), [2])
+        XCTAssertTrue(refined.contains { $0.narrative?.headline.hasPrefix("Everyday life at Home") == true })
+        XCTAssertTrue(refined.contains { $0.narrative?.headline.hasPrefix("Notes and records at Home") == true })
+    }
+
+    func testRoutineRefinementLeavesSignificantProtectedAndFavoriteMomentsAlone() {
+        let home = MeaningfulPlace(label: "Home", address: "Home", latitude: 52, longitude: 4)
+        let favorite = IndexedPhoto(id: "favorite", created: Date(timeIntervalSince1970: 0), modified: nil,
+            latitude: 52, longitude: 4, favorite: true, width: 100, height: 100)
+        let favoriteMoment = PhotoMoment(id: "favorite-moment", start: favorite.created!, end: favorite.created!,
+            photos: [favorite])
+        let protected = moment("protected", 86_400)
+        let visitPhotos = (0..<200).map { photo("visit-\($0)", 2 * 86_400 + Double($0)) }
+        let visit = PhotoMoment(id: "visit", start: visitPhotos.first!.created!, end: visitPhotos.last!.created!,
+            photos: visitPhotos)
+
+        let refined = HolisticCurationGenerator.refiningRoutineSingletons(
+            [favoriteMoment, protected, visit], places: [home], protectedMomentIDs: [protected.id],
+            calendar: calendar())
+
+        XCTAssertEqual(Set(refined.map(\.id)), [favoriteMoment.id, protected.id, visit.id])
+        XCTAssertEqual(refined.first(where: { $0.id == visit.id })?.photos.count, 200)
     }
 
     func testStrongRecordedLocationConflictSplitsWithoutInventingMissingGPS() {
@@ -112,6 +166,19 @@ final class HolisticCurationGenerationTests: XCTestCase {
         XCTAssertEqual(periods.map(\.momentCount), [1, 1])
     }
 
+    func testCrossDayRoutineMomentIsNotCountedAsSameDayFragmentation() {
+        let photos = (0..<5).map { photo("p\($0)", Double($0 * 60)) }
+        let sameDay = photos.map { item in
+            PhotoMoment(id: item.id, start: item.created!, end: item.created!, photos: [item])
+        }
+        XCTAssertEqual(HolisticLibraryMetrics.measure(sameDay, calendar: calendar()).fragmentedDayCount, 1)
+        let rollup = PhotoMoment(id: "routine", start: Date(timeIntervalSince1970: 0),
+            end: Date(timeIntervalSince1970: 2 * 86_400), photos: photos)
+        let metrics = HolisticLibraryMetrics.measure([rollup], calendar: calendar())
+        XCTAssertEqual(metrics.fragmentedDayCount, 0)
+        XCTAssertEqual(metrics.crossDayMomentCount, 1)
+    }
+
     func testProtectedAnchorKeepsIdentityAcrossBoundaryChange() throws {
         let photos = [photo("a", 0), photo("b", 60), photo("c", 20_000)]
         let previous = [MomentIdentityEntry(id: "reviewed", members: Set(photos.map(\.id)))]
@@ -168,6 +235,11 @@ final class HolisticCurationGenerationTests: XCTestCase {
 
     private func moment(_ id: String, _ time: TimeInterval) -> PhotoMoment {
         let item = photo("photo-\(id)", time)
+        return PhotoMoment(id: id, start: item.created!, end: item.created!, photos: [item])
+    }
+
+    private func locatedMoment(_ id: String, _ time: TimeInterval) -> PhotoMoment {
+        let item = photo("photo-\(id)", time, latitude: 52, longitude: 4)
         return PhotoMoment(id: id, start: item.created!, end: item.created!, photos: [item])
     }
 

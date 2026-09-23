@@ -23,6 +23,13 @@ family members contribute overlapping phone captures. Such photos belong to one 
 redundancy belongs in hierarchical highlight selection, while splitting requires positive boundary
 evidence. Fragmented days, generic narratives, and lost highlight layers remain guarded regressions.
 
+The second owner-corpus candidate starts from trusted active event boundaries and rolls up only
+unprotected, unpublished, non-Favorite singletons at a user-defined habitual place within a calendar
+month. It separates everyday photographs from reference-memory captures. On 109,007 photos it reduced
+5,206 Moments to 5,001 and 1,677 singletons to 1,385 while preserving all 14,261 highlights and all
+large/giant visits. Fragmented days fell from 31 to 29. The candidate passes structural checks but was
+not activated because the private false-join/false-split benchmark is not yet frozen.
+
 ## Independent architecture review incorporated (2026-09-21)
 
 - Made SQLite ownership explicit: write transactions are synchronous, nonescaping, and never cross

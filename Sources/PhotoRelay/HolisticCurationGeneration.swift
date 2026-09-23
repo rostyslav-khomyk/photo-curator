@@ -1,4 +1,5 @@
 import Foundation
+import CoreLocation
 
 struct HolisticBoundaryEvidence {
     var visualPercentile: (IndexedPhoto, IndexedPhoto) -> CuratorEvidence<Double> = { _, _ in
@@ -83,6 +84,81 @@ enum HolisticCurationGenerator {
         }
     }
 
+    /// Coalesces only uncurated singletons at a habitual place. Event-sized, reviewed,
+    /// customized, Favorite, and published Moments remain untouched.
+    static func refiningRoutineSingletons(_ moments: [PhotoMoment], places: [MeaningfulPlace],
+                                          protectedMomentIDs: Set<String> = [],
+                                          calendar: Calendar = .current) -> [PhotoMoment] {
+        struct Key: Hashable { let placeID: UUID; let year: Int; let month: Int; let reference: Bool }
+        var groups: [Key: [(PhotoMoment, MeaningfulPlace)]] = [:]
+        var output: [PhotoMoment] = []
+
+        for moment in moments {
+            guard moment.photos.count == 1, !moment.photos[0].favorite,
+                  moment.publishedAlbumID == nil, moment.groupingState != .reviewed,
+                  moment.narrative?.state != .customized, !protectedMomentIDs.contains(moment.id),
+                  let place = habitualPlace(for: moment, places: places) else {
+                output.append(moment)
+                continue
+            }
+            let parts = calendar.dateComponents([.year, .month], from: moment.start)
+            guard let year = parts.year, let month = parts.month else { output.append(moment); continue }
+            let reference = MomentDisplayEligibility.evidence(for: moment.photos[0], in: moment) != nil
+            groups[Key(placeID: place.id, year: year, month: month, reference: reference), default: []]
+                .append((moment, place))
+        }
+
+        for (key, values) in groups {
+            guard values.count >= 2 else { output.append(values[0].0); continue }
+            let ordered = values.map(\.0).sorted { $0.start < $1.start }
+            let place = values[0].1
+            let photos = ordered.flatMap(\.photos)
+            let fingerprint = photos.map(\.id).sorted().joined(separator: "|")
+            let titlePrefix = key.reference ? "Notes and records" : "Everyday life"
+            var dateParts = DateComponents(); dateParts.year = key.year; dateParts.month = key.month; dateParts.day = 1
+            let period = calendar.date(from: dateParts)?.formatted(.dateTime.month(.wide).year())
+                ?? "\(key.year)-\(key.month)"
+            let narrative = MomentNarrative(version: MomentNarrative.version,
+                headline: "\(titlePrefix) at \(place.label) in \(period)", deck: nil, story: nil,
+                place: place.label, date: period, confidence: 1,
+                provenance: ["habitual place", key.reference ? "reference capture" : "sparse everyday capture"],
+                state: .automatic)
+            output.append(PhotoMoment(id: "routine-" + MomentContinuity.digest(Data(fingerprint.utf8)),
+                start: ordered.first!.start, end: ordered.last!.end, photos: photos,
+                selection: combinedSelection(ordered), narrative: narrative,
+                groupingSource: algorithmVersion,
+                groupingReason: "Sparse captures at the same habitual place were collected within one calendar month. Exact photo dates are preserved.",
+                groupingState: .conservative,
+                displayEvidence: ordered.reduce(into: [:]) { result, moment in
+                    result.merge(moment.displayEvidence ?? [:]) { current, _ in current }
+                }))
+        }
+        return output.sorted { $0.start == $1.start ? $0.id < $1.id : $0.start > $1.start }
+    }
+
+    private static func habitualPlace(for moment: PhotoMoment, places: [MeaningfulPlace]) -> MeaningfulPlace? {
+        let photo = moment.photos[0]
+        if EvidenceGrouping.validGPS(photo) {
+            let location = CLLocation(latitude: photo.latitude!, longitude: photo.longitude!)
+            return places.compactMap { place -> (MeaningfulPlace, Double)? in
+                let distance = location.distance(from: CLLocation(latitude: place.latitude, longitude: place.longitude))
+                return distance <= max(place.radius, 750) ? (place, distance) : nil
+            }.min { $0.1 < $1.1 }?.0
+        }
+        guard let named = moment.narrative?.place else { return nil }
+        return places.first { $0.label.compare(named, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame }
+    }
+
+    private static func combinedSelection(_ moments: [PhotoMoment]) -> MomentSelection? {
+        let selections = moments.compactMap(\.selection)
+        guard !selections.isEmpty else { return nil }
+        var explanations: [String: String] = [:]
+        for selection in selections { explanations.merge(selection.explanations) { current, _ in current } }
+        return MomentSelection(selected: selections.flatMap(\.selected), pending: selections.flatMap(\.pending),
+            similar: selections.flatMap(\.similar), explanations: explanations,
+            alternatives: selections.flatMap(\.alternatives), contextOnly: selections.flatMap { $0.contextOnly ?? [] })
+    }
+
     private static func cadenceThresholds(_ photos: [IndexedPhoto], calendar: Calendar) -> [Date: TimeInterval] {
         var gaps: [Date: [TimeInterval]] = [:]
         for pair in zip(photos, photos.dropFirst()) {
@@ -119,8 +195,11 @@ enum HolisticLibraryMetrics {
         var momentsByDay: [Date: Int] = [:]
         var crossDay = 0
         for moment in moments {
-            momentsByDay[calendar.startOfDay(for: moment.start), default: 0] += 1
-            if !calendar.isDate(moment.start, inSameDayAs: moment.end) { crossDay += 1 }
+            if calendar.isDate(moment.start, inSameDayAs: moment.end) {
+                momentsByDay[calendar.startOfDay(for: moment.start), default: 0] += 1
+            } else {
+                crossDay += 1
+            }
         }
         return CurationGenerationMetrics(
             photoCount: moments.reduce(0) { $0 + $1.photos.count }, momentCount: moments.count,

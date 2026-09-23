@@ -652,7 +652,10 @@ allocation are implemented and tracked in
 private benchmark, performance qualification, and shipping candidate workflow remain gated. The
 first 109,007-photo copied-corpus candidate was complete and fast but failed the holistic quality
 gate because it substantially increased fragmentation and did not yet carry narratives/highlights;
-it was not activated.
+it was not activated. A second conservative candidate retained trusted event boundaries and combined
+only eligible habitual-place singletons. It reduced the catalog to 5,001 Moments and 1,385 singletons,
+preserved every existing highlight and large visit, and passed the structural gate. Reviewed boundary
+errors remain required before activation.
 
 - Add adaptive logical-day/scene boundaries, optional Story parents, hierarchical highlight
   allocation, and grounded titles as a candidate generation, reusing the current evidence cache.
