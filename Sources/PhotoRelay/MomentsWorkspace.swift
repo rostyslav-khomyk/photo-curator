@@ -679,6 +679,7 @@ struct CuratorSettingsView: View {
     @State private var storageSummary = "Calculating local storage…"
     @State private var resetPreview: CuratorResetPreview?
     @State private var reanalysisPreview: CuratorReanalysisPreview?
+    @State private var rebuildPreview: CurationRebuildPreview?
     @State private var loadingResetPreview = false
 
     var body: some View {
@@ -776,8 +777,15 @@ struct CuratorSettingsView: View {
             }
 
             Section("Maintenance") {
-                Text("A curation rebuild will appear here after its candidate comparison gate passes.")
-                    .font(.caption).foregroundStyle(.secondary)
+                Button("Rebuild Curation with Latest Algorithm…") {
+                    loadingResetPreview = true
+                    Task {
+                        do { rebuildPreview = try await curator.buildLatestCurationCandidate() }
+                        catch { curator.errorMessage = error.localizedDescription }
+                        loadingResetPreview = false
+                    }
+                }
+                .disabled(loadingResetPreview || curator.maintenanceBusy || curator.syncBusy)
                 Button("Reanalyze Entire Library…") {
                     loadingResetPreview = true
                     Task {
@@ -837,6 +845,58 @@ struct CuratorSettingsView: View {
                     reanalysisPreview = nil
                 }
             }
+            .sheet(item: $rebuildPreview) { preview in
+                CurationRebuildComparisonView(preview: preview) { rebuildPreview = nil }
+            }
+    }
+}
+
+private struct CurationRebuildComparisonView: View {
+    let preview: CurationRebuildPreview
+    let close: () -> Void
+
+    private var comparison: CurationGenerationComparison { preview.comparison }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Curation Comparison").font(.title2.bold())
+            Text("The latest algorithm built a complete shadow catalog. Your current Moments remain active.")
+            Grid(alignment: .leading, horizontalSpacing: 24, verticalSpacing: 8) {
+                GridRow { Text(""); Text("Current").bold(); Text("Candidate").bold() }
+                metric("Moments", comparison.active.momentCount, comparison.candidate.momentCount)
+                metric("Single-photo Moments", comparison.active.singletonCount,
+                       comparison.candidate.singletonCount)
+                metric("Highlights", comparison.active.highlightCount,
+                       comparison.candidate.highlightCount)
+                metric("Large Moments", comparison.active.largeMomentCount,
+                       comparison.candidate.largeMomentCount)
+                metric("Fragmented days", comparison.active.fragmentedDayCount,
+                       comparison.candidate.fragmentedDayCount)
+                metric("Generic titles", comparison.active.genericTitleCount,
+                       comparison.candidate.genericTitleCount)
+            }
+            Divider()
+            if comparison.canRecommendActivation {
+                Text("The measured quality gate passed. Activation remains unavailable until the runtime cutover no longer permits the legacy worker to overwrite the chosen generation.")
+                    .foregroundStyle(.orange)
+            } else {
+                Text("This candidate is retained for review but cannot be recommended yet. The owner-reviewed false-join/false-split benchmark is still required.")
+                    .foregroundStyle(.orange)
+            }
+            Text("No Photos albums, Favorites, Google uploads, titles, choices, or active Moment memberships were changed.")
+                .font(.callout).foregroundStyle(.secondary)
+            HStack { Spacer(); Button("Done", action: close).keyboardShortcut(.defaultAction) }
+        }
+        .padding(24)
+        .frame(width: 580)
+    }
+
+    private func metric(_ label: String, _ active: Int, _ candidate: Int) -> some View {
+        GridRow {
+            Text(label)
+            Text(active.formatted()).monospacedDigit()
+            Text(candidate.formatted()).monospacedDigit()
+        }
     }
 }
 

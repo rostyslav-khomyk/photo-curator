@@ -48,6 +48,14 @@ counts, the app quits. Its next launch removes generated local state and Curator
 empty legacy and Catalog v2 schemas before constructing controllers. Significant Places, Google state,
 and ordinary preferences are preserved. Automated tests cover this boundary; it was not run live.
 
+Full evidence reanalysis is now a separate Settings operation. It estimates the indexed corpus and
+cache cost, requeues analysis in one transaction, clears only rebuildable evidence, and avoids a new
+PhotoKit metadata scan. A normal curation rebuild now snapshots the active catalog, stages a complete
+shadow generation from existing evidence, and displays aggregate quality deltas. It deliberately has
+no Apply action: the legacy worker can still republish its grouping into Catalog v2, and no candidate
+may become active until that runtime ownership is removed and the owner-reviewed boundary benchmark
+passes. These maintenance checkpoints did not mutate the live Photos library or owner catalog.
+
 ## Independent architecture review incorporated (2026-09-21)
 
 - Made SQLite ownership explicit: write transactions are synchronous, nonescaping, and never cross

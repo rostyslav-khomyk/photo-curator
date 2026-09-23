@@ -25,17 +25,24 @@
   clears rebuildable derived evidence, and resumes the event-driven scheduler without forcing a
   PhotoKit metadata rescan. Titles, choices, merges, publications, Significant Places, Favorites,
   and Google state remain intact.
+- `Rebuild Curation with Latest Algorithm...` now builds and persists a complete shadow generation
+  from the current catalog and evidence, then compares Moment, singleton, highlight, large-Moment,
+  fragmented-day, and generic-title counts with the active generation. It does not change active
+  memberships or external state.
 
 ## Current safety boundary
 
 The destructive Settings action is enabled, but has not been exercised against the owner's live
 library. Existing legacy albums have no creation proof and therefore cannot be deleted automatically;
 the confirmation calls out that count and leaves those albums for manual review. Reset requires the
-user to reopen the app after its safe quit boundary.
+user to reopen the app after its safe quit boundary. Shadow candidate activation remains unavailable
+until the Catalog v2 runtime cutover prevents the legacy worker from writing its older grouping back
+over an activated generation and the owner-reviewed false-join/false-split benchmark passes.
 
 ## Remaining gate
 
-- Add `Rebuild Curation with Latest Algorithm...` and comparison acceptance.
+- Cut the runtime workspace over to the active Catalog v2 generation, then add benchmark-gated
+  candidate acceptance and rollback controls.
 - Test interruption at every durable phase, including app termination between Photos verification
   and local catalog erasure.
 - Verify on a copied owner catalog and a Photos test library that unrelated same-named containers,

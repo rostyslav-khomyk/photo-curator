@@ -659,6 +659,11 @@ actor CatalogV2Store {
         try generationRecord(where: "id=?", bindValue: id)
     }
 
+    func activeGeneration() throws -> CurationGenerationRecord? {
+        guard let id = try activeGenerationID() else { return nil }
+        return try generation(id: id)
+    }
+
     func candidateSummaries(generationID: String) throws -> [MomentSummary] {
         let statement = try prepare("""
             SELECT id,revision,start,end,headline,photo_count,highlight_count,cover_asset_id,

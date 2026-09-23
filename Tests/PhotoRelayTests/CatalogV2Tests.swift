@@ -210,6 +210,8 @@ final class CatalogV2Tests: XCTestCase {
             falseJoinCount: 1, falseSplitCount: 0)
         let activeGeneration = try await store.snapshotActiveGeneration(
             algorithmVersion: "legacy", evidenceVersion: "legacy", metrics: activeMetrics, id: "active-generation")
+        let persistedActiveGeneration = try await store.activeGeneration()
+        XCTAssertEqual(persistedActiveGeneration, activeGeneration)
         let candidate = try await store.beginCandidateGeneration(
             algorithmVersion: "adaptive-scenes-v1", evidenceVersion: "local-evidence-v1", id: "candidate-generation")
         XCTAssertEqual(candidate.sourceGenerationID, activeGeneration.id)

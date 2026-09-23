@@ -949,6 +949,53 @@ final class CuratorController: ObservableObject {
         return try await worker.reanalysisPreview()
     }
 
+    func buildLatestCurationCandidate() async throws -> CurationRebuildPreview {
+        guard !maintenanceBusy, !syncBusy, let catalog else {
+            throw PublicationFailure.conflictingOperation
+        }
+        maintenanceBusy = true
+        maintenancePaused = true
+        activity = "Building a shadow curation from existing evidence…"
+        analysisTask?.cancel()
+        metadataTask?.cancel()
+        let analysis = analysisTask
+        let metadata = metadataTask
+        await analysis?.value
+        await metadata?.value
+        var candidateID: String?
+        do {
+            let protection = MomentGroupingProtection.load(.standard)
+            let activeMoments = try await worker.preparedCatalog(protection: protection)
+            let saved = try await catalog.activeGeneration()?.metrics
+            let activeMetrics = HolisticLibraryMetrics.measure(activeMoments,
+                falseJoins: saved?.falseJoinCount, falseSplits: saved?.falseSplitCount)
+            let active = try await catalog.snapshotActiveGeneration(algorithmVersion: "shipping-v1",
+                evidenceVersion: CuratorVisionAnalyzer.version, metrics: activeMetrics)
+            let candidateMoments = HolisticCurationGenerator.refiningRoutineSingletons(activeMoments,
+                places: MeaningfulPlacesStore.snapshot(), protectedMomentIDs: protection.ids)
+            let candidateMetrics = HolisticLibraryMetrics.measure(candidateMoments)
+            let generation = try await catalog.beginCandidateGeneration(
+                algorithmVersion: HolisticCurationGenerator.algorithmVersion,
+                evidenceVersion: CuratorVisionAnalyzer.version, sourceGenerationID: active.id)
+            candidateID = generation.id
+            try await catalog.stageCandidateGeneration(id: generation.id, moments: candidateMoments,
+                metrics: candidateMetrics)
+            let comparison = CurationGenerationComparison.compare(active: activeMetrics,
+                candidate: candidateMetrics)
+            maintenancePaused = false
+            maintenanceBusy = false
+            activity = "Shadow curation ready for comparison. Active Moments were not changed."
+            wakeScheduler(.policyChanged)
+            return CurationRebuildPreview(generationID: generation.id, comparison: comparison)
+        } catch {
+            if let candidateID { try? await catalog.failGeneration(id: candidateID, reason: error.localizedDescription) }
+            maintenancePaused = false
+            maintenanceBusy = false
+            wakeScheduler(.policyChanged)
+            throw error
+        }
+    }
+
     func reanalyzeEntireLibrary(_ preview: CuratorReanalysisPreview) async throws {
         guard !maintenanceBusy, !syncBusy else { throw PublicationFailure.conflictingOperation }
         guard try await worker.reanalysisPreview().photos == preview.photos else {

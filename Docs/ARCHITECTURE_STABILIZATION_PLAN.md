@@ -675,7 +675,10 @@ quiescence, and startup-time empty-schema recreation are implemented and tracked
 [`PHASE7_MAINTENANCE_RESET.md`](PHASE7_MAINTENANCE_RESET.md). Copied-library interruption and live
 owner-library qualification remain open. Legacy albums without creation proof are deliberately not
 inferred from names. Full evidence reanalysis is also wired through the existing queue and cache;
-it preserves metadata and user work instead of causing another PhotoKit scan.
+it preserves metadata and user work instead of causing another PhotoKit scan. Normal rebuild now
+stages a complete shadow generation and presents an active-versus-candidate comparison without
+changing the live workspace. Acceptance remains blocked until Catalog v2 owns the runtime projection
+and the private false-join/false-split benchmark passes.
 
 - Add storage reporting, versioned curation rebuild, full evidence reanalysis, and the crash-resumable
   destructive reset described below.
@@ -705,7 +708,8 @@ Settings should contain a clearly separated `Maintenance` section. Three actions
 needs and must not be collapsed into one alarming button:
 
 1. `Rebuild Curation with Latest Algorithm...` creates a shadow generation from existing metadata
-   and evidence, preserves user work, shows a comparison, and switches only after acceptance.
+   and evidence, preserves user work, and shows a comparison. Switching remains unavailable until
+   the Catalog v2 runtime cutover and owner-reviewed benchmark make acceptance safe.
 2. `Reanalyze Entire Library...` also invalidates Vision/OCR/derived evidence. Use it when evidence
    extraction changed or corruption is suspected; show time and disk estimates.
 3. `Reset Photo Curator...` is the nuclear clean-room option. It removes local curation and managed

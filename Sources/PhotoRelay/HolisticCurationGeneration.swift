@@ -260,6 +260,12 @@ struct CurationGenerationComparison: Equatable, Sendable {
     }
 }
 
+struct CurationRebuildPreview: Identifiable, Equatable, Sendable {
+    let generationID: String
+    let comparison: CurationGenerationComparison
+    var id: String { generationID }
+}
+
 struct LibraryOverviewPeriod: Equatable, Sendable, Identifiable {
     let year: Int
     let month: Int
