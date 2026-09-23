@@ -30,6 +30,16 @@ month. It separates everyday photographs from reference-memory captures. On 109,
 large/giant visits. Fragmented days fell from 31 to 29. The candidate passes structural checks but was
 not activated because the private false-join/false-split benchmark is not yet frozen.
 
+## Phase 7 reset safety foundation (2026-09-23)
+
+Catalog schema 7 now persists stable PhotoKit container identity only when an operation proves that
+Photo Curator created the container. Publication verification carries that proof through its durable
+receipt, while ambiguous crash recovery remains intentionally unowned. A reset journal and replayable
+coordinator verify identifier hierarchy, delete only proven containers, recheck Photos asset and
+Favorite totals, and only then permit local erasure and catalog recreation. The destructive Settings
+action remains disabled until worker quiescence, safe relaunch/recreation, and copied-library
+interruption tests are complete.
+
 ## Independent architecture review incorporated (2026-09-21)
 
 - Made SQLite ownership explicit: write transactions are synchronous, nonescaping, and never cross

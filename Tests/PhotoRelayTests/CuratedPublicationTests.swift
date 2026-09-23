@@ -7,17 +7,19 @@ private actor FakeAlbums: CuratedAlbumAdapter {
     var receipt: CuratedAlbumReceipt?
     var failAfterEffect = false
     var recovery: Recovery = .automatic
+    var recoverWithoutOwnership = false
 
     func configure(failAfterEffect: Bool = false, recovery: Recovery = .automatic,
-                   receipt: CuratedAlbumReceipt? = nil) {
+                   receipt: CuratedAlbumReceipt? = nil, recoverWithoutOwnership: Bool = false) {
         self.failAfterEffect = failAfterEffect
         self.recovery = recovery
         self.receipt = receipt
+        self.recoverWithoutOwnership = recoverWithoutOwnership
     }
 
     func publish(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumReceipt {
         calls += 1
-        let value = CuratedAlbumReceipt(albumID: "managed", assetIDs: request.assetIDs)
+        let value = receipt ?? CuratedAlbumReceipt(albumID: "managed", assetIDs: request.assetIDs)
         receipt = value
         if failAfterEffect { throw PublicationFailure.verificationPending }
         return value
@@ -26,7 +28,12 @@ private actor FakeAlbums: CuratedAlbumAdapter {
     func recover(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumRecovery {
         switch recovery {
         case .automatic:
-            return receipt.map(CuratedAlbumRecovery.confirmed) ?? .absent
+            guard let receipt else { return .absent }
+            if recoverWithoutOwnership {
+                return .confirmed(CuratedAlbumReceipt(albumID: receipt.albumID, assetIDs: receipt.assetIDs,
+                    rootFolderID: receipt.rootFolderID, yearFolderID: receipt.yearFolderID))
+            }
+            return .confirmed(receipt)
         case .absent: return .absent
         case .conflicting: return .conflicting
         }
@@ -50,6 +57,22 @@ final class CuratedPublicationTests: XCTestCase {
         XCTAssertEqual(calls, 1)
         XCTAssertTrue(pending.isEmpty)
         XCTAssertTrue(summaries.first?.inPhotos == true)
+    }
+
+    func testPublicationPersistsOnlyContainersCreatedByThisApp() async throws {
+        let fixture = try await makeFixture()
+        let albums = FakeAlbums()
+        await albums.configure(receipt: CuratedAlbumReceipt(albumID: "album", assetIDs: ["a", "b"],
+            rootFolderID: "root", yearFolderID: "year", createdContainerIDs: ["year", "album"]),
+            recoverWithoutOwnership: true)
+
+        _ = try await coordinator(fixture.store, albums).publish(request())
+
+        let containers = try await fixture.store.managedPhotoContainers()
+        XCTAssertEqual(containers, [
+            ManagedPhotoContainer(id: "album", kind: .album, parentID: "year"),
+            ManagedPhotoContainer(id: "year", kind: .year, parentID: "root")
+        ])
     }
 
     func testLostPhotoKitResponseIsRecoveredWithoutDuplicateAlbum() async throws {

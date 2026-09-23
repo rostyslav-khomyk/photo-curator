@@ -31,6 +31,16 @@ struct CuratedPublicationRequest: Codable, Equatable, Sendable {
 struct CuratedAlbumReceipt: Codable, Equatable, Sendable {
     let albumID: String
     let assetIDs: [String]
+    var rootFolderID: String? = nil
+    var yearFolderID: String? = nil
+    var createdContainerIDs: [String] = []
+}
+
+struct ManagedPhotoContainer: Equatable, Sendable {
+    enum Kind: String, Sendable { case root, year, album }
+    let id: String
+    let kind: Kind
+    let parentID: String?
 }
 
 enum PublicationFailure: Error, Equatable {
@@ -162,10 +172,11 @@ actor PublicationCoordinator {
             try Task.checkCancellation()
             switch try await adapter.recover(request) {
             case .confirmed(let receipt):
-                try validate(receipt, for: request)
+                let completed = receipt.preservingOwnership(from: record.receipt)
+                try validate(completed, for: request)
                 try await store.completePublication(operationID: request.operationID,
-                                                    receipt: receipt, date: Date())
-                return receipt
+                                                    receipt: completed, date: Date())
+                return completed
             case .absent:
                 record = try await store.recordPublicationVerification(
                     operationID: request.operationID, error: "Managed album is not visible yet")
@@ -192,5 +203,16 @@ actor PublicationCoordinator {
               Set(receipt.assetIDs) == Set(request.assetIDs) else {
             throw PublicationFailure.invalidReceipt
         }
+    }
+}
+
+private extension CuratedAlbumReceipt {
+    func preservingOwnership(from durable: CuratedAlbumReceipt?) -> CuratedAlbumReceipt {
+        guard let durable, durable.albumID == albumID else { return self }
+        return CuratedAlbumReceipt(albumID: albumID, assetIDs: assetIDs,
+            rootFolderID: rootFolderID ?? durable.rootFolderID,
+            yearFolderID: yearFolderID ?? durable.yearFolderID,
+            createdContainerIDs: createdContainerIDs.isEmpty
+                ? durable.createdContainerIDs : createdContainerIDs)
     }
 }

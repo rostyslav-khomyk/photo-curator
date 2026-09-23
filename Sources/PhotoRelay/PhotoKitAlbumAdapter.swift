@@ -20,8 +20,8 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
         var createdAlbumID: String?
 
         // Step 1: Find or create root folder and year folder
-        let rootFolder = try await findOrCreateRootFolder()
-        let yearFolder = try await findOrCreateYearFolder(year: yearString, in: rootFolder)
+        let (rootFolder, createdRoot) = try await findOrCreateRootFolder()
+        let (yearFolder, createdYear) = try await findOrCreateYearFolder(year: yearString, in: rootFolder)
 
         // Step 2: Check if album already exists in year folder
         let existingAlbum = findAlbum(named: albumTitle, in: yearFolder)
@@ -57,7 +57,13 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
             throw PublicationFailure.verificationPending
         }
 
-        return CuratedAlbumReceipt(albumID: finalAlbumID, assetIDs: request.assetIDs)
+        var created = [String]()
+        if createdRoot { created.append(rootFolder.localIdentifier) }
+        if createdYear { created.append(yearFolder.localIdentifier) }
+        if existingAlbum == nil { created.append(finalAlbumID) }
+        return CuratedAlbumReceipt(albumID: finalAlbumID, assetIDs: request.assetIDs,
+            rootFolderID: rootFolder.localIdentifier, yearFolderID: yearFolder.localIdentifier,
+            createdContainerIDs: created)
     }
 
     func recover(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumRecovery {
@@ -79,7 +85,8 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
         }
 
         if Set(memberIDs) == Set(request.assetIDs) {
-            return .confirmed(CuratedAlbumReceipt(albumID: album.localIdentifier, assetIDs: request.assetIDs))
+            return .confirmed(CuratedAlbumReceipt(albumID: album.localIdentifier, assetIDs: request.assetIDs,
+                rootFolderID: rootFolder.localIdentifier, yearFolderID: yearFolder.localIdentifier))
         }
         return .conflicting
     }
@@ -125,8 +132,8 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
         return root
     }
 
-    private func findOrCreateRootFolder() async throws -> PHCollectionList {
-        if let existing = findRootFolder() { return existing }
+    private func findOrCreateRootFolder() async throws -> (PHCollectionList, Bool) {
+        if let existing = findRootFolder() { return (existing, false) }
         var placeholderID: String?
         try await PHPhotoLibrary.shared().performChanges {
             let req = PHCollectionListChangeRequest.creationRequestForCollectionList(withTitle: self.rootFolderName)
@@ -134,9 +141,9 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
         }
         if let placeholderID {
             let fetched = PHCollectionList.fetchCollectionLists(withLocalIdentifiers: [placeholderID], options: nil)
-            if let first = fetched.firstObject { return first }
+            if let first = fetched.firstObject { return (first, true) }
         }
-        if let root = findRootFolder() { return root }
+        if let root = findRootFolder() { return (root, true) }
         throw PublicationFailure.verificationPending
     }
 
@@ -152,8 +159,8 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
         return yearList
     }
 
-    private func findOrCreateYearFolder(year: String, in root: PHCollectionList) async throws -> PHCollectionList {
-        if let existing = findYearFolder(year: year, in: root) { return existing }
+    private func findOrCreateYearFolder(year: String, in root: PHCollectionList) async throws -> (PHCollectionList, Bool) {
+        if let existing = findYearFolder(year: year, in: root) { return (existing, false) }
         var placeholderID: String?
         try await PHPhotoLibrary.shared().performChanges {
             let yearReq = PHCollectionListChangeRequest.creationRequestForCollectionList(withTitle: year)
@@ -165,9 +172,9 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
         }
         if let placeholderID {
             let fetched = PHCollectionList.fetchCollectionLists(withLocalIdentifiers: [placeholderID], options: nil)
-            if let first = fetched.firstObject { return first }
+            if let first = fetched.firstObject { return (first, true) }
         }
-        if let yearList = findYearFolder(year: year, in: root) { return yearList }
+        if let yearList = findYearFolder(year: year, in: root) { return (yearList, true) }
         throw PublicationFailure.verificationPending
     }
 
@@ -219,6 +226,74 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
                 continuation.resume(returning: status)
             }
+        }
+    }
+}
+
+extension PhotoKitAlbumAdapter: CuratorResetPhotos {
+    func assetCounts() async throws -> PhotoLibraryAssetCounts {
+        let all = PHAsset.fetchAssets(with: nil)
+        let favorites = PHFetchOptions()
+        favorites.predicate = NSPredicate(format: "favorite == YES")
+        favorites.includeHiddenAssets = true
+        return PhotoLibraryAssetCounts(assets: all.count,
+            favorites: PHAsset.fetchAssets(with: favorites).count)
+    }
+
+    func verifyOwnership(of containers: [ManagedPhotoContainer]) async throws {
+        for container in containers where containerExists(container) {
+            guard isInRecordedHierarchy(container) else { throw PublicationFailure.destinationConflict }
+        }
+    }
+
+    func deleteContainers(_ containers: [ManagedPhotoContainer]) async throws {
+        let existing = containers.filter(containerExists)
+        try await verifyOwnership(of: existing)
+        let albums = existing.filter { $0.kind == .album }.compactMap {
+            PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [$0.id], options: nil).firstObject
+        }
+        let lists = existing.filter { $0.kind != .album }.compactMap {
+            PHCollectionList.fetchCollectionLists(withLocalIdentifiers: [$0.id], options: nil).firstObject
+        }
+        guard !albums.isEmpty || !lists.isEmpty else { return }
+        try await PHPhotoLibrary.shared().performChanges {
+            if !albums.isEmpty { PHAssetCollectionChangeRequest.deleteAssetCollections(albums as NSArray) }
+            if !lists.isEmpty { PHCollectionListChangeRequest.deleteCollectionLists(lists as NSArray) }
+        }
+    }
+
+    func containersAreAbsent(_ containers: [ManagedPhotoContainer]) async throws -> Bool {
+        containers.allSatisfy { !containerExists($0) }
+    }
+
+    private func containerExists(_ container: ManagedPhotoContainer) -> Bool {
+        switch container.kind {
+        case .album:
+            return PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [container.id], options: nil).count == 1
+        case .root, .year:
+            return PHCollectionList.fetchCollectionLists(withLocalIdentifiers: [container.id], options: nil).count == 1
+        }
+    }
+
+    private func isInRecordedHierarchy(_ container: ManagedPhotoContainer) -> Bool {
+        switch container.kind {
+        case .root:
+            let top = PHCollectionList.fetchTopLevelUserCollections(with: nil)
+            var found = false
+            top.enumerateObjects { collection, _, stop in
+                if collection.localIdentifier == container.id { found = true; stop.pointee = true }
+            }
+            return found
+        case .year, .album:
+            guard let parentID = container.parentID,
+                  let parent = PHCollectionList.fetchCollectionLists(
+                    withLocalIdentifiers: [parentID], options: nil).firstObject else { return false }
+            let children = PHCollection.fetchCollections(in: parent, options: nil)
+            var found = false
+            children.enumerateObjects { collection, _, stop in
+                if collection.localIdentifier == container.id { found = true; stop.pointee = true }
+            }
+            return found
         }
     }
 }

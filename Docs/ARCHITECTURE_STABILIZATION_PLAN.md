@@ -670,6 +670,11 @@ errors remain required before activation.
 
 ### Phase 7: Maintenance and nuclear reset, 2-3 days
 
+Ownership persistence and the crash-resumable reset state machine are implemented and tracked in
+[`PHASE7_MAINTENANCE_RESET.md`](PHASE7_MAINTENANCE_RESET.md). The destructive UI remains disabled
+until worker quiescence, startup-time local recreation, exact confirmation counts, and copied-library
+interruption tests pass. Legacy albums without creation proof are deliberately not inferred from names.
+
 - Add storage reporting, versioned curation rebuild, full evidence reanalysis, and the crash-resumable
   destructive reset described below.
 - Verify managed Photos container ownership from persisted identifiers and hierarchy, never title alone.

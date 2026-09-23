@@ -147,7 +147,7 @@ private final class CatalogV2Connection {
                     }
                 }
             }
-            guard sqlite3_exec(opened, "PRAGMA user_version=6;", nil, nil, nil) == SQLITE_OK else {
+            guard sqlite3_exec(opened, "PRAGMA user_version=7;", nil, nil, nil) == SQLITE_OK else {
                 throw NSError(domain: "PhotoCurator.CatalogV2", code: 1,
                     userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(opened))])
             }
@@ -162,7 +162,7 @@ private final class CatalogV2Connection {
 }
 
 actor CatalogV2Store {
-    static let schemaVersion = 6
+    static let schemaVersion = 7
     private let connection: CatalogV2Connection
     private var db: OpaquePointer? { connection.db }
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -416,10 +416,43 @@ actor CatalogV2Store {
             sqlite3_bind_text(marker, 2, receipt.albumID, -1, transient)
             sqlite3_bind_double(marker, 3, date.timeIntervalSince1970)
             guard sqlite3_step(marker) == SQLITE_DONE else { throw failure() }
+            try recordManagedContainers(receipt)
             try execute("COMMIT")
         } catch {
             try? execute("ROLLBACK")
             throw error
+        }
+    }
+
+    func managedPhotoContainers() throws -> [ManagedPhotoContainer] {
+        let statement = try prepare("SELECT id,kind,parent_id FROM managed_photo_containers ORDER BY kind,id")
+        defer { sqlite3_finalize(statement) }
+        var result: [ManagedPhotoContainer] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let kind = ManagedPhotoContainer.Kind(rawValue: text(statement, 1)) else { continue }
+            result.append(ManagedPhotoContainer(id: text(statement, 0), kind: kind,
+                parentID: optionalText(statement, 2)))
+        }
+        return result
+    }
+
+    private func recordManagedContainers(_ receipt: CuratedAlbumReceipt) throws {
+        let created = Set(receipt.createdContainerIDs)
+        guard !created.isEmpty else { return }
+        let insert = try prepare("INSERT OR IGNORE INTO managed_photo_containers(id,kind,parent_id) VALUES(?,?,?)")
+        defer { sqlite3_finalize(insert) }
+        let candidates: [(String?, ManagedPhotoContainer.Kind, String?)] = [
+            (receipt.rootFolderID, .root, nil),
+            (receipt.yearFolderID, .year, receipt.rootFolderID),
+            (receipt.albumID, .album, receipt.yearFolderID)
+        ]
+        for (id, kind, parent) in candidates where id.map(created.contains) == true {
+            sqlite3_reset(insert); sqlite3_clear_bindings(insert)
+            sqlite3_bind_text(insert, 1, id!, -1, transient)
+            sqlite3_bind_text(insert, 2, kind.rawValue, -1, transient)
+            if let parent { sqlite3_bind_text(insert, 3, parent, -1, transient) }
+            else { sqlite3_bind_null(insert, 3) }
+            guard sqlite3_step(insert) == SQLITE_DONE else { throw failure() }
         }
     }
 
@@ -711,6 +744,8 @@ actor CatalogV2Store {
               request BLOB NOT NULL,phase TEXT NOT NULL,receipt BLOB,verification_attempts INTEGER NOT NULL,
               next_verification_at REAL,last_error TEXT,updated_at REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS publication_operations_phase ON publication_operations(phase,next_verification_at);
+            CREATE TABLE IF NOT EXISTS managed_photo_containers(
+              id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('root','year','album')),parent_id TEXT);
             CREATE TABLE IF NOT EXISTS schema_migrations(name TEXT PRIMARY KEY,completed_at REAL NOT NULL,completed INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS curation_generations(
               id TEXT PRIMARY KEY,algorithm_version TEXT NOT NULL,evidence_version TEXT NOT NULL,
@@ -737,7 +772,7 @@ actor CatalogV2Store {
               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
               active_generation_id TEXT NOT NULL REFERENCES curation_generations(id),
               previous_generation_id TEXT REFERENCES curation_generations(id));
-            PRAGMA user_version=6;
+            PRAGMA user_version=7;
             """
 
     private func activeGenerationID() throws -> String? {
