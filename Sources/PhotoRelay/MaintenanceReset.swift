@@ -98,11 +98,16 @@ actor CuratorResetCoordinator {
     private let photos: CuratorResetPhotos
     private let localData: CuratorResetLocalData
     private let journal: CuratorResetJournal
+    private let delay: @Sendable (TimeInterval) async throws -> Void
 
-    init(photos: CuratorResetPhotos, localData: CuratorResetLocalData, journal: CuratorResetJournal) {
+    init(photos: CuratorResetPhotos, localData: CuratorResetLocalData, journal: CuratorResetJournal,
+         delay: @escaping @Sendable (TimeInterval) async throws -> Void = { seconds in
+             try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+         }) {
         self.photos = photos
         self.localData = localData
         self.journal = journal
+        self.delay = delay
     }
 
     func begin(containers: [ManagedPhotoContainer], reclaimableBytes: Int64,
@@ -134,12 +139,7 @@ actor CuratorResetCoordinator {
                 try await photos.deleteContainers(containers)
                 try advance(&operation, to: .verifyingPhotos, now: now)
             case .verifyingPhotos:
-                guard try await photos.containersAreAbsent(containers) else {
-                    throw PublicationFailure.verificationPending
-                }
-                guard try await photos.assetCounts() == operation.before else {
-                    throw PublicationFailure.destinationConflict
-                }
+                try await verifyDeletion(containers, preserving: operation.before)
                 try advance(&operation, to: .erasingLocalData, now: now)
             case .erasingLocalData:
                 try await localData.eraseCuratorData()
@@ -169,10 +169,7 @@ actor CuratorResetCoordinator {
                 try await photos.deleteContainers(containers)
                 try advance(&operation, to: .verifyingPhotos, now: now)
             case .verifyingPhotos:
-                guard try await photos.containersAreAbsent(containers),
-                      try await photos.assetCounts() == operation.before else {
-                    throw PublicationFailure.destinationConflict
-                }
+                try await verifyDeletion(containers, preserving: operation.before)
                 try advance(&operation, to: .erasingLocalData, now: now)
             case .erasingLocalData, .recreatingCatalog, .completed:
                 break
@@ -186,6 +183,19 @@ actor CuratorResetCoordinator {
         operation.phase = phase
         operation.updatedAt = now
         try journal.save(operation)
+    }
+
+    private func verifyDeletion(_ containers: [ManagedPhotoContainer],
+                                preserving counts: PhotoLibraryAssetCounts) async throws {
+        for wait in [0.0, 0.25, 0.5, 1.0, 2.0] {
+            if wait > 0 { try await delay(wait) }
+            guard try await photos.containersAreAbsent(containers) else { continue }
+            guard try await photos.assetCounts() == counts else {
+                throw PublicationFailure.destinationConflict
+            }
+            return
+        }
+        throw PublicationFailure.verificationPending
     }
 
     private func decodedContainers(_ operation: CuratorResetOperation) throws -> [ManagedPhotoContainer] {

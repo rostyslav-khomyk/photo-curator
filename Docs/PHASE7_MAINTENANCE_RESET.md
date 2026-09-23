@@ -13,7 +13,8 @@
 - The reset journal lives outside data intended for erasure and advances through requested,
   container deletion, Photos verification, local erasure, catalog recreation, and completion.
 - Reset replay is idempotent. Photos asset and Favorite counts must match the pre-reset snapshot
-  before local data can be erased.
+  before local data can be erased. Folder/album absence is verified with bounded backoff because
+  PhotoKit can briefly return a stale hierarchy after a successful change.
 - Settings prepares an exact reset summary, revalidates it at confirmation, pauses curator work,
   waits for metadata/analysis tasks, blocks publication, and runs only the Photos-facing phases.
 - Local erasure uses a restart boundary. The app quits after Photos verification; on the next launch

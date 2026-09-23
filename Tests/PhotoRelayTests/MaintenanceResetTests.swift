@@ -5,6 +5,7 @@ private actor ResetPhotosFake: CuratorResetPhotos {
     var containers = Set(["root", "year", "album"])
     var counts = PhotoLibraryAssetCounts(assets: 100, favorites: 10)
     var deleteCalls = 0
+    var staleAbsenceReads = 0
 
     func assetCounts() -> PhotoLibraryAssetCounts { counts }
     func verifyOwnership(of requested: [ManagedPhotoContainer]) throws {
@@ -17,9 +18,14 @@ private actor ResetPhotosFake: CuratorResetPhotos {
         containers.subtract(requested.map(\.id))
     }
     func containersAreAbsent(_ requested: [ManagedPhotoContainer]) -> Bool {
-        requested.allSatisfy { !containers.contains($0.id) }
+        if staleAbsenceReads > 0 {
+            staleAbsenceReads -= 1
+            return false
+        }
+        return requested.allSatisfy { !containers.contains($0.id) }
     }
     func calls() -> Int { deleteCalls }
+    func deferAbsence(reads: Int) { staleAbsenceReads = reads }
 }
 
 private actor ResetLocalFake: CuratorResetLocalData {
@@ -95,6 +101,16 @@ final class MaintenanceResetTests: XCTestCase {
         XCTAssertEqual(localCounts.1, 0)
     }
 
+    func testPhotosVerificationRetriesStaleReadsBeforeAdvancing() async throws {
+        let fixture = fixture()
+        await fixture.photos.deferAbsence(reads: 2)
+        _ = try await fixture.coordinator.begin(containers: containers(), reclaimableBytes: 42)
+
+        let operation = try await fixture.coordinator.resumeThroughPhotos()
+
+        XCTAssertEqual(operation.phase, .erasingLocalData)
+    }
+
     func testLaunchBootstrapErasesGeneratedStateButPreservesPreferences() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }
@@ -135,7 +151,8 @@ final class MaintenanceResetTests: XCTestCase {
         let photos = ResetPhotosFake()
         let local = ResetLocalFake()
         let journal = CuratorResetJournal(url: root.appendingPathComponent("reset.json"))
-        return (CuratorResetCoordinator(photos: photos, localData: local, journal: journal),
+        return (CuratorResetCoordinator(photos: photos, localData: local, journal: journal,
+                    delay: { _ in }),
                 photos, local, journal)
     }
 
