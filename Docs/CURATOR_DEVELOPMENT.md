@@ -10,6 +10,13 @@ hierarchical highlights that do not depend on Favorites, and a compact Library O
 by focused tests. See `Docs/PHASE6_HOLISTIC_CURATION.md`. The owner-corpus run and private benchmark
 remain intentionally opt-in; no live catalog or Photos content was changed.
 
+The first isolated owner-corpus rehearsal migrated 109,007 assets and 5,206 Moments successfully.
+Candidate generation and staging took 3.24 seconds, but the candidate was rejected: it produced
+7,269 Moments and 316 fragmented days versus 5,206 and 28 in the active catalog, and it did not yet
+carry the narrative or highlight layers. This is a quality failure, not a storage/atomicity failure.
+The activation comparison now also requires a structural quality gate. The live catalog and Photos
+library were not modified.
+
 ## Independent architecture review incorporated (2026-09-21)
 
 - Made SQLite ownership explicit: write transactions are synchronous, nonescaping, and never cross

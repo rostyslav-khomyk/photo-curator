@@ -649,7 +649,10 @@ The generation schema, isolated candidate read model, adaptive boundary scaffold
 atomic activation/rollback, aggregate overview, conservative Stories, and hierarchical highlight
 allocation are implemented and tracked in
 [`PHASE6_HOLISTIC_CURATION.md`](PHASE6_HOLISTIC_CURATION.md). Owner-corpus generation, the frozen
-private benchmark, performance qualification, and shipping candidate workflow remain gated.
+private benchmark, performance qualification, and shipping candidate workflow remain gated. The
+first 109,007-photo copied-corpus candidate was complete and fast but failed the holistic quality
+gate because it substantially increased fragmentation and did not yet carry narratives/highlights;
+it was not activated.
 
 - Add adaptive logical-day/scene boundaries, optional Story parents, hierarchical highlight
   allocation, and grounded titles as a candidate generation, reusing the current evidence cache.

@@ -219,7 +219,7 @@ final class CatalogV2Tests: XCTestCase {
         ]
         let candidateMetrics = CurationGenerationMetrics(photoCount: 2, momentCount: 2, highlightCount: 0,
             singletonCount: 2, smallMomentCount: 2, largeMomentCount: 0, giantMomentCount: 0,
-            fragmentedDayCount: 0, crossDayMomentCount: 0, genericTitleCount: 2,
+            fragmentedDayCount: 0, crossDayMomentCount: 0, genericTitleCount: 1,
             falseJoinCount: 0, falseSplitCount: 1)
         try await store.stageCandidateGeneration(id: candidate.id, moments: candidateMoments,
                                                   metrics: candidateMetrics)

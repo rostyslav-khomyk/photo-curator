@@ -10,6 +10,8 @@
   Moments workspace.
 - Activation requires equal corpus coverage and reviewed false-join/false-split measurements. False
   joins carry three times the comparison cost of false splits.
+- A separate structural gate rejects increased fragmented days, giant Moments, generic titles, or
+  complete loss of an existing highlight layer even if benchmark error counts improve.
 - Activation and rollback replace the active derived projection in one transaction. User edits,
   protected membership, Photos publication receipts, and unfinished publication operations must
   retain their Moment identities or activation fails closed.
@@ -61,7 +63,14 @@ pipeline. Candidate generation must reuse that pipeline rather than introduce a 
 
 ## Remaining qualification
 
-- Run the opt-in copied owner catalog migration and full candidate comparison.
+- The 2026-09-23 copied owner-catalog migration passed for 109,007 assets and 5,206 Moments in 8.3
+  seconds, with zero validation failures, a 27 ms warm summary query, and about 348 MB maximum RSS.
+- The first complete-corpus candidate generated and staged in 3.24 seconds with about 500 MB maximum
+  test-process RSS. It was correctly rejected: Moments increased from 5,206 to 7,269, fragmented
+  days from 28 to 316, and the candidate did not yet carry narratives or highlights. The isolated
+  candidate snapshot grew the copied catalog from about 127 MB to 269 MB.
+- Integrate current evidence, narrative, and hierarchical-highlight pipelines, then rerun the copied
+  owner-corpus comparison until the structural gate passes.
 - Freeze and execute the private reviewed benchmark.
 - Measure generation time, peak RSS, WAL growth, and overview query latency on the owner library.
 - Connect the scheduler's bounded full-library generation job and candidate comparison sheet only

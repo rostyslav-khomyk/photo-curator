@@ -2,6 +2,39 @@ import XCTest
 @testable import PhotoRelay
 
 final class HolisticCurationGenerationTests: XCTestCase {
+    func testOptInCopiedOwnerCorpusCandidateGeneration() async throws {
+        guard let path = ProcessInfo.processInfo.environment["PHOTO_CURATOR_PHASE6_CATALOG"] else {
+            throw XCTSkip("Set PHOTO_CURATOR_PHASE6_CATALOG to an isolated owner-catalog copy")
+        }
+        let root = URL(fileURLWithPath: path)
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: "local.icloudpd.photorelay"))
+        let input = try CatalogV2Migrator.loadInput(root: root, defaults: defaults)
+        let store = try CatalogV2Store(url: root.appendingPathComponent(CatalogV2Migrator.catalogName))
+        _ = try await store.migrate(input)
+        try await store.prepareWorkspace(input)
+        let activeMetrics = HolisticLibraryMetrics.measure(input.moments)
+        _ = try await store.snapshotActiveGeneration(algorithmVersion: "shipping-v1",
+            evidenceVersion: "owner-copy", metrics: activeMetrics, id: "owner-active-generation")
+
+        let photos = input.moments.flatMap(\.photos)
+        let started = Date()
+        let candidateMoments = HolisticCurationGenerator.moments(photos, calendar: calendar())
+        let candidateMetrics = HolisticLibraryMetrics.measure(candidateMoments, calendar: calendar())
+        let generation = try await store.beginCandidateGeneration(
+            algorithmVersion: HolisticCurationGenerator.algorithmVersion,
+            evidenceVersion: "owner-copy", id: "owner-candidate-generation")
+        try await store.stageCandidateGeneration(id: generation.id, moments: candidateMoments,
+            metrics: candidateMetrics)
+        let elapsed = Date().timeIntervalSince(started)
+        let stagedSummaries = try await store.candidateSummaries(generationID: generation.id)
+
+        XCTAssertEqual(candidateMetrics.photoCount, activeMetrics.photoCount)
+        XCTAssertEqual(stagedSummaries.count, candidateMetrics.momentCount)
+        print("Phase 6 owner candidate: \(String(format: "%.3f", elapsed))s")
+        print("Active: \(activeMetrics)")
+        print("Candidate: \(candidateMetrics)")
+    }
+
     func testAdaptiveCadenceKeepsBurstAndSplitsLongPause() {
         let photos = [photo("a", 0), photo("b", 300), photo("c", 600), photo("d", 7_800)]
         let candidates = HolisticCurationGenerator.candidates(photos, calendar: calendar())
@@ -52,6 +85,11 @@ final class HolisticCurationGenerationTests: XCTestCase {
             candidate: metrics(photos: 99, moments: 12, joins: 0, splits: 0)).canRecommendActivation)
         XCTAssertFalse(CurationGenerationComparison.compare(active: active,
             candidate: metrics(photos: 100, moments: 12, joins: nil, splits: nil)).canRecommendActivation)
+        let fragmented = metrics(photos: 100, moments: 12, joins: 0, splits: 0,
+            fragmentedDays: 1)
+        let structuralRegression = CurationGenerationComparison.compare(active: active, candidate: fragmented)
+        XCTAssertFalse(structuralRegression.structuralQualityPassed)
+        XCTAssertFalse(structuralRegression.canRecommendActivation)
     }
 
     func testOverviewReportsSeasonalityWithoutChangingCandidates() {
@@ -126,10 +164,11 @@ final class HolisticCurationGenerationTests: XCTestCase {
     }
 
 
-    private func metrics(photos: Int, moments: Int, joins: Int?, splits: Int?) -> CurationGenerationMetrics {
+    private func metrics(photos: Int, moments: Int, joins: Int?, splits: Int?,
+                         fragmentedDays: Int = 0) -> CurationGenerationMetrics {
         CurationGenerationMetrics(photoCount: photos, momentCount: moments, highlightCount: 0,
             singletonCount: 0, smallMomentCount: 0, largeMomentCount: 0, giantMomentCount: 0,
-            fragmentedDayCount: 0, crossDayMomentCount: 0, genericTitleCount: 0,
+            fragmentedDayCount: fragmentedDays, crossDayMomentCount: 0, genericTitleCount: 0,
             falseJoinCount: joins, falseSplitCount: splits)
     }
 }

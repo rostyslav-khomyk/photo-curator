@@ -154,6 +154,7 @@ struct CurationGenerationComparison: Equatable, Sendable {
     let genericTitleDelta: Int
     let activeBenchmarkCost: Int?
     let candidateBenchmarkCost: Int?
+    let structuralQualityPassed: Bool
     let canRecommendActivation: Bool
 
     static func compare(active: CurationGenerationMetrics,
@@ -163,6 +164,10 @@ struct CurationGenerationComparison: Equatable, Sendable {
             return joins * 3 + splits
         }
         let activeCost = cost(active), candidateCost = cost(candidate)
+        let structuralQualityPassed = candidate.fragmentedDayCount <= active.fragmentedDayCount
+            && candidate.giantMomentCount <= active.giantMomentCount
+            && candidate.genericTitleCount <= active.genericTitleCount
+            && (active.highlightCount == 0 || candidate.highlightCount > 0)
         return Self(active: active, candidate: candidate,
             momentDelta: candidate.momentCount - active.momentCount,
             singletonDelta: candidate.singletonCount - active.singletonCount,
@@ -170,8 +175,10 @@ struct CurationGenerationComparison: Equatable, Sendable {
             fragmentedDayDelta: candidate.fragmentedDayCount - active.fragmentedDayCount,
             genericTitleDelta: candidate.genericTitleCount - active.genericTitleCount,
             activeBenchmarkCost: activeCost, candidateBenchmarkCost: candidateCost,
+            structuralQualityPassed: structuralQualityPassed,
             canRecommendActivation: active.photoCount == candidate.photoCount
-                && activeCost != nil && candidateCost != nil && candidateCost! <= activeCost!)
+                && activeCost != nil && candidateCost != nil && candidateCost! <= activeCost!
+                && structuralQualityPassed)
     }
 }
 
