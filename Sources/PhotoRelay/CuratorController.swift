@@ -703,6 +703,7 @@ final class CuratorController: ObservableObject {
     @Published private(set) var undatedCount = 0
     @Published private(set) var moments: [PhotoMoment] = []
     @Published private(set) var momentSummaries: [MomentSummary] = []
+    @Published private(set) var libraryOverview: [LibraryOverviewPeriod] = []
     @Published private(set) var availableMoments = 0
     @Published private(set) var overviewLoading = false
     private let momentLimit = 200
@@ -1134,6 +1135,7 @@ final class CuratorController: ObservableObject {
         do {
             momentSummaries = try await catalog.summaries(googleUploadedAssetIDs: googleUploadedAssetIDs,
                                                           reviewDecisions: reviewDecisions)
+            libraryOverview = HolisticLibraryOverview.periods(momentSummaries)
             availableMoments = momentSummaries.count
         } catch is CancellationError {
             return

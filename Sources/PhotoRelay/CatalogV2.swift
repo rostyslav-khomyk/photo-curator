@@ -42,6 +42,39 @@ struct CatalogV2Validation: Equatable, Sendable {
     let foreignKeyViolations: Int
 }
 
+enum CurationGenerationState: String, Codable, Sendable {
+    case building, candidate, active, retired, failed
+}
+
+struct CurationGenerationMetrics: Codable, Equatable, Sendable {
+    let photoCount: Int
+    let momentCount: Int
+    let highlightCount: Int
+    let singletonCount: Int
+    let smallMomentCount: Int
+    let largeMomentCount: Int
+    let giantMomentCount: Int
+    let fragmentedDayCount: Int
+    let crossDayMomentCount: Int
+    let genericTitleCount: Int
+    let falseJoinCount: Int?
+    let falseSplitCount: Int?
+}
+
+struct CurationGenerationRecord: Equatable, Sendable, Identifiable {
+    let id: String
+    let algorithmVersion: String
+    let evidenceVersion: String
+    let state: CurationGenerationState
+    let createdAt: Date
+    let completedAt: Date?
+    let sourceGenerationID: String?
+    let catalogRevision: String
+    let sourceCatalogRevision: String?
+    let metrics: CurationGenerationMetrics?
+    let failure: String?
+}
+
 enum CatalogV2Migrator {
     static let catalogName = "catalog-v2.sqlite3"
 
@@ -114,7 +147,7 @@ private final class CatalogV2Connection {
                     }
                 }
             }
-            guard sqlite3_exec(opened, "PRAGMA user_version=5;", nil, nil, nil) == SQLITE_OK else {
+            guard sqlite3_exec(opened, "PRAGMA user_version=6;", nil, nil, nil) == SQLITE_OK else {
                 throw NSError(domain: "PhotoCurator.CatalogV2", code: 1,
                     userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(opened))])
             }
@@ -129,7 +162,7 @@ private final class CatalogV2Connection {
 }
 
 actor CatalogV2Store {
-    static let schemaVersion = 5
+    static let schemaVersion = 6
     private let connection: CatalogV2Connection
     private var db: OpaquePointer? { connection.db }
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -437,6 +470,207 @@ actor CatalogV2Store {
             foreignKeyViolations: try scalar("SELECT COUNT(*) FROM pragma_foreign_key_check"))
     }
 
+    func beginCandidateGeneration(algorithmVersion: String, evidenceVersion: String,
+                                  sourceGenerationID: String? = nil, now: Date = Date(),
+                                  id: String = UUID().uuidString) throws -> CurationGenerationRecord {
+        guard !id.isEmpty, !algorithmVersion.isEmpty, !evidenceVersion.isEmpty else {
+            throw failure("Generation identity and versions are required")
+        }
+        let statement = try prepare("""
+            INSERT INTO curation_generations(
+              id,algorithm_version,evidence_version,state,created_at,source_generation_id,
+              catalog_revision,source_catalog_revision
+            ) VALUES(?,?,?,'building',?,?,?,?)
+            """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, id, -1, transient)
+        sqlite3_bind_text(statement, 2, algorithmVersion, -1, transient)
+        sqlite3_bind_text(statement, 3, evidenceVersion, -1, transient)
+        sqlite3_bind_double(statement, 4, now.timeIntervalSince1970)
+        let source: String?
+        if let sourceGenerationID { source = sourceGenerationID }
+        else { source = try activeGenerationID() }
+        bind(source, to: statement, at: 5)
+        let revision = try currentCatalogRevision()
+        sqlite3_bind_text(statement, 6, revision, -1, transient)
+        sqlite3_bind_text(statement, 7, revision, -1, transient)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }
+        return try requiredGeneration(id: id)
+    }
+
+    func snapshotActiveGeneration(algorithmVersion: String, evidenceVersion: String,
+                                  metrics: CurationGenerationMetrics, now: Date = Date(),
+                                  id: String = UUID().uuidString) throws -> CurationGenerationRecord {
+        let photoCount = try scalar("SELECT COUNT(*) FROM moment_assets")
+        let momentCount = try scalar("SELECT COUNT(*) FROM moments")
+        guard metrics.photoCount == photoCount, metrics.momentCount == momentCount else {
+            throw failure("Active generation metrics do not match the active catalog")
+        }
+        let revision = try currentCatalogRevision()
+        if let active = try activeGenerationID() {
+            try execute("BEGIN IMMEDIATE")
+            do {
+                let remove = try prepare("DELETE FROM generation_moments WHERE generation_id=?")
+                sqlite3_bind_text(remove, 1, active, -1, transient)
+                guard sqlite3_step(remove) == SQLITE_DONE else { sqlite3_finalize(remove); throw failure() }
+                sqlite3_finalize(remove)
+                try copyActiveMoments(to: active)
+                let update = try prepare("""
+                    UPDATE curation_generations SET algorithm_version=?,evidence_version=?,
+                      completed_at=?,catalog_revision=?,metrics=? WHERE id=? AND state='active'
+                    """)
+                sqlite3_bind_text(update, 1, algorithmVersion, -1, transient)
+                sqlite3_bind_text(update, 2, evidenceVersion, -1, transient)
+                sqlite3_bind_double(update, 3, now.timeIntervalSince1970)
+                sqlite3_bind_text(update, 4, revision, -1, transient)
+                bind(try JSONEncoder().encode(metrics), to: update, at: 5)
+                sqlite3_bind_text(update, 6, active, -1, transient)
+                guard sqlite3_step(update) == SQLITE_DONE, sqlite3_changes(db) == 1 else {
+                    sqlite3_finalize(update); throw failure("Active snapshot could not be refreshed")
+                }
+                sqlite3_finalize(update)
+                try execute("COMMIT")
+                return try requiredGeneration(id: active)
+            } catch {
+                try? execute("ROLLBACK")
+                throw error
+            }
+        }
+        try execute("BEGIN IMMEDIATE")
+        do {
+            let insert = try prepare("""
+                INSERT INTO curation_generations(
+                  id,algorithm_version,evidence_version,state,created_at,completed_at,
+                  catalog_revision,metrics
+                ) VALUES(?,?,?,'active',?,?,?,?)
+                """)
+            sqlite3_bind_text(insert, 1, id, -1, transient)
+            sqlite3_bind_text(insert, 2, algorithmVersion, -1, transient)
+            sqlite3_bind_text(insert, 3, evidenceVersion, -1, transient)
+            sqlite3_bind_double(insert, 4, now.timeIntervalSince1970)
+            sqlite3_bind_double(insert, 5, now.timeIntervalSince1970)
+            sqlite3_bind_text(insert, 6, revision, -1, transient)
+            bind(try JSONEncoder().encode(metrics), to: insert, at: 7)
+            guard sqlite3_step(insert) == SQLITE_DONE else { sqlite3_finalize(insert); throw failure() }
+            sqlite3_finalize(insert)
+            try copyActiveMoments(to: id)
+            let state = try prepare("INSERT INTO catalog_generation_state VALUES(1,?,NULL)")
+            sqlite3_bind_text(state, 1, id, -1, transient)
+            guard sqlite3_step(state) == SQLITE_DONE else { sqlite3_finalize(state); throw failure() }
+            sqlite3_finalize(state)
+            try execute("COMMIT")
+            return try requiredGeneration(id: id)
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    /// Candidate writes are isolated from the active read model. All validation and writes
+    /// complete synchronously inside one transaction; no PhotoKit or other async work belongs here.
+    func stageCandidateGeneration(id: String, moments: [PhotoMoment],
+                                  metrics: CurationGenerationMetrics, now: Date = Date()) throws {
+        let memberships = moments.flatMap { $0.photos.map(\.id) }
+        guard Set(moments.map(\.id)).count == moments.count,
+              moments.allSatisfy({ !$0.photos.isEmpty && Set($0.photos.map(\.id)).count == $0.photos.count }),
+              Set(memberships).count == memberships.count,
+              metrics.photoCount == moments.reduce(0, { $0 + $1.photos.count }),
+              metrics.momentCount == moments.count,
+              metrics.highlightCount == moments.reduce(0, { $0 + ($1.selection?.selected.count ?? 0) }) else {
+            throw failure("Candidate generation metrics or membership are inconsistent")
+        }
+        try execute("BEGIN IMMEDIATE")
+        do {
+            let generation = try requiredGeneration(id: id)
+            guard generation.state == .building else {
+                throw failure("Only a building generation can be staged")
+            }
+            try ensureCandidateAssetsExist(moments)
+            try writeGenerationMoments(generationID: id, moments: moments)
+            let encodedMetrics = try JSONEncoder().encode(metrics)
+            let update = try prepare("""
+                UPDATE curation_generations SET state='candidate',completed_at=?,metrics=?,failure=NULL
+                WHERE id=? AND state='building'
+                """)
+            defer { sqlite3_finalize(update) }
+            sqlite3_bind_double(update, 1, now.timeIntervalSince1970)
+            bind(encodedMetrics, to: update, at: 2)
+            sqlite3_bind_text(update, 3, id, -1, transient)
+            guard sqlite3_step(update) == SQLITE_DONE, sqlite3_changes(db) == 1 else {
+                throw failure("Candidate generation changed while it was being staged")
+            }
+            try execute("COMMIT")
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    func failGeneration(id: String, reason: String, now: Date = Date()) throws {
+        let statement = try prepare("""
+            UPDATE curation_generations SET state='failed',completed_at=?,failure=?
+            WHERE id=? AND state='building'
+            """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, now.timeIntervalSince1970)
+        sqlite3_bind_text(statement, 2, reason, -1, transient)
+        sqlite3_bind_text(statement, 3, id, -1, transient)
+        guard sqlite3_step(statement) == SQLITE_DONE, sqlite3_changes(db) == 1 else {
+            throw failure("Only a building generation can fail")
+        }
+    }
+
+    func generation(id: String) throws -> CurationGenerationRecord? {
+        try generationRecord(where: "id=?", bindValue: id)
+    }
+
+    func candidateSummaries(generationID: String) throws -> [MomentSummary] {
+        let statement = try prepare("""
+            SELECT id,revision,start,end,headline,photo_count,highlight_count,cover_asset_id,
+                   fallback_cover_2,fallback_cover_3,narrative IS NOT NULL,
+                   COALESCE(grouping_state,'') NOT IN ('','preparing')
+            FROM generation_moments WHERE generation_id=? ORDER BY start DESC,id
+            """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, generationID, -1, transient)
+        var result: [MomentSummary] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            result.append(MomentSummary(id: text(statement, 0), revision: Int(sqlite3_column_int64(statement, 1)),
+                start: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)),
+                end: Date(timeIntervalSince1970: sqlite3_column_double(statement, 3)),
+                headline: optionalText(statement, 4), photoCount: Int(sqlite3_column_int64(statement, 5)),
+                highlightCount: Int(sqlite3_column_int64(statement, 6)), coverAssetID: optionalText(statement, 7),
+                fallbackCoverAssetIDs: [optionalText(statement, 7), optionalText(statement, 8),
+                    optionalText(statement, 9)].compactMap { $0 }, customized: false, inPhotos: false,
+                inGoogle: false, narrativeReady: sqlite3_column_int(statement, 10) != 0,
+                groupingReady: sqlite3_column_int(statement, 11) != 0))
+        }
+        return result
+    }
+
+    func activateCandidateGeneration(id: String, comparison: CurationGenerationComparison,
+                                     now: Date = Date()) throws {
+        let candidate = try requiredGeneration(id: id)
+        let currentRevision = try currentCatalogRevision()
+        guard candidate.state == .candidate, candidate.metrics == comparison.candidate,
+              comparison.canRecommendActivation,
+              let activeID = try activeGenerationID(), candidate.sourceGenerationID == activeID,
+              candidate.sourceCatalogRevision == currentRevision,
+              try requiredGeneration(id: activeID).metrics == comparison.active else {
+            throw failure("Candidate generation has not passed the activation comparison")
+        }
+        try installGeneration(id: id, replacing: activeID, now: now)
+    }
+
+    func rollbackGeneration(now: Date = Date()) throws {
+        guard let activeID = try activeGenerationID(), let previousID = try previousGenerationID(),
+              try requiredGeneration(id: activeID).state == .active,
+              try requiredGeneration(id: previousID).state == .retired else {
+            throw failure("No previous curation generation is available")
+        }
+        try installGeneration(id: previousID, replacing: activeID, now: now)
+    }
+
     private static let schemaSQL = """
             CREATE TABLE IF NOT EXISTS assets(
               id TEXT PRIMARY KEY, created REAL, modified REAL, latitude REAL, longitude REAL,
@@ -478,8 +712,312 @@ actor CatalogV2Store {
               next_verification_at REAL,last_error TEXT,updated_at REAL NOT NULL);
             CREATE INDEX IF NOT EXISTS publication_operations_phase ON publication_operations(phase,next_verification_at);
             CREATE TABLE IF NOT EXISTS schema_migrations(name TEXT PRIMARY KEY,completed_at REAL NOT NULL,completed INTEGER NOT NULL);
-            PRAGMA user_version=5;
+            CREATE TABLE IF NOT EXISTS curation_generations(
+              id TEXT PRIMARY KEY,algorithm_version TEXT NOT NULL,evidence_version TEXT NOT NULL,
+              state TEXT NOT NULL CHECK(state IN ('building','candidate','active','retired','failed')),
+              created_at REAL NOT NULL,completed_at REAL,source_generation_id TEXT,
+              catalog_revision TEXT NOT NULL,source_catalog_revision TEXT,metrics BLOB,failure TEXT);
+            CREATE INDEX IF NOT EXISTS curation_generations_state ON curation_generations(state,created_at);
+            CREATE TABLE IF NOT EXISTS generation_moments(
+              generation_id TEXT NOT NULL REFERENCES curation_generations(id) ON DELETE CASCADE,
+              id TEXT NOT NULL,revision INTEGER NOT NULL,start REAL NOT NULL,end REAL NOT NULL,
+              headline TEXT,narrative BLOB,photo_count INTEGER NOT NULL,highlight_count INTEGER NOT NULL,
+              cover_asset_id TEXT REFERENCES assets(id),selection BLOB,context_source TEXT,
+              reviewed_group_title TEXT,grouping_source TEXT,grouping_reason TEXT,grouping_state TEXT,
+              grouping_kind TEXT,display_evidence BLOB,continuity_reason TEXT,
+              fallback_cover_2 TEXT,fallback_cover_3 TEXT,PRIMARY KEY(generation_id,id));
+            CREATE INDEX IF NOT EXISTS generation_moments_start
+              ON generation_moments(generation_id,start DESC,id);
+            CREATE TABLE IF NOT EXISTS generation_moment_assets(
+              generation_id TEXT NOT NULL,moment_id TEXT NOT NULL,asset_id TEXT NOT NULL REFERENCES assets(id),
+              sequence INTEGER NOT NULL,display_role TEXT NOT NULL,
+              PRIMARY KEY(generation_id,moment_id,asset_id),UNIQUE(generation_id,moment_id,sequence),
+              FOREIGN KEY(generation_id,moment_id) REFERENCES generation_moments(generation_id,id) ON DELETE CASCADE);
+            CREATE TABLE IF NOT EXISTS catalog_generation_state(
+              singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+              active_generation_id TEXT NOT NULL REFERENCES curation_generations(id),
+              previous_generation_id TEXT REFERENCES curation_generations(id));
+            PRAGMA user_version=6;
             """
+
+    private func activeGenerationID() throws -> String? {
+        let statement = try prepare("SELECT active_generation_id FROM catalog_generation_state WHERE singleton=1")
+        defer { sqlite3_finalize(statement) }
+        return sqlite3_step(statement) == SQLITE_ROW ? text(statement, 0) : nil
+    }
+
+    private func previousGenerationID() throws -> String? {
+        let statement = try prepare("SELECT previous_generation_id FROM catalog_generation_state WHERE singleton=1")
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return optionalText(statement, 0)
+    }
+
+    private func currentCatalogRevision() throws -> String {
+        let statement = try prepare("SELECT id,revision FROM moments ORDER BY id")
+        defer { sqlite3_finalize(statement) }
+        var hash = SHA256()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            hash.update(data: Data(text(statement, 0).utf8))
+            var revision = sqlite3_column_int64(statement, 1).bigEndian
+            withUnsafeBytes(of: &revision) { hash.update(bufferPointer: $0) }
+        }
+        return hash.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func copyActiveMoments(to generationID: String) throws {
+        let moments = try prepare("""
+            INSERT INTO generation_moments
+            SELECT ?,id,revision,start,end,headline,narrative,photo_count,highlight_count,cover_asset_id,
+                   selection,context_source,reviewed_group_title,grouping_source,grouping_reason,
+                   grouping_state,grouping_kind,display_evidence,continuity_reason,
+                   fallback_cover_2,fallback_cover_3 FROM moments
+            """)
+        sqlite3_bind_text(moments, 1, generationID, -1, transient)
+        guard sqlite3_step(moments) == SQLITE_DONE else { sqlite3_finalize(moments); throw failure() }
+        sqlite3_finalize(moments)
+        let members = try prepare("""
+            INSERT INTO generation_moment_assets
+            SELECT ?,moment_id,asset_id,sequence,display_role FROM moment_assets
+            """)
+        sqlite3_bind_text(members, 1, generationID, -1, transient)
+        guard sqlite3_step(members) == SQLITE_DONE else { sqlite3_finalize(members); throw failure() }
+        sqlite3_finalize(members)
+    }
+
+    private func installGeneration(id: String, replacing activeID: String, now: Date) throws {
+        let moments = try loadGenerationMoments(id: id)
+        let candidateIDs = Set(moments.map(\.id))
+        try validateDurableMomentState(candidateIDs: candidateIDs, generationID: id)
+        try execute("BEGIN IMMEDIATE")
+        do {
+            let active = try prepare("SELECT id FROM moments")
+            var stale: [String] = []
+            while sqlite3_step(active) == SQLITE_ROW {
+                let momentID = text(active, 0)
+                if !candidateIDs.contains(momentID) { stale.append(momentID) }
+            }
+            sqlite3_finalize(active)
+            let remove = try prepare("DELETE FROM moments WHERE id=?")
+            for momentID in stale {
+                sqlite3_reset(remove); sqlite3_clear_bindings(remove)
+                sqlite3_bind_text(remove, 1, momentID, -1, transient)
+                guard sqlite3_step(remove) == SQLITE_DONE else { sqlite3_finalize(remove); throw failure() }
+            }
+            sqlite3_finalize(remove)
+            try upsertMoments(moments)
+            let retire = try prepare("UPDATE curation_generations SET state='retired' WHERE id=? AND state='active'")
+            sqlite3_bind_text(retire, 1, activeID, -1, transient)
+            guard sqlite3_step(retire) == SQLITE_DONE, sqlite3_changes(db) == 1 else {
+                sqlite3_finalize(retire); throw failure("Active generation changed during activation")
+            }
+            sqlite3_finalize(retire)
+            let activate = try prepare("UPDATE curation_generations SET state='active',completed_at=? WHERE id=? AND state IN ('candidate','retired')")
+            sqlite3_bind_double(activate, 1, now.timeIntervalSince1970)
+            sqlite3_bind_text(activate, 2, id, -1, transient)
+            guard sqlite3_step(activate) == SQLITE_DONE, sqlite3_changes(db) == 1 else {
+                sqlite3_finalize(activate); throw failure("Target generation cannot be activated")
+            }
+            sqlite3_finalize(activate)
+            let state = try prepare("UPDATE catalog_generation_state SET active_generation_id=?,previous_generation_id=? WHERE singleton=1 AND active_generation_id=?")
+            sqlite3_bind_text(state, 1, id, -1, transient)
+            sqlite3_bind_text(state, 2, activeID, -1, transient)
+            sqlite3_bind_text(state, 3, activeID, -1, transient)
+            guard sqlite3_step(state) == SQLITE_DONE, sqlite3_changes(db) == 1 else {
+                sqlite3_finalize(state); throw failure("Generation state changed during activation")
+            }
+            sqlite3_finalize(state)
+            try execute("COMMIT")
+            cachedGoogleAssets.removeAll(); cachedReviewDecisions.removeAll(); cachedGoogleMoments.removeAll()
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    private func requiredGeneration(id: String) throws -> CurationGenerationRecord {
+        guard let value = try generationRecord(where: "id=?", bindValue: id) else {
+            throw failure("Curation generation does not exist")
+        }
+        return value
+    }
+
+    private func generationRecord(where clause: String, bindValue: String) throws -> CurationGenerationRecord? {
+        let statement = try prepare("""
+            SELECT id,algorithm_version,evidence_version,state,created_at,completed_at,
+                   source_generation_id,catalog_revision,source_catalog_revision,metrics,failure
+            FROM curation_generations WHERE \(clause)
+            """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, bindValue, -1, transient)
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        guard let state = CurationGenerationState(rawValue: text(statement, 3)) else {
+            throw failure("Curation generation has an invalid state")
+        }
+        let metrics = sqlite3_column_type(statement, 9) == SQLITE_NULL ? nil
+            : try JSONDecoder().decode(CurationGenerationMetrics.self, from: blob(statement, 9))
+        return CurationGenerationRecord(id: text(statement, 0), algorithmVersion: text(statement, 1),
+            evidenceVersion: text(statement, 2), state: state,
+            createdAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4)),
+            completedAt: sqlite3_column_type(statement, 5) == SQLITE_NULL ? nil
+                : Date(timeIntervalSince1970: sqlite3_column_double(statement, 5)),
+            sourceGenerationID: optionalText(statement, 6), catalogRevision: text(statement, 7),
+            sourceCatalogRevision: optionalText(statement, 8), metrics: metrics,
+            failure: optionalText(statement, 10))
+    }
+
+    private func ensureCandidateAssetsExist(_ moments: [PhotoMoment]) throws {
+        let candidateAssets = Set(moments.flatMap { $0.photos.map(\.id) })
+        let statement = try prepare("SELECT 1 FROM assets WHERE id=?")
+        defer { sqlite3_finalize(statement) }
+        for assetID in candidateAssets {
+            sqlite3_reset(statement); sqlite3_clear_bindings(statement)
+            sqlite3_bind_text(statement, 1, assetID, -1, transient)
+            guard sqlite3_step(statement) == SQLITE_ROW else {
+                throw failure("Candidate generation references an asset outside the indexed corpus")
+            }
+        }
+        let active = try prepare("SELECT asset_id FROM moment_assets")
+        defer { sqlite3_finalize(active) }
+        var activeAssets = Set<String>()
+        while sqlite3_step(active) == SQLITE_ROW { activeAssets.insert(text(active, 0)) }
+        guard candidateAssets == activeAssets else {
+            throw failure("Candidate generation does not cover the complete active Moment corpus")
+        }
+    }
+
+    private func writeGenerationMoments(generationID: String, moments: [PhotoMoment]) throws {
+        let remove = try prepare("DELETE FROM generation_moments WHERE generation_id=?")
+        sqlite3_bind_text(remove, 1, generationID, -1, transient)
+        guard sqlite3_step(remove) == SQLITE_DONE else { sqlite3_finalize(remove); throw failure() }
+        sqlite3_finalize(remove)
+        let insertMoment = try prepare("""
+            INSERT INTO generation_moments VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """)
+        let insertMember = try prepare("INSERT INTO generation_moment_assets VALUES(?,?,?,?,?)")
+        defer { sqlite3_finalize(insertMoment); sqlite3_finalize(insertMember) }
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        for moment in moments {
+            let revision = SHA256.hash(data: try encoder.encode(moment)).prefix(8)
+                .reduce(UInt64(0)) { ($0 << 8) | UInt64($1) } & UInt64(Int64.max)
+            let selected = moment.selection?.selected ?? []
+            let fallbacks = Array((selected + moment.photos.map(\.id).filter { !selected.contains($0) }).prefix(3))
+            sqlite3_reset(insertMoment); sqlite3_clear_bindings(insertMoment)
+            sqlite3_bind_text(insertMoment, 1, generationID, -1, transient)
+            sqlite3_bind_text(insertMoment, 2, moment.id, -1, transient)
+            sqlite3_bind_int64(insertMoment, 3, Int64(revision))
+            sqlite3_bind_double(insertMoment, 4, moment.start.timeIntervalSince1970)
+            sqlite3_bind_double(insertMoment, 5, moment.end.timeIntervalSince1970)
+            bind(moment.narrative?.headline, to: insertMoment, at: 6)
+            if let narrative = moment.narrative { bind(try encoder.encode(narrative), to: insertMoment, at: 7) }
+            else { sqlite3_bind_null(insertMoment, 7) }
+            sqlite3_bind_int64(insertMoment, 8, Int64(moment.photos.count))
+            sqlite3_bind_int64(insertMoment, 9, Int64(selected.count))
+            bind(selected.first ?? moment.photos.first?.id, to: insertMoment, at: 10)
+            if let selection = moment.selection { bind(try encoder.encode(selection), to: insertMoment, at: 11) }
+            else { sqlite3_bind_null(insertMoment, 11) }
+            bind(moment.contextSource, to: insertMoment, at: 12)
+            bind(moment.reviewedGroupTitle, to: insertMoment, at: 13)
+            bind(moment.groupingSource, to: insertMoment, at: 14)
+            bind(moment.groupingReason, to: insertMoment, at: 15)
+            bind(moment.groupingState?.rawValue, to: insertMoment, at: 16)
+            bind(moment.groupingKind?.rawValue, to: insertMoment, at: 17)
+            if let evidence = moment.displayEvidence { bind(try encoder.encode(evidence), to: insertMoment, at: 18) }
+            else { sqlite3_bind_null(insertMoment, 18) }
+            bind(moment.continuityReason, to: insertMoment, at: 19)
+            bind(fallbacks.count > 1 ? fallbacks[1] : nil, to: insertMoment, at: 20)
+            bind(fallbacks.count > 2 ? fallbacks[2] : nil, to: insertMoment, at: 21)
+            guard sqlite3_step(insertMoment) == SQLITE_DONE else { throw failure() }
+            let highlights = Set(selected)
+            for (sequence, photo) in moment.photos.enumerated() {
+                sqlite3_reset(insertMember); sqlite3_clear_bindings(insertMember)
+                sqlite3_bind_text(insertMember, 1, generationID, -1, transient)
+                sqlite3_bind_text(insertMember, 2, moment.id, -1, transient)
+                sqlite3_bind_text(insertMember, 3, photo.id, -1, transient)
+                sqlite3_bind_int64(insertMember, 4, Int64(sequence))
+                sqlite3_bind_text(insertMember, 5, highlights.contains(photo.id) ? "highlight" : "member", -1, transient)
+                guard sqlite3_step(insertMember) == SQLITE_DONE else { throw failure() }
+            }
+        }
+    }
+
+    private func loadGenerationMoments(id: String) throws -> [PhotoMoment] {
+        let statement = try prepare("""
+            SELECT id,start,end,narrative,selection,context_source,reviewed_group_title,
+                   grouping_source,grouping_reason,grouping_state,grouping_kind,display_evidence,
+                   continuity_reason FROM generation_moments WHERE generation_id=? ORDER BY start DESC,id
+            """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, id, -1, transient)
+        let photos = try prepare("""
+            SELECT a.payload FROM generation_moment_assets gma JOIN assets a ON a.id=gma.asset_id
+            WHERE gma.generation_id=? AND gma.moment_id=? ORDER BY gma.sequence
+            """)
+        defer { sqlite3_finalize(photos) }
+        let decoder = JSONDecoder()
+        var result: [PhotoMoment] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let momentID = text(statement, 0)
+            sqlite3_reset(photos); sqlite3_clear_bindings(photos)
+            sqlite3_bind_text(photos, 1, id, -1, transient)
+            sqlite3_bind_text(photos, 2, momentID, -1, transient)
+            var members: [IndexedPhoto] = []
+            while sqlite3_step(photos) == SQLITE_ROW {
+                members.append(try decoder.decode(IndexedPhoto.self, from: blob(photos, 0)))
+            }
+            let narrative: MomentNarrative? = sqlite3_column_type(statement, 3) == SQLITE_NULL ? nil
+                : try decoder.decode(MomentNarrative.self, from: blob(statement, 3))
+            let selection: MomentSelection? = sqlite3_column_type(statement, 4) == SQLITE_NULL ? nil
+                : try decoder.decode(MomentSelection.self, from: blob(statement, 4))
+            let evidence: [String: PhotoDisplayEvidence]? = sqlite3_column_type(statement, 11) == SQLITE_NULL ? nil
+                : try decoder.decode([String: PhotoDisplayEvidence].self, from: blob(statement, 11))
+            result.append(PhotoMoment(id: momentID,
+                start: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
+                end: Date(timeIntervalSince1970: sqlite3_column_double(statement, 2)), photos: members,
+                selection: selection, narrative: narrative, contextSource: optionalText(statement, 5),
+                reviewedGroupTitle: optionalText(statement, 6), groupingSource: optionalText(statement, 7),
+                groupingReason: optionalText(statement, 8),
+                groupingState: optionalText(statement, 9).flatMap(MomentGroupingState.init(rawValue:)),
+                groupingKind: optionalText(statement, 10).flatMap(AutomaticMomentSegmentKind.init(rawValue:)),
+                displayEvidence: evidence, continuityReason: optionalText(statement, 12)))
+        }
+        return result
+    }
+
+    private func validateDurableMomentState(candidateIDs: Set<String>, generationID: String) throws {
+        let durable = try prepare("""
+            SELECT moment_id FROM moment_edits
+            WHERE title IS NOT NULL OR description IS NOT NULL OR protected_members IS NOT NULL
+            UNION SELECT moment_id FROM publications
+            UNION SELECT moment_id FROM publication_operations
+            """)
+        defer { sqlite3_finalize(durable) }
+        while sqlite3_step(durable) == SQLITE_ROW {
+            guard candidateIDs.contains(text(durable, 0)) else {
+                throw failure("Candidate generation would orphan user work or publication history")
+            }
+        }
+        let anchors = try prepare("SELECT moment_id,protected_members FROM moment_edits WHERE protected_members IS NOT NULL")
+        defer { sqlite3_finalize(anchors) }
+        let membership = try prepare("""
+            SELECT 1 FROM generation_moment_assets
+            WHERE generation_id=? AND moment_id=? AND asset_id=?
+            """)
+        defer { sqlite3_finalize(membership) }
+        while sqlite3_step(anchors) == SQLITE_ROW {
+            let momentID = text(anchors, 0)
+            let members = try JSONDecoder().decode([String].self, from: blob(anchors, 1))
+            for assetID in members {
+                sqlite3_reset(membership); sqlite3_clear_bindings(membership)
+                sqlite3_bind_text(membership, 1, generationID, -1, transient)
+                sqlite3_bind_text(membership, 2, momentID, -1, transient)
+                sqlite3_bind_text(membership, 3, assetID, -1, transient)
+                guard sqlite3_step(membership) == SQLITE_ROW else {
+                    throw failure("Candidate generation would move a protected asset")
+                }
+            }
+        }
+    }
 
     private func importAssets() throws {
         try execute("""

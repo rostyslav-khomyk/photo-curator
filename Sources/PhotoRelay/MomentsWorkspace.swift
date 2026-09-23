@@ -11,6 +11,7 @@ struct CuratorView: View {
     @State private var selection = MomentMultiSelection()
     @State private var mergeDraft: MomentMergeDraft?
     @State private var showWorkspaceHelp = false
+    @State private var showLibraryOverview = false
     @State private var googleExportMoments: [PhotoMoment] = []
     @State private var showingGoogleExport = false
     @State private var activeMomentID: String?
@@ -202,6 +203,16 @@ struct CuratorView: View {
         .background(MomentGridKeyHandler { event in handleGridKey(event) })
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    showLibraryOverview = true
+                } label: {
+                    Label("Library Overview", systemImage: "chart.bar.xaxis")
+                }
+                .help("See capture density across your library")
+                .popover(isPresented: $showLibraryOverview) {
+                    LibraryOverviewView(periods: curator.libraryOverview)
+                }
+
                 Menu {
                     Toggle("Hide Moments Already in Photos", isOn: $hidePublishedMoments)
                     Toggle("Hide Moments Uploaded to Google", isOn: $hideGoogleUploadedMoments)
@@ -360,6 +371,60 @@ struct CuratorView: View {
     private func summaryTitle(_ moment: MomentSummary) -> String {
         decisions.titles[moment.id] ?? moment.headline
             ?? moment.start.formatted(.dateTime.month(.abbreviated).day().year())
+    }
+}
+
+private struct LibraryOverviewView: View {
+    let periods: [LibraryOverviewPeriod]
+
+    private var maximum: Int { max(1, periods.map(\.photoCount).max() ?? 1) }
+    private var totals: (photos: Int, moments: Int, highlights: Int) {
+        periods.reduce((0, 0, 0)) { ($0.0 + $1.photoCount, $0.1 + $1.momentCount, $0.2 + $1.highlightCount) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Library Overview").font(.title2.bold())
+            Text("Capture density across your library. Quiet months are simply months with fewer photographs; they are not less important.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            if periods.isEmpty {
+                VStack(spacing: 10) {
+                    Image(systemName: "chart.bar.xaxis").font(.largeTitle).foregroundStyle(.secondary)
+                    Text("Overview is preparing").font(.headline)
+                    Text("Monthly totals will appear after Moment summaries load.")
+                        .font(.callout).foregroundStyle(.secondary)
+                }.frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                let totals = totals
+                Text("\(totals.photos.formatted()) photos · \(totals.moments.formatted()) Moments · \(totals.highlights.formatted()) highlights")
+                    .font(.headline).monospacedDigit()
+                ScrollView {
+                    LazyVStack(spacing: 7) {
+                        ForEach(periods.reversed()) { period in
+                            HStack(spacing: 10) {
+                                Text(month(period)).frame(width: 82, alignment: .leading)
+                                GeometryReader { geometry in
+                                    RoundedRectangle(cornerRadius: 3)
+                                        .fill(Color.accentColor.opacity(0.7))
+                                        .frame(width: max(2, geometry.size.width
+                                            * CGFloat(period.photoCount) / CGFloat(maximum)))
+                                }.frame(height: 9)
+                                Text(period.photoCount.formatted())
+                                    .font(.caption.monospacedDigit()).frame(width: 52, alignment: .trailing)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(20).frame(width: 480, height: 520)
+    }
+
+    private func month(_ period: LibraryOverviewPeriod) -> String {
+        var components = DateComponents()
+        components.year = period.year; components.month = period.month; components.day = 1
+        return Calendar.current.date(from: components)?.formatted(.dateTime.month(.abbreviated).year())
+            ?? period.id
     }
 }
 

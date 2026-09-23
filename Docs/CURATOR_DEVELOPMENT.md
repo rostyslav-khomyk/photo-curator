@@ -1,5 +1,15 @@
 # Background Curator: Development Record
 
+## Phase 6 generation foundation (2026-09-23)
+
+Catalog v2 schema version 6 now supports isolated, complete-corpus curation generations with
+false-join-weighted comparison, atomic activation and rollback, protected identity validation, and
+stale-source rejection. A candidate cannot change the active workspace until its reviewed benchmark
+and corpus coverage pass. Adaptive logical-day boundaries, optional place-grounded Stories,
+hierarchical highlights that do not depend on Favorites, and a compact Library Overview are covered
+by focused tests. See `Docs/PHASE6_HOLISTIC_CURATION.md`. The owner-corpus run and private benchmark
+remain intentionally opt-in; no live catalog or Photos content was changed.
+
 ## Independent architecture review incorporated (2026-09-21)
 
 - Made SQLite ownership explicit: write transactions are synchronous, nonescaping, and never cross

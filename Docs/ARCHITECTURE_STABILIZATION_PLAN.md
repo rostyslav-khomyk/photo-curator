@@ -645,6 +645,12 @@ packaged owner-library file-count and Instruments qualification remain open.
 
 ### Phase 6: Holistic curation generations, 5-8 days
 
+The generation schema, isolated candidate read model, adaptive boundary scaffold, identity safety,
+atomic activation/rollback, aggregate overview, conservative Stories, and hierarchical highlight
+allocation are implemented and tracked in
+[`PHASE6_HOLISTIC_CURATION.md`](PHASE6_HOLISTIC_CURATION.md). Owner-corpus generation, the frozen
+private benchmark, performance qualification, and shipping candidate workflow remain gated.
+
 - Add adaptive logical-day/scene boundaries, optional Story parents, hierarchical highlight
   allocation, and grounded titles as a candidate generation, reusing the current evidence cache.
 - Add the aggregate Library Overview and active-versus-candidate comparison.
