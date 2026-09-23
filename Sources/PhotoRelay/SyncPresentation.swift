@@ -1,6 +1,6 @@
 import Foundation
 
-struct GoogleAlbum: Decodable, Identifiable {
+struct GoogleAlbum: Decodable, Identifiable, Sendable {
     let id: String
     let title: String
     let mediaItemsCount: String?
