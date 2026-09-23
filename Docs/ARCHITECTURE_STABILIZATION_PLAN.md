@@ -1,6 +1,6 @@
 # Photo Curator Architecture Stabilization Plan
 
-Status: accepted; Phase 2 compact read model implemented, interactive qualification pending
+Status: accepted; Phases 1-8 implemented, Phase 9 qualification in progress
 Prepared: 2026-09-21
 Baseline: `fdca2bae` on `codex/photo-curator-full-history-snapshot`
 
@@ -695,6 +695,11 @@ phase; qualification against a real Photos test library remains deliberately man
 - Exit gate: interrupted uploads reconcile and no helper remains running without an active operation.
 
 ### Phase 9: Closed-alpha qualification, 1-2 weeks
+
+Automated preflight, fixed bundle identity, the 250,000-photo fixture, and a fail-closed notarized-DMG
+release command are implemented and tracked in
+[`PHASE9_CLOSED_ALPHA.md`](PHASE9_CLOSED_ALPHA.md). This Mac does not yet have a Developer ID identity
+or notarization profile, and the three real-library multi-day soak runs remain open.
 
 - Run multi-day soak tests on at least three real libraries and the 250k synthetic fixture.
 - Produce a Developer ID-signed, hardened-runtime, notarized build with stable bundle identity and entitlements.

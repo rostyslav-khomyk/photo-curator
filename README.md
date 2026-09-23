@@ -34,10 +34,19 @@ Run the warning gate and deterministic 100,000-photo performance baseline with:
 ./Scripts/phase0_baseline.sh
 ```
 
+Run the closed-alpha preflight, including the complete suite and 250,000-photo fixture, with:
+
+```bash
+./Scripts/qualify_alpha.sh preflight
+```
+
 Settings includes a privacy-safe **Export Diagnostics** action for alpha support. It exports only
 aggregate versions, counts, sizes, and whitelisted activity counters.
 
-Ad-hoc signing can cause macOS to request Photos permission again after a rebuild. A stable Developer ID signature is required to preserve the installed application's identity across distributed builds.
+Ad-hoc signing can cause macOS to request Photos permission again after a rebuild. Distributed builds
+use the stable `com.rostyslavkhomyk.PhotoCurator` bundle identifier and must pass the Developer ID,
+hardened-runtime, and notarization gate documented in
+[PHASE9_CLOSED_ALPHA.md](Docs/PHASE9_CLOSED_ALPHA.md).
 
 ## Local Data
 

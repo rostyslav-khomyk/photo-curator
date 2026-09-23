@@ -9,7 +9,7 @@
     <key>CFBundleExecutable</key>
     <string>PhotoRelay</string>
     <key>CFBundleIdentifier</key>
-    <string>local.icloudpd.photorelay</string>
+    <string>com.rostyslavkhomyk.PhotoCurator</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

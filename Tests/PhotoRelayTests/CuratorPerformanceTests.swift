@@ -4,10 +4,13 @@ import XCTest
 final class CuratorPerformanceTests: XCTestCase {
     func testFullLibraryGroupingBaseline() throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["PHOTO_CURATOR_PERFORMANCE"] == "1")
+        let photoCount = ProcessInfo.processInfo.environment["PHOTO_CURATOR_PERFORMANCE_COUNT"]
+            .flatMap(Int.init) ?? 100_000
+        XCTAssertGreaterThan(photoCount, 0)
         let day: TimeInterval = 86_400
         var photos: [IndexedPhoto] = []
-        photos.reserveCapacity(100_000)
-        for index in 0..<100_000 {
+        photos.reserveCapacity(photoCount)
+        for index in 0..<photoCount {
             let captureTime = 978_307_200 + Double(index / 35) * day + Double(index % 35) * 45
             let hasLocation = index % 7 != 0
             let latitude = hasLocation ? 52.0 + Double(index % 31) / 10_000 : nil
@@ -23,7 +26,7 @@ final class CuratorPerformanceTests: XCTestCase {
 
         measure(metrics: [XCTClockMetric(), XCTMemoryMetric()], options: options) {
             let moments = MomentGrouping.group(photos, calendar: calendar)
-            XCTAssertGreaterThan(moments.count, 2_000)
+            XCTAssertGreaterThan(moments.count, photoCount / 50)
             XCTAssertEqual(moments.reduce(0) { $0 + $1.photos.count }, photos.count)
         }
     }
