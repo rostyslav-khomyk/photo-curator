@@ -14,7 +14,7 @@ private actor GoogleTokenFake: GoogleAccessTokenProviding {
     }
 }
 
-private final class GoogleURLProtocol: URLProtocol {
+final class GoogleURLProtocol: URLProtocol {
     static var handler: ((URLRequest) throws -> (Int, Data))?
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
