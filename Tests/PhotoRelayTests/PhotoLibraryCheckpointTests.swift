@@ -24,6 +24,24 @@ final class PhotoLibraryCheckpointTests: XCTestCase {
             now: now.addingTimeInterval(7 * 24 * 60 * 60)))
     }
 
+    func testReplayableTokenDefersLibraryDifferencesToPersistentHistory() throws {
+        let now = Date()
+        let token = try XCTUnwrap(PhotoLibraryChangeToken.capture())
+        let checkpoint = PhotoLibraryCheckpoint(
+            fingerprint: fingerprint(count: 1), fullyVerifiedAt: now, persistentToken: token)
+
+        XCTAssertFalse(checkpoint.requiresFullReconciliation(
+            current: fingerprint(count: 200_000, suffix: "changed"), now: now))
+    }
+
+    func testUnreadableTokenRequiresFullReconciliation() {
+        let now = Date()
+        let checkpoint = PhotoLibraryCheckpoint(
+            fingerprint: fingerprint(), fullyVerifiedAt: now, persistentToken: Data("bad".utf8))
+
+        XCTAssertTrue(checkpoint.requiresFullReconciliation(current: fingerprint(), now: now))
+    }
+
     func testIncrementalFingerprintUpdatePreservesFullVerificationDate() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

@@ -2007,3 +2007,22 @@ Photos access, network research or private-photo inspection in this subchunk.
   build with complete strict-concurrency checking emitted zero warnings. No catalog wipe or Photos
   mutation occurred. Packaged-app scroll/RSS qualification and oldest-supported-Mac measurements
   remain open.
+
+## Architecture stabilization Phase 3 scheduler and PhotoKit owner (2026-09-23)
+
+- Replaced the two-second controller timer with an event-driven scheduler that coalesces startup,
+  user, PhotoKit, completion, policy, verification, and retry events and sleeps until exact deadlines.
+- Added one actor-owned PhotoKit observer with persistent change-history replay, bounded 100-asset
+  ingestion, and operation-ID suppression for Curator-owned Favorite and deletion callbacks. Valid
+  history now handles offline library differences before any full verification is considered.
+- Full verification persists its generation and cursor in SQLite after every bounded batch. Relaunch
+  resumes that cursor, incremental edits are protected from stale-generation cleanup, and progress is
+  cleared only after database finalization and the PhotoKit checkpoint both commit.
+- Removed the arbitrary three-second publication-change ignore window. Policy notifications and work
+  completion now wake scheduling directly; visual analysis remains utility-priority while automatic
+  Photos publication retains its external-side-effect idle gate.
+- Focused verification: 24 scheduler, checkpoint, and curator-store tests passed with zero failures.
+  The full native suite passed 220 tests with 12 opt-in skips and zero failures; the strict production
+  build passed complete concurrency checking with zero warnings. Owner-library sleep/relaunch
+  qualification remains open before the Phase 3 exit gate is closed. No catalog wipe, Photos
+  mutation, deployment, or indexing restart occurred.

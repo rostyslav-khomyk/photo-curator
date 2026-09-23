@@ -19,7 +19,7 @@ final class CuratorStore {
             let version = try prepare("PRAGMA user_version")
             defer { sqlite3_finalize(version) }
             guard sqlite3_step(version) == SQLITE_ROW else { throw failure() }
-            guard sqlite3_column_int(version, 0) <= 2 else {
+            guard sqlite3_column_int(version, 0) <= 3 else {
                 throw NSError(domain: "PhotoRelay.CuratorStore", code: 2, userInfo: [NSLocalizedDescriptionKey:
                     "This curator index was created by a newer Photo Relay. Update the app to continue; your index was kept."])
             }
@@ -35,7 +35,10 @@ final class CuratorStore {
                         priority INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending',
                         token TEXT, lease REAL, result BLOB);
                     CREATE INDEX IF NOT EXISTS analysis_pending ON analysis_jobs(state, priority);
-                    PRAGMA user_version=2;
+                    CREATE TABLE IF NOT EXISTS verification_progress (
+                        kind TEXT PRIMARY KEY, scope TEXT NOT NULL, generation TEXT NOT NULL,
+                        cursor INTEGER NOT NULL, total INTEGER NOT NULL, updated REAL NOT NULL);
+                    PRAGMA user_version=3;
                     """)
                 try execute("COMMIT")
             } catch {
@@ -75,11 +78,56 @@ final class CuratorStore {
     }
 
     func finishFullScan(generation: String) throws {
-        let statement = try prepare("DELETE FROM photos WHERE generation != ?")
+        try execute("BEGIN IMMEDIATE")
+        do {
+            let statement = try prepare("DELETE FROM photos WHERE generation != ?")
+            defer { sqlite3_finalize(statement) }
+            sqlite3_bind_text(statement, 1, generation, -1, transient)
+            guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }
+            try execute("DELETE FROM analysis_jobs WHERE asset NOT IN (SELECT id FROM photos)")
+            try execute("COMMIT")
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
+    func verificationProgress(kind: String = "full") throws -> VerificationProgress? {
+        let statement = try prepare("SELECT scope,generation,cursor,total,updated FROM verification_progress WHERE kind=?")
         defer { sqlite3_finalize(statement) }
-        sqlite3_bind_text(statement, 1, generation, -1, transient)
+        sqlite3_bind_text(statement, 1, kind, -1, transient)
+        let status = sqlite3_step(statement)
+        if status == SQLITE_DONE { return nil }
+        guard status == SQLITE_ROW else { throw failure() }
+        return VerificationProgress(
+            scope: String(cString: sqlite3_column_text(statement, 0)),
+            generation: String(cString: sqlite3_column_text(statement, 1)),
+            cursor: Int(sqlite3_column_int64(statement, 2)),
+            total: Int(sqlite3_column_int64(statement, 3)),
+            updated: Date(timeIntervalSince1970: sqlite3_column_double(statement, 4)))
+    }
+
+    func saveVerificationProgress(_ progress: VerificationProgress, kind: String = "full") throws {
+        let statement = try prepare("""
+            INSERT INTO verification_progress(kind,scope,generation,cursor,total,updated) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(kind) DO UPDATE SET scope=excluded.scope,generation=excluded.generation,
+                cursor=excluded.cursor,total=excluded.total,updated=excluded.updated
+            """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, kind, -1, transient)
+        sqlite3_bind_text(statement, 2, progress.scope, -1, transient)
+        sqlite3_bind_text(statement, 3, progress.generation, -1, transient)
+        sqlite3_bind_int64(statement, 4, Int64(progress.cursor))
+        sqlite3_bind_int64(statement, 5, Int64(progress.total))
+        sqlite3_bind_double(statement, 6, progress.updated.timeIntervalSince1970)
         guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }
-        try execute("DELETE FROM analysis_jobs WHERE asset NOT IN (SELECT id FROM photos)")
+    }
+
+    func clearVerificationProgress(kind: String = "full") throws {
+        let statement = try prepare("DELETE FROM verification_progress WHERE kind=?")
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, kind, -1, transient)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }
     }
 
     func deletePhotos(ids: Set<String>) throws {
@@ -105,17 +153,50 @@ final class CuratorStore {
     /// Updates public PhotoKit metadata without changing the active full-scan generation.
     /// Returns false for PhotoKit notifications that only changed local resource availability.
     @discardableResult
-    func updatePhoto(_ photo: IndexedPhoto) throws -> Bool {
-        let statement = try prepare("UPDATE photos SET created=?,payload=? WHERE id=? AND payload != ?")
+    func updatePhoto(_ photo: IndexedPhoto, generation: String? = nil) throws -> Bool {
+        let statement = try prepare("UPDATE photos SET created=?,payload=?" +
+            (generation == nil ? "" : ",generation=?") + " WHERE id=? AND payload != ?")
         defer { sqlite3_finalize(statement) }
         if let date = photo.created { sqlite3_bind_double(statement, 1, date.timeIntervalSince1970) }
         else { sqlite3_bind_null(statement, 1) }
         let data = try JSONEncoder().encode(photo)
         _ = data.withUnsafeBytes { sqlite3_bind_blob(statement, 2, $0.baseAddress, Int32(data.count), transient) }
-        sqlite3_bind_text(statement, 3, photo.id, -1, transient)
-        _ = data.withUnsafeBytes { sqlite3_bind_blob(statement, 4, $0.baseAddress, Int32(data.count), transient) }
+        var offset: Int32 = 3
+        if let generation {
+            sqlite3_bind_text(statement, offset, generation, -1, transient)
+            offset += 1
+        }
+        sqlite3_bind_text(statement, offset, photo.id, -1, transient)
+        _ = data.withUnsafeBytes { sqlite3_bind_blob(statement, offset + 1, $0.baseAddress, Int32(data.count), transient) }
         guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }
-        return sqlite3_changes(db) == 1
+        if sqlite3_changes(db) == 1 { return true }
+
+        let exists = try prepare("SELECT 1 FROM photos WHERE id=?")
+        sqlite3_bind_text(exists, 1, photo.id, -1, transient)
+        let existsStatus = sqlite3_step(exists)
+        sqlite3_finalize(exists)
+        guard existsStatus == SQLITE_ROW || existsStatus == SQLITE_DONE else { throw failure() }
+        if existsStatus == SQLITE_ROW {
+            if let generation {
+                let markSeen = try prepare("UPDATE photos SET generation=? WHERE id=? AND generation != ?")
+                defer { sqlite3_finalize(markSeen) }
+                sqlite3_bind_text(markSeen, 1, generation, -1, transient)
+                sqlite3_bind_text(markSeen, 2, photo.id, -1, transient)
+                sqlite3_bind_text(markSeen, 3, generation, -1, transient)
+                guard sqlite3_step(markSeen) == SQLITE_DONE else { throw failure() }
+            }
+            return false
+        }
+
+        let inserted = try prepare("INSERT INTO photos(id,created,payload,generation) VALUES(?,?,?,?)")
+        defer { sqlite3_finalize(inserted) }
+        sqlite3_bind_text(inserted, 1, photo.id, -1, transient)
+        if let date = photo.created { sqlite3_bind_double(inserted, 2, date.timeIntervalSince1970) }
+        else { sqlite3_bind_null(inserted, 2) }
+        _ = data.withUnsafeBytes { sqlite3_bind_blob(inserted, 3, $0.baseAddress, Int32(data.count), transient) }
+        sqlite3_bind_text(inserted, 4, generation ?? "incremental", -1, transient)
+        guard sqlite3_step(inserted) == SQLITE_DONE else { throw failure() }
+        return true
     }
 
     func maintain() throws {
@@ -252,6 +333,15 @@ final class CuratorStore {
         guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }
     }
 
+    func nextAnalysisEligibilityDate(after now: Date = Date()) throws -> Date? {
+        let statement = try prepare("SELECT MIN(lease) FROM analysis_jobs WHERE state='running' AND lease > ?")
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, now.timeIntervalSince1970)
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw failure() }
+        guard sqlite3_column_type(statement, 0) != SQLITE_NULL else { return nil }
+        return Date(timeIntervalSince1970: sqlite3_column_double(statement, 0))
+    }
+
     private func prepare(_ sql: String) throws -> OpaquePointer {
         var statement: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK, let statement else { throw failure() }
@@ -273,4 +363,12 @@ struct AnalysisJob: Equatable {
     let revision: String
     let analyzer: String
     let token: String
+}
+
+struct VerificationProgress: Equatable {
+    let scope: String
+    let generation: String
+    let cursor: Int
+    let total: Int
+    let updated: Date
 }

@@ -611,6 +611,11 @@ Instruments and oldest-supported-Mac checks remain open.
 
 ### Phase 3: Explicit scheduler and PhotoKit owner, 5-8 days
 
+Implementation and automated coverage are tracked in
+[`PHASE3_SCHEDULER_AND_PHOTOKIT.md`](PHASE3_SCHEDULER_AND_PHOTOKIT.md). Automated scheduler,
+persistent-history, and resumable-verification gates pass; live owner-library sleep/relaunch and
+packaged-app responsiveness qualification remain open.
+
 - Replace timer/boolean scheduling with durable jobs and event-driven wakeup.
 - Centralize PhotoKit observation, incremental ingestion, full verification, and expected self-mutations.
 - Exit gate: deletion/favorite/edit/sleep/relaunch tests do not restart completed work or stall UI.

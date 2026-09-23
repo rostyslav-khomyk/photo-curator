@@ -25,6 +25,8 @@ actor CuratorWorker {
     private var cursor = 0
     private var generation = ""
     private var fullScan = false
+    private var scanOverrides = Set<String>()
+    private var scanRemovals = Set<String>()
     private var textCandidates: [IndexedPhoto] = []
     private var textCursor = 0
     private var textScope: DateInterval?
@@ -58,15 +60,24 @@ actor CuratorWorker {
         guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else {
             return indexedCount == 0
         }
+        if (try? database().verificationProgress()) != nil { return true }
         let current = PhotoLibraryFingerprint.current()
         guard let checkpoint = checkpointStore.load() else {
             // One-time migration for catalogs completed before checkpoints existed.
             // A later age-based verification still checks for same-count offline edits.
             guard indexedCount > 0, indexedCount == current.count else { return true }
-            try? checkpointStore.save(PhotoLibraryCheckpoint(fingerprint: current, fullyVerifiedAt: now))
+            try? checkpointStore.save(PhotoLibraryCheckpoint(
+                fingerprint: current, fullyVerifiedAt: now,
+                persistentToken: PhotoLibraryChangeToken.capture()))
             return false
         }
-        return checkpoint.requiresFullReconciliation(current: current, now: now)
+        let required = checkpoint.requiresFullReconciliation(current: current, now: now)
+        if !required, checkpoint.persistentToken == nil {
+            try? checkpointStore.save(PhotoLibraryCheckpoint(
+                fingerprint: checkpoint.fingerprint, fullyVerifiedAt: checkpoint.fullyVerifiedAt,
+                persistentToken: PhotoLibraryChangeToken.capture()))
+        }
+        return required
     }
 
     func refreshCheckpointFingerprint() throws {
@@ -74,11 +85,31 @@ actor CuratorWorker {
         try checkpointStore.updateFingerprint(.current())
     }
 
+    func checkpointChangeToken() -> Data? { checkpointStore.load()?.persistentToken }
+
+    func commitLibraryChangeToken(_ token: Data) throws {
+        let previous = checkpointStore.load()
+        try checkpointStore.save(PhotoLibraryCheckpoint(
+            fingerprint: .current(),
+            fullyVerifiedAt: previous?.fullyVerifiedAt ?? .distantPast,
+            persistentToken: token))
+    }
+
+    func advanceVerificationScope(to token: Data) throws {
+        let db = try database()
+        guard let progress = try db.verificationProgress() else { return }
+        try db.saveVerificationProgress(VerificationProgress(
+            scope: "token:\(token.base64EncodedString())",
+            generation: progress.generation, cursor: progress.cursor,
+            total: progress.total, updated: Date()))
+    }
+
     @discardableResult
     func reconcileEditedAsset(_ assetID: String) throws -> Bool {
         let result = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil)
         guard let asset = result.firstObject, !asset.isHidden else {
             try database().deletePhotos(ids: [assetID])
+            if fullScan { scanRemovals.insert(assetID) }
             return true
         }
         let photo = IndexedPhoto(id: asset.localIdentifier, created: asset.creationDate,
@@ -86,13 +117,36 @@ actor CuratorWorker {
             longitude: asset.location?.coordinate.longitude, favorite: asset.isFavorite,
             width: asset.pixelWidth, height: asset.pixelHeight,
             similarityCategory: asset.mediaSubtypes.contains(.photoScreenshot) ? .screenshots : .photos)
-        return try database().updatePhoto(photo)
+        let db = try database()
+        if fullScan { scanOverrides.insert(assetID) }
+        let changed = try db.updatePhoto(photo, generation: fullScan ? generation : nil)
+        if changed {
+            try db.enqueueAnalysis(asset: photo.id, revision: photo.analysisRevision,
+                                   analyzer: CuratorVisionAnalyzer.version)
+        }
+        return changed
     }
 
-    func removeDeletedAsset(_ assetID: String) throws { try database().deletePhotos(ids: [assetID]) }
+    func removeDeletedAsset(_ assetID: String) throws {
+        if fullScan { scanRemovals.insert(assetID) }
+        try database().deletePhotos(ids: [assetID])
+    }
     func maintainStorage() throws { try database().maintain() }
 
     func indexedPhotoCount() throws -> Int { try database().counts().total }
+
+    func nextAnalysisEligibilityDate() throws -> Date? { try database().nextAnalysisEligibilityDate() }
+
+    func nextVerificationDate() -> Date? {
+        checkpointStore.load()?.fullyVerifiedAt.addingTimeInterval(7 * 24 * 60 * 60)
+    }
+
+    func invalidateFullVerification() throws {
+        fetch = nil
+        cursor = 0
+        fullScan = false
+        try database().clearVerificationProgress()
+    }
 
     func prioritizeAnalysis(_ photos: [IndexedPhoto]) throws {
         let db = try database()
@@ -359,6 +413,8 @@ actor CuratorWorker {
             metadataGeneration += 1
             textScanStarted = false
             captionGroups = nil
+            scanOverrides.removeAll(keepingCapacity: true)
+            scanRemovals.removeAll(keepingCapacity: true)
             let options = PHFetchOptions()
             var predicates = [NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)]
             if let range {
@@ -368,14 +424,30 @@ actor CuratorWorker {
             options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
             options.includeHiddenAssets = false
             fetch = PHAsset.fetchAssets(with: options)
+            fullScan = range == nil
             cursor = 0
             generation = UUID().uuidString
-            fullScan = range == nil
+            if fullScan {
+                let scope = verificationScope(fetch: fetch!)
+                let db = try database()
+                if let saved = try db.verificationProgress(),
+                   verificationScopeMatches(saved.scope, fetch: fetch!),
+                   saved.total == fetch!.count, saved.cursor <= saved.total {
+                    cursor = saved.cursor
+                    generation = saved.generation
+                } else {
+                    try db.saveVerificationProgress(VerificationProgress(
+                        scope: scope, generation: generation, cursor: 0,
+                        total: fetch!.count, updated: Date()))
+                }
+            }
         }
         guard let fetch else { return CuratorBatch(scanned: 0, total: 0, finished: true) }
         let end = min(cursor + max(25, min(limit, 2_000)), fetch.count)
-        let photos = (cursor..<end).map { index -> IndexedPhoto in
+        let photos = (cursor..<end).compactMap { index -> IndexedPhoto? in
             let asset = fetch.object(at: index)
+            guard !scanOverrides.contains(asset.localIdentifier),
+                  !scanRemovals.contains(asset.localIdentifier) else { return nil }
             return IndexedPhoto(id: asset.localIdentifier, created: asset.creationDate,
                                 modified: asset.modificationDate, latitude: asset.location?.coordinate.latitude,
                                 longitude: asset.location?.coordinate.longitude, favorite: asset.isFavorite,
@@ -390,13 +462,43 @@ actor CuratorWorker {
             try db.enqueueAnalysis(asset: photo.id, revision: photo.analysisRevision, analyzer: CuratorVisionAnalyzer.version)
         }
         cursor = end
+        if fullScan {
+            try db.saveVerificationProgress(VerificationProgress(
+                scope: verificationScope(fetch: fetch), generation: generation,
+                cursor: cursor, total: fetch.count, updated: Date()))
+        }
         let done = cursor == fetch.count
         // A suddenly empty/unavailable library must not erase a previous index.
         if done && fullScan && fetch.count > 0 {
             try db.finishFullScan(generation: generation)
-            try checkpointStore.save(PhotoLibraryCheckpoint(fingerprint: .current(), fullyVerifiedAt: Date()))
+            try checkpointStore.save(PhotoLibraryCheckpoint(
+                fingerprint: .current(), fullyVerifiedAt: Date(),
+                persistentToken: PhotoLibraryChangeToken.capture()))
+            try db.clearVerificationProgress()
         }
         return CuratorBatch(scanned: cursor, total: fetch.count, finished: done)
+    }
+
+    private func verificationScope(fetch: PHFetchResult<PHAsset>) -> String {
+        if let token = PhotoLibraryChangeToken.capture() {
+            return "token:\(token.base64EncodedString())"
+        }
+        var digest = SHA256()
+        digest.update(data: Data("count:\(fetch.count)".utf8))
+        let sampleCount = min(12, fetch.count)
+        for index in 0..<sampleCount {
+            let asset = fetch.object(at: index)
+            digest.update(data: Data("|\(asset.localIdentifier)|\(asset.modificationDate?.timeIntervalSince1970 ?? -1)|\(asset.pixelWidth)x\(asset.pixelHeight)".utf8))
+        }
+        return digest.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func verificationScopeMatches(_ saved: String, fetch: PHFetchResult<PHAsset>) -> Bool {
+        if saved.hasPrefix("token:"),
+           let data = Data(base64Encoded: String(saved.dropFirst("token:".count))) {
+            return PhotoLibraryChangeToken.matchesCurrent(data)
+        }
+        return saved == verificationScope(fetch: fetch)
     }
 
     func savedMoments() throws -> [PhotoMoment] {
@@ -577,38 +679,6 @@ actor CuratorWorker {
     func release(_ job: AnalysisJob) throws { try database().releaseAnalysis(job) }
 }
 
-private final class CuratorLibraryObserver: NSObject, PHPhotoLibraryChangeObserver {
-    private let lock = NSLock()
-    private var assets: PHFetchResult<PHAsset>
-    let changed: (_ changedOrInserted: Set<String>, _ removed: Set<String>, _ requiresFullScan: Bool) -> Void
-
-    init(changed: @escaping (Set<String>, Set<String>, Bool) -> Void) {
-        let options = PHFetchOptions()
-        options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
-        options.includeHiddenAssets = false
-        assets = PHAsset.fetchAssets(with: options)
-        self.changed = changed
-    }
-
-    func photoLibraryDidChange(_ changeInstance: PHChange) {
-        lock.lock()
-        defer { lock.unlock() }
-        guard let details = changeInstance.changeDetails(for: assets) else {
-            // Album/folder membership and title changes do not affect the image index.
-            return
-        }
-        assets = details.fetchResultAfterChanges
-        guard details.hasIncrementalChanges else {
-            changed([], [], true)
-            return
-        }
-        let updated = Set((details.insertedObjects + details.changedObjects).map(\.localIdentifier))
-        let removed = Set(details.removedObjects.map(\.localIdentifier))
-        guard !updated.isEmpty || !removed.isEmpty else { return }
-        changed(updated, removed, false)
-    }
-}
-
 @MainActor
 final class CuratorController: ObservableObject {
     @Published private(set) var similarityThresholds = SimilarityCategory.savedThresholds()
@@ -655,8 +725,12 @@ final class CuratorController: ObservableObject {
 
     private let worker: CuratorWorker
     private let catalog: CatalogV2Store?
-    private var timer: Timer?
-    private var observer: CuratorLibraryObserver?
+    private let scheduler = CurationScheduler()
+    private lazy var library = LibraryCoordinator { [scheduler] in
+        Task { await scheduler.wake(.libraryChanged) }
+    }
+    private var schedulerTask: Task<Void, Never>?
+    private var policySubscriptions = Set<AnyCancellable>()
     private var batchRunning = false
     private var restartRequested = false
     private var backgroundNeedsScan = false
@@ -666,9 +740,8 @@ final class CuratorController: ObservableObject {
     private var metadataReady = false
     private var startupStateLoaded = false
     private var nextReconciliationAnalysisStep = 4
-    private var checkpointProbeRunning = false
-    private var lastCheckpointProbe = Date.distantPast
     private var analysisTask: Task<Void, Never>?
+    private var metadataTask: Task<Void, Never>?
     private var viewportPrioritySignatures = Set<String>()
     private(set) var analyzedThisSession = 0
     private(set) var deferredThisSession = 0
@@ -676,13 +749,12 @@ final class CuratorController: ObservableObject {
     private let analyzer = CuratorVisionAnalyzer()
     private var contextStep = 0
     private var lastWaitLog = Date.distantPast
+    private var systemSleeping = false
 
     @Published var autoPublishEnabled: Bool
     private var publishingMomentIDs: Set<String> = []
     private var failedAutoPublishMomentIDs: Set<String> = []
     private var isPublishingInBackground = false
-    private var publicationChangeInProgress = false
-    private var ignorePublicationChangesUntil = Date.distantPast
 
     private func logWait(_ code: Int) {
         guard Date().timeIntervalSince(lastWaitLog) >= 60 else { return }
@@ -692,6 +764,42 @@ final class CuratorController: ObservableObject {
 
     var selectedRange: DateInterval? {
         period.interval(now: Date(), customStart: customStart, customEnd: customEnd)
+    }
+
+    private func startScheduler() {
+        schedulerTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                let events = await scheduler.next()
+                guard !events.isEmpty, !Task.isCancelled else { return }
+                await scheduleWork(for: events)
+            }
+        }
+    }
+
+    private func wakeScheduler(_ event: CurationScheduler.Event) {
+        Task { await scheduler.wake(event) }
+    }
+
+    private func observePolicyChanges() {
+        let center = NotificationCenter.default
+        [Notification.Name("NSProcessInfoPowerStateDidChange"),
+         Notification.Name("NSProcessInfoThermalStateDidChange"),
+         NSApplication.didBecomeActiveNotification,
+         .photoRelayPhotosAccessChanged].forEach { name in
+            center.publisher(for: name).sink { [weak self] _ in
+                self?.wakeScheduler(.policyChanged)
+            }.store(in: &policySubscriptions)
+        }
+        let workspace = NSWorkspace.shared.notificationCenter
+        [NSWorkspace.didWakeNotification, NSWorkspace.willSleepNotification].forEach { name in
+            workspace.publisher(for: name).sink { [weak self] note in
+                guard let self else { return }
+                self.systemSleeping = note.name == NSWorkspace.willSleepNotification
+                if self.systemSleeping { self.analysisTask?.cancel() }
+                self.wakeScheduler(.policyChanged)
+            }.store(in: &policySubscriptions)
+        }
     }
 
     init(model: PhotoRelayViewModel) {
@@ -737,20 +845,23 @@ final class CuratorController: ObservableObject {
                 self.metadataReady = indexed > 0
                 self.backgroundNeedsScan = needsReconciliation
                 self.restartRequested = needsReconciliation
-                self.lastCheckpointProbe = PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized
-                    ? Date() : .distantPast
+                if needsReconciliation { self.nextReconciliationAnalysisStep = self.contextStep }
                 self.startupStateLoaded = true
-                self.tick()
+                self.wakeScheduler(.startup)
+                Task {
+                    if let date = await self.worker.nextVerificationDate() {
+                        await self.scheduler.wake(.verificationDue, at: date)
+                    }
+                }
             }
         }
         syncSubscription = model.$isWorking.sink { [weak self] busy in
             self?.syncBusy = busy
             if busy { self?.analysisTask?.cancel() }
+            self?.wakeScheduler(.policyChanged)
         }
-        timer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.tick() }
-        }
-        RunLoop.main.add(timer!, forMode: .common)
+        startScheduler()
+        observePolicyChanges()
         Task { await refreshOverview(reusingVisibleMoments: true) }
         if UserDefaults.standard.bool(forKey: "curatorPrioritizePilotOnLaunch") {
             Task { @MainActor [weak self] in
@@ -763,30 +874,37 @@ final class CuratorController: ObservableObject {
     func setAutoPublishEnabled(_ value: Bool) {
         autoPublishEnabled = value
         UserDefaults.standard.set(value, forKey: "curatorAutoPublish")
+        wakeScheduler(.policyChanged)
     }
 
     func setFavorite(_ favorite: Bool, photoID: String) async throws {
-        publicationChangeInProgress = true
-        defer {
-            publicationChangeInProgress = false
-            ignorePublicationChangesUntil = Date().addingTimeInterval(3)
+        let operation = UUID()
+        await library.expect(operation: operation, assetIDs: [photoID], effect: .update)
+        do {
+            try await PhotoKitAssetEditor.shared.setFavorite(favorite, assetID: photoID)
+        } catch {
+            await library.cancelExpected(operation: operation)
+            throw error
         }
-        try await PhotoKitAssetEditor.shared.setFavorite(favorite, assetID: photoID)
         try await worker.reconcileEditedAsset(photoID)
         try? await worker.refreshCheckpointFingerprint()
         await refreshOverview()
+        wakeScheduler(.workCompleted)
     }
 
     func moveToRecentlyDeleted(photoID: String) async throws {
-        publicationChangeInProgress = true
-        defer {
-            publicationChangeInProgress = false
-            ignorePublicationChangesUntil = Date().addingTimeInterval(3)
+        let operation = UUID()
+        await library.expect(operation: operation, assetIDs: [photoID], effect: .removal)
+        do {
+            try await PhotoKitAssetEditor.shared.moveToRecentlyDeleted(assetID: photoID)
+        } catch {
+            await library.cancelExpected(operation: operation)
+            throw error
         }
-        try await PhotoKitAssetEditor.shared.moveToRecentlyDeleted(assetID: photoID)
         try await worker.removeDeletedAsset(photoID)
         try? await worker.refreshCheckpointFingerprint()
         await refreshOverview()
+        wakeScheduler(.workCompleted)
     }
 
     func mergeMoments(_ source: [PhotoMoment], title: String, decisions: MomentReviewDecisions,
@@ -834,14 +952,18 @@ final class CuratorController: ObservableObject {
                     self.metadataReady = indexed > 0
                     self.backgroundNeedsScan = needsReconciliation
                     self.restartRequested = needsReconciliation
+                    if needsReconciliation { self.nextReconciliationAnalysisStep = self.contextStep }
                     self.revision += 1
-                    self.tick()
+                    self.wakeScheduler(.userRequested)
                 }
             }
         } else {
             enabled = false
             CuratorTelemetry.shared.record(.paused)
-            if !foregroundActive { analysisTask?.cancel() }
+            if !foregroundActive {
+                analysisTask?.cancel()
+                metadataTask?.cancel()
+            }
             UserDefaults.standard.set(false, forKey: "curatorEnabled")
             if !foregroundActive { activity = "Background curation is paused. Your index is kept." }
         }
@@ -859,19 +981,21 @@ final class CuratorController: ObservableObject {
             self.restartRequested = true
             self.revision += 1
             self.activity = "Preparing this date range…"
-            self.tick()
+            self.wakeScheduler(.userRequested)
         }
     }
 
     func stopForeground() {
         analysisTask?.cancel()
-        metadataReady = false
+        metadataTask?.cancel()
+        metadataReady = indexedCount > 0
         foregroundActive = false
         foregroundRange = nil
-        restartRequested = true
-        backgroundNeedsScan = true
+        restartRequested = backgroundNeedsScan
+        if backgroundNeedsScan { nextReconciliationAnalysisStep = contextStep }
         revision += 1
         activity = "Range scan stopped. Indexed metadata was kept."
+        wakeScheduler(.userRequested)
     }
 
     func stopDiagnostic() { diagnosticTask?.cancel() }
@@ -886,7 +1010,11 @@ final class CuratorController: ObservableObject {
         diagnosticRunning = true
         diagnosticReport = "Checking local photos..."
         diagnosticTask = Task {
-            defer { diagnosticRunning = false; diagnosticTask = nil }
+            defer {
+                diagnosticRunning = false
+                diagnosticTask = nil
+                wakeScheduler(.workCompleted)
+            }
             let options = PHFetchOptions()
             options.predicate = NSPredicate(format: "mediaType == %d AND creationDate >= %@ AND creationDate < %@", PHAssetMediaType.image.rawValue, range.start as NSDate, range.end as NSDate)
             options.includeHiddenAssets = false
@@ -1023,7 +1151,7 @@ final class CuratorController: ObservableObject {
         guard viewportPrioritySignatures.insert(signature).inserted else { return }
         do {
             try await worker.prioritizeAnalysis(photos)
-            tick()
+            wakeScheduler(.userRequested)
         } catch {
             viewportPrioritySignatures.remove(signature)
             CuratorTelemetry.shared.record(.failure, counts: ["code": (error as NSError).code])
@@ -1066,70 +1194,67 @@ final class CuratorController: ObservableObject {
         }
     }
 
-    private func tick() {
+    private func scheduleWork(for events: Set<CurationScheduler.Event>) async {
         guard !diagnosticRunning else { return }
         guard startupStateLoaded else { return }
-        guard !batchRunning, enabled || foregroundActive else { return }
         guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else {
             activity = "Waiting for full Photos access. Open Moments to enable it."
             logWait(1)
             return
         }
-        if observer == nil {
-            let listener = CuratorLibraryObserver { [weak self] updated, removed, requiresFullScan in
-                Task { @MainActor in
-                    guard let self else { return }
-                    // Creating our managed folders/albums emits PhotoKit changes. Cancelling
-                    // here would interrupt the publication that caused the notification.
-                    if self.publicationChangeInProgress || Date() < self.ignorePublicationChangesUntil {
-                        return
-                    }
-                    CuratorTelemetry.shared.record(.libraryChange, counts: [
-                        "updated": updated.count, "removed": removed.count,
-                        "full": requiresFullScan ? 1 : 0
-                    ])
-                    if requiresFullScan {
-                        self.backgroundNeedsScan = true
-                        self.restartRequested = true
-                        self.metadataReady = false
-                        self.analysisTask?.cancel()
-                        self.revision += 1
-                    } else {
-                        do {
-                            for id in removed { try await self.worker.removeDeletedAsset(id) }
-                            var metadataChanged = !removed.isEmpty
-                            for id in updated {
-                                if try await self.worker.reconcileEditedAsset(id) { metadataChanged = true }
-                            }
-                            if metadataChanged {
-                                try await self.worker.refreshCheckpointFingerprint()
-                                await self.refreshOverview()
-                            }
-                        } catch {
-                            self.backgroundNeedsScan = true
-                            self.restartRequested = true
-                            self.metadataReady = false
-                        }
-                    }
-                }
-            }
-            observer = listener
-            PHPhotoLibrary.shared().register(listener)
-        }
-        if !foregroundActive, !checkpointProbeRunning,
-           Date().timeIntervalSince(lastCheckpointProbe) >= 60 * 60 {
-            checkpointProbeRunning = true
-            lastCheckpointProbe = Date()
-            Task {
-                let indexed = (try? await worker.indexedPhotoCount()) ?? 0
-                let needed = await worker.startupRequiresFullReconciliation(indexedCount: indexed)
-                checkpointProbeRunning = false
-                if needed, !backgroundNeedsScan {
+        await library.start(since: await worker.checkpointChangeToken())
+        guard !batchRunning else { return }
+
+        let changes = await library.drain(limit: 100)
+        if changes != .empty {
+            CuratorTelemetry.shared.record(.libraryChange, counts: [
+                "updated": changes.updated.count, "removed": changes.removed.count,
+                "full": changes.requiresVerification ? 1 : 0
+            ])
+            do {
+                if changes.requiresVerification {
+                    try await worker.invalidateFullVerification()
                     backgroundNeedsScan = true
                     restartRequested = true
-                    revision += 1
+                    nextReconciliationAnalysisStep = contextStep
                 }
+                for id in changes.removed { try await worker.removeDeletedAsset(id) }
+                var metadataChanged = !changes.removed.isEmpty
+                for id in changes.updated {
+                    if try await worker.reconcileEditedAsset(id) { metadataChanged = true }
+                }
+                if metadataChanged {
+                    try await worker.refreshCheckpointFingerprint()
+                    await refreshOverview()
+                }
+                if let token = changes.changeToken {
+                    try await worker.advanceVerificationScope(to: token)
+                    try await worker.commitLibraryChangeToken(token)
+                    await library.commit(changeToken: token)
+                }
+            } catch {
+                backgroundNeedsScan = true
+                restartRequested = true
+                nextReconciliationAnalysisStep = contextStep
             }
+            if changes.hasMore { wakeScheduler(.libraryChanged) }
+        }
+
+        if events.contains(.verificationDue), !foregroundActive {
+            let indexed = (try? await worker.indexedPhotoCount()) ?? 0
+            if await worker.startupRequiresFullReconciliation(indexedCount: indexed) {
+                backgroundNeedsScan = true
+                restartRequested = true
+                nextReconciliationAnalysisStep = contextStep
+            } else if let date = await worker.nextVerificationDate() {
+                await scheduler.wake(.verificationDue, at: date)
+            }
+        }
+
+        guard enabled || foregroundActive else { return }
+        if systemSleeping {
+            activity = "Paused while your Mac is asleep."
+            return
         }
         let process = ProcessInfo.processInfo
         if syncBusy {
@@ -1159,15 +1284,16 @@ final class CuratorController: ObservableObject {
             let restart = restartRequested
             restartRequested = false
             batchRunning = true
-            Task {
+            metadataTask = Task {
                 let interval = CuratorPerformance.begin("Metadata batch")
                 defer { CuratorPerformance.end("Metadata batch", interval) }
-                defer { batchRunning = false }
+                defer {
+                    batchRunning = false
+                    metadataTask = nil
+                    wakeScheduler(.workCompleted)
+                }
                 do {
-                    // Keep foreground review responsive; accelerate metadata-only reconciliation
-                    // when the app is unattended. Vision work remains idle-gated separately.
-                    let metadataBatchSize = wasForeground ? 500 : (NSApp.isActive ? 100 : 1_000)
-                    let result = try await worker.batch(range: range, restart: restart, limit: metadataBatchSize)
+                    let result = try await worker.batch(range: range, restart: restart, limit: 100)
                     guard currentRevision == revision else { return }
                     scanned = result.scanned
                     scanTotal = result.total
@@ -1177,6 +1303,10 @@ final class CuratorController: ObservableObject {
                         metadataReady = true
                         if !wasForeground { backgroundNeedsScan = false }
                         activity = "Metadata ready. Preparing local visual analysis."
+                        if !wasForeground, let date = await worker.nextVerificationDate() {
+                            await library.resetToCurrentToken()
+                            await scheduler.wake(.verificationDue, at: date)
+                        }
                     } else if !wasForeground {
                         nextReconciliationAnalysisStep = contextStep + 4
                     }
@@ -1221,11 +1351,7 @@ final class CuratorController: ObservableObject {
                 batchRunning = false
                 analysisTask = nil
                 if CuratorPolicy.shouldContinueAnalysis(caughtUp: caughtUp, failedBeforeClaim: failedBeforeClaim) {
-                    Task { @MainActor in
-                        await Task.yield()
-                        guard token == self.revision else { return }
-                        self.tick()
-                    }
+                    if token == revision { wakeScheduler(.workCompleted) }
                 }
             }
             var claimed: AnalysisJob?
@@ -1275,12 +1401,24 @@ final class CuratorController: ObservableObject {
                     caughtUp = true
                     CuratorTelemetry.shared.record(.caughtUp, counts: ["saved": analyzedThisSession, "deferred": deferredThisSession])
                     await refreshOverview(reusingVisibleMoments: true)
+                    if let retry = try await worker.nextAnalysisEligibilityDate() {
+                        await scheduler.wake(.retryDue, at: retry)
+                    }
+                    if autoPublishEnabled && !allowAutomaticPublication {
+                        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState,
+                            eventType: CGEventType(rawValue: UInt32.max)!)
+                        if idle.isFinite {
+                            await scheduler.wake(.policyChanged,
+                                at: Date().addingTimeInterval(max(1, 120 - idle)))
+                        }
+                    }
                     if foregroundActive {
                         foregroundActive = false
                         foregroundRange = nil
-                        metadataReady = false
-                        restartRequested = true
-                        backgroundNeedsScan = true
+                    }
+                    if backgroundNeedsScan {
+                        nextReconciliationAnalysisStep = contextStep
+                        wakeScheduler(.workCompleted)
                     }
                     return
                 }
@@ -1319,6 +1457,7 @@ final class CuratorController: ObservableObject {
                         failedBeforeClaim = true
                         CuratorTelemetry.shared.record(.failure, counts: ["code": (error as NSError).code])
                         activity = "Moment preparation paused: \(error.localizedDescription)"
+                        await scheduler.wake(.retryDue, at: Date().addingTimeInterval(60))
                     }
                 }
                 if let job = claimed {
@@ -1339,6 +1478,8 @@ final class CuratorController: ObservableObject {
         restartRequested = true
         metadataReady = false
         revision += 1
+        nextReconciliationAnalysisStep = contextStep
+        wakeScheduler(.userRequested)
     }
 
     @discardableResult
@@ -1380,11 +1521,6 @@ final class CuratorController: ObservableObject {
     func publishToPhotos(moment: PhotoMoment, decisions: MomentReviewDecisions) async throws -> CuratedAlbumReceipt {
         let interval = CuratorPerformance.begin("Photos publication")
         defer { CuratorPerformance.end("Photos publication", interval) }
-        publicationChangeInProgress = true
-        defer {
-            publicationChangeInProgress = false
-            ignorePublicationChangesUntil = Date().addingTimeInterval(3)
-        }
         let place = await CuratorGeocodingService.shared.place(for: moment)
         let narrative = MomentPresentation.narrative(moment, customTitle: decisions.titles[moment.id],
             customDescription: decisions.descriptions[moment.id], place: place)

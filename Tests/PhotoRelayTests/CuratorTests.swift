@@ -57,6 +57,50 @@ final class CuratorTests: XCTestCase {
         XCTAssertEqual(photos.first?.created, Date(timeIntervalSince1970: 30))
     }
 
+    func testFullVerificationProgressSurvivesRestartAndClearsOnlyOnCommit() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("index.sqlite3")
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let progress = VerificationProgress(scope: "fingerprint", generation: "scan-1",
+                                            cursor: 4_200, total: 109_182, updated: Date(timeIntervalSince1970: 10))
+        do {
+            let store = try CuratorStore(url: url)
+            try store.save([photo("old", 10), photo("seen", 20)], generation: "old")
+            try store.save([photo("seen", 20)], generation: progress.generation)
+            try store.saveVerificationProgress(progress)
+        }
+
+        let reopened = try CuratorStore(url: url)
+        XCTAssertEqual(try reopened.verificationProgress(), progress)
+        try reopened.finishFullScan(generation: progress.generation)
+        XCTAssertEqual(try reopened.verificationProgress(), progress)
+        try reopened.clearVerificationProgress()
+        XCTAssertNil(try reopened.verificationProgress())
+        XCTAssertEqual(try reopened.photos(in: DateInterval(start: .distantPast, end: .distantFuture)).map(\.id), ["seen"])
+    }
+
+    func testIncrementalChangeDuringVerificationIsMarkedSeenByGeneration() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("index.sqlite3")
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = try CuratorStore(url: url)
+        try store.save([photo("edited", 10), photo("missing", 20)], generation: "old")
+        XCTAssertTrue(try store.updatePhoto(photo("edited", 10, favorite: true), generation: "scan"))
+        try store.finishFullScan(generation: "scan")
+        let photos = try store.photos(in: DateInterval(start: .distantPast, end: .distantFuture))
+        XCTAssertEqual(photos.map(\.id), ["edited"])
+        XCTAssertTrue(photos[0].favorite)
+    }
+
+    func testIncrementalInsertCreatesPhotoAndAnalysisWork() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("index.sqlite3")
+        defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
+        let store = try CuratorStore(url: url)
+        let inserted = photo("new", 10)
+        XCTAssertTrue(try store.updatePhoto(inserted))
+        try store.enqueueAnalysis(asset: inserted.id, revision: inserted.analysisRevision, analyzer: "test")
+        XCTAssertEqual(try store.counts().total, 1)
+        XCTAssertEqual(try store.claimAnalysis()?.asset, inserted.id)
+    }
+
     func testIdenticalPhotoKitMetadataDoesNotRequestCatalogRefresh() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).appendingPathComponent("index.sqlite3")
         defer { try? FileManager.default.removeItem(at: url.deletingLastPathComponent()) }
