@@ -1,6 +1,6 @@
 import Foundation
 
-struct GoogleAlbum: Decodable, Identifiable, Sendable {
+struct GoogleAlbum: Codable, Identifiable, Sendable {
     let id: String
     let title: String
     let mediaItemsCount: String?
@@ -8,11 +8,7 @@ struct GoogleAlbum: Decodable, Identifiable, Sendable {
     var count: Int { Int(mediaItemsCount ?? "0") ?? 0 }
 }
 
-struct GoogleAlbumClearResponse: Decodable {
-    let removed: Int
-}
-
-struct SyncReview: Decodable {
+struct SyncReview: Codable, Sendable {
     let token: String
     let destinations: [Destination]
     let fileCount: Int
@@ -27,7 +23,7 @@ struct SyncReview: Decodable {
         case unresolvedFiles = "unresolved_files"
     }
 
-    struct Destination: Decodable, Identifiable {
+    struct Destination: Codable, Identifiable, Sendable {
         let id: String
         let title: String
         let isNew: Bool
@@ -43,7 +39,7 @@ struct SyncReview: Decodable {
     }
 }
 
-struct TransferProgress: Decodable {
+struct TransferProgress: Codable, Sendable {
     let runID: String?
     let phase: String
     let message: String
@@ -56,7 +52,7 @@ struct TransferProgress: Decodable {
     let etaSeconds: Double?
     let destinations: [SavedDestination]?
 
-    struct SavedDestination: Decodable {
+    struct SavedDestination: Codable, Sendable {
         let id: String
         let title: String
     }

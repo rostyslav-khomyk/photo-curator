@@ -6,15 +6,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // The dashboard bridge controls Dock presence; do not override it at launch.
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        BackendController.shared.stop()
-    }
 }
 
 @main
 struct PhotoRelayApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var backend = BackendController.shared
     @StateObject private var model: PhotoRelayViewModel
     @StateObject private var curator: CuratorController
 
@@ -27,7 +23,7 @@ struct PhotoRelayApp: App {
         } catch {
             bootstrapError = "Photo Curator could not finish its reset safely: \(error.localizedDescription)"
         }
-        let model = PhotoRelayViewModel(backend: BackendController.shared)
+        let model = PhotoRelayViewModel()
         let curator = CuratorController(model: model)
         if let bootstrapError { curator.errorMessage = bootstrapError }
         _model = StateObject(wrappedValue: model)
@@ -36,7 +32,7 @@ struct PhotoRelayApp: App {
 
     var body: some Scene {
         Window("Photo Curator", id: "dashboard") {
-            DashboardView(backend: backend, model: model, curator: curator)
+            DashboardView(model: model, curator: curator)
                 .frame(minWidth: 820, minHeight: 580)
                 .background(DashboardActivationBridge())
         }
@@ -45,7 +41,7 @@ struct PhotoRelayApp: App {
         Settings { CuratorSettingsView(curator: curator, model: model) }
 
         MenuBarExtra {
-            MenuContent(backend: backend, model: model, curator: curator)
+            MenuContent(model: model, curator: curator)
         } label: {
             Label(
                 "Photo Curator",
@@ -58,7 +54,6 @@ struct PhotoRelayApp: App {
 
 private struct MenuContent: View {
     @Environment(\.openWindow) private var openWindow
-    @ObservedObject var backend: BackendController
     @ObservedObject var model: PhotoRelayViewModel
     @ObservedObject var curator: CuratorController
 
@@ -70,9 +65,6 @@ private struct MenuContent: View {
         if let progress = model.transferProgress, progress.isTransferring, model.isWorking {
             Text(progress.transferSummary)
             Text("\(progress.completed ?? 0) of \(progress.total ?? 0) items ready")
-        }
-        if let error = backend.lastError {
-            Text(error).foregroundStyle(.red)
         }
         Divider()
         Button("Open Photo Curator") {

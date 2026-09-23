@@ -2122,3 +2122,13 @@ Photos access, network research or private-photo inspection in this subchunk.
   passes complete strict-concurrency checking with warnings as errors. Packaged owner-library
   migration/file-count and Instruments qualification remain open.
 - No catalog wipe, Photos mutation, deployment, or indexing restart occurred.
+# 2026-09-24: Native Google Photos integration
+
+Replaced the bundled Python/PyInstaller helper and private JSON-line RPC bridge with native
+Swift actors. OAuth now uses the system browser, a temporary loopback callback, and Keychain
+storage. The Photos Library REST client preserves 50-item request limits and never retries an
+ambiguous create. A SQLite hash ledger prevents duplicate retries, and replacement sync adds
+and verifies all selected media before removing old album membership. Legacy JSON tokens are
+imported into Keychain while upgrading an existing installation.
+Validation: 256 Swift tests passed, 13 opt-in tests skipped, zero failures. The release app bundle
+builds and signs without an Engine directory, Python runtime, helper executable, or web assets.

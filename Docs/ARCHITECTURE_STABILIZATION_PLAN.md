@@ -456,13 +456,16 @@ Exactly-once behavior cannot be guaranteed across an external API crash gap. The
 
 Google sync is a separate product boundary and must not own or refresh the curator catalog.
 
-- Start the bundled helper only for credential checks or an active Google operation, then stop it deterministically.
-- Remove startup credential probing that launches the helper before the user requests Google work.
+- Keep Google OAuth, REST calls, and sync orchestration in isolated native Swift actors; no helper
+  process or persistent web server is part of the application.
+- Check saved access without launching a subprocess or opening a browser; use a temporary loopback
+  listener only while the user explicitly completes OAuth.
 - Persist export operations and per-asset completion in SQLite instead of growing UserDefaults arrays.
 - Store OAuth tokens in Keychain, not adjacent JSON files.
 - Keep staging files in Caches or temporary directories and delete them after terminal operation states.
 - Route Google completion into a narrow `google_exports` update and changed-summary event.
-- Consider a native Google client only after the curator stabilization is complete; replacing the helper now expands the critical path without fixing Moments.
+- The native client must retain the no-blind-retry rule for ambiguous creates and verify additions
+  before any replacement removal.
 
 ## 13. Concurrency rules
 

@@ -48,7 +48,9 @@ final class NativeGoogleOAuthTests: XCTestCase {
 
         XCTAssertTrue(connected)
         XCTAssertEqual(store.token?.refreshToken, "refresh")
-        XCTAssertTrue(FileManager.default.fileExists(atPath: legacy.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path))
+        let account = try await oauth.accountIdentifier(subject: "person")
+        XCTAssertEqual(account, "client:person")
     }
 
     private func session() -> URLSession {

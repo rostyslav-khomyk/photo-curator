@@ -173,12 +173,16 @@ actor NativeGoogleOAuth: GoogleAccessTokenProviding {
         return token.map { scopes.isSubset(of: $0.scopes) } ?? false
     }
 
+    func accountIdentifier(subject: String) async throws -> String {
+        "\(try loadClient().clientID):\(subject)"
+    }
+
     func authorize(scopes: Set<String>) async throws {
         let client = try loadClient()
         let callback = try GoogleOAuthLoopbackServer()
-        let redirectURI = try await callback.start()
-        defer { callback.stop() }
         let state = UUID().uuidString
+        let redirectURI = try await callback.start(expectedState: state)
+        defer { callback.stop() }
         var components = URLComponents(string: "https://accounts.google.com/o/oauth2/v2/auth")!
         components.queryItems = [
             URLQueryItem(name: "client_id", value: client.clientID),
@@ -193,7 +197,7 @@ actor NativeGoogleOAuth: GoogleAccessTokenProviding {
         guard let authorizationURL = components.url else { throw GoogleOAuthError.invalidResponse }
         let opened = await MainActor.run { NSWorkspace.shared.open(authorizationURL) }
         guard opened else { throw GoogleOAuthError.rejected("The system browser could not be opened.") }
-        let code = try await callback.waitForCode(state: state)
+        let code = try await callback.waitForCode()
         let token = try await exchange(code: code, redirectURI: redirectURI, scopes: scopes, client: client)
         try store.save(token, clientID: client.clientID)
         cachedToken = token
@@ -231,18 +235,19 @@ actor NativeGoogleOAuth: GoogleAccessTokenProviding {
             cachedToken = saved
             return saved
         }
-        guard let legacy = try legacyToken() else { return nil }
+        guard let (legacy, legacyURL) = try legacyToken() else { return nil }
         try store.save(legacy, clientID: clientID)
+        try FileManager.default.removeItem(at: legacyURL)
         cachedToken = legacy
         return legacy
     }
 
-    private func legacyToken() throws -> GoogleOAuthToken? {
+    private func legacyToken() throws -> (GoogleOAuthToken, URL)? {
         let name = credentialsURL.deletingPathExtension().lastPathComponent + "_token"
         let url = credentialsURL.deletingLastPathComponent()
             .appendingPathComponent(name).appendingPathExtension(credentialsURL.pathExtension)
         guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        return try JSONDecoder().decode(GoogleOAuthToken.self, from: Data(contentsOf: url))
+        return (try JSONDecoder().decode(GoogleOAuthToken.self, from: Data(contentsOf: url)), url)
     }
 
     private func refresh(_ token: GoogleOAuthToken, client: ClientFile.Client) async throws -> GoogleOAuthToken {
@@ -319,10 +324,16 @@ private final class GoogleOAuthLoopbackServer: @unchecked Sendable {
     private var completed: Result<String, Error>?
 
     init() throws {
-        listener = try NWListener(using: .tcp, on: .any)
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(
+            host: .ipv4(IPv4Address("127.0.0.1")!),
+            port: .any
+        )
+        listener = try NWListener(using: parameters)
     }
 
-    func start() async throws -> String {
+    func start(expectedState: String) async throws -> String {
+        lock.withLock { self.expectedState = expectedState }
         let port = try await withCheckedThrowingContinuation { continuation in
             lock.withLock { startCallback = continuation }
             listener.stateUpdateHandler = { state in
@@ -341,10 +352,9 @@ private final class GoogleOAuthLoopbackServer: @unchecked Sendable {
         return "http://127.0.0.1:\(port.rawValue)/callback"
     }
 
-    func waitForCode(state: String) async throws -> String {
+    func waitForCode() async throws -> String {
         try await withCheckedThrowingContinuation { continuation in
             lock.withLock {
-                expectedState = state
                 if let completed {
                     continuation.resume(with: completed)
                 } else {

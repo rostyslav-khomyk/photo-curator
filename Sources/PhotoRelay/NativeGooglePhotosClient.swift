@@ -3,6 +3,22 @@ import UniformTypeIdentifiers
 
 protocol GoogleAccessTokenProviding: Sendable {
     func accessToken(scopes: Set<String>, forceRefresh: Bool) async throws -> String
+    func accountIdentifier(subject: String) async throws -> String
+}
+
+extension GoogleAccessTokenProviding {
+    func accountIdentifier(subject: String) async throws -> String { subject }
+}
+
+protocol GooglePhotosServicing: Sendable {
+    func accountIdentifier() async throws -> String
+    func listAlbums() async throws -> [GoogleAlbum]
+    func albumMediaIDs(_ albumID: String) async throws -> Set<String>
+    func existingMediaIDs(_ ids: Set<String>) async throws -> Set<String>
+    func createAlbum(title: String) async throws -> String
+    func uploadBytes(at file: URL) async throws -> String
+    func createMedia(uploadToken: String, filename: String) async throws -> String
+    func changeAlbum(_ albumID: String, mediaIDs: Set<String>, removing: Bool) async throws
 }
 
 enum NativeGooglePhotosError: LocalizedError, Equatable {
@@ -22,7 +38,7 @@ enum NativeGooglePhotosError: LocalizedError, Equatable {
     }
 }
 
-actor NativeGooglePhotosClient {
+actor NativeGooglePhotosClient: GooglePhotosServicing {
     static let appendScope = "https://www.googleapis.com/auth/photoslibrary.appendonly"
     static let readScope = "https://www.googleapis.com/auth/photoslibrary.readonly.appcreateddata"
     static let editScope = "https://www.googleapis.com/auth/photoslibrary.edit.appcreateddata"
@@ -34,6 +50,15 @@ actor NativeGooglePhotosClient {
     init(tokens: GoogleAccessTokenProviding, session: URLSession = .shared) {
         self.tokens = tokens
         self.session = session
+    }
+
+    func accountIdentifier() async throws -> String {
+        let url = URL(string: "https://openidconnect.googleapis.com/v1/userinfo")!
+        let data = try await request(url: url, scopes: [NativeGoogleOAuth.identityScope])
+        guard let subject = try JSONDecoder().decode(Account.self, from: data).sub.nonEmpty else {
+            throw NativeGooglePhotosError.missingIdentifier
+        }
+        return try await tokens.accountIdentifier(subject: subject)
     }
 
     func listAlbums() async throws -> [GoogleAlbum] {
@@ -97,13 +122,28 @@ actor NativeGooglePhotosClient {
                          ?? "application/octet-stream", forHTTPHeaderField: "X-Goog-Upload-Content-Type")
         request.setValue("raw", forHTTPHeaderField: "X-Goog-Upload-Protocol")
         request.setValue(file.lastPathComponent, forHTTPHeaderField: "X-Goog-Upload-File-Name")
-        request.setValue("Bearer \(try await tokens.accessToken(scopes: [Self.appendScope], forceRefresh: false))",
-                         forHTTPHeaderField: "Authorization")
-        let (data, response) = try await session.upload(for: request, fromFile: file)
-        try validate(response, data: data)
-        guard let token = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !token.isEmpty else { throw NativeGooglePhotosError.missingIdentifier }
-        return token
+        for forceRefresh in [false, true] {
+            let access = try await tokens.accessToken(scopes: [Self.appendScope], forceRefresh: forceRefresh)
+            request.setValue("Bearer \(access)", forHTTPHeaderField: "Authorization")
+            for attempt in 0..<4 {
+                let (data, response) = try await session.upload(for: request, fromFile: file)
+                guard let http = response as? HTTPURLResponse else {
+                    throw NativeGooglePhotosError.invalidResponse
+                }
+                if http.statusCode == 401, !forceRefresh { break }
+                if shouldRetry(http.statusCode, method: "POST", attempt: attempt) {
+                    try await Task.sleep(for: .seconds(retryDelay(response: http, attempt: attempt)))
+                    continue
+                }
+                try validate(response, data: data)
+                guard let token = String(data: data, encoding: .utf8)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines), !token.isEmpty else {
+                    throw NativeGooglePhotosError.missingIdentifier
+                }
+                return token
+            }
+        }
+        throw NativeGooglePhotosError.invalidResponse
     }
 
     func createMedia(uploadToken: String, filename: String) async throws -> String {
@@ -142,12 +182,38 @@ actor NativeGooglePhotosClient {
         for forceRefresh in [false, true] {
             let token = try await tokens.accessToken(scopes: scopes, forceRefresh: forceRefresh)
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            let (data, response) = try await session.data(for: request)
-            if (response as? HTTPURLResponse)?.statusCode == 401, !forceRefresh { continue }
-            try validate(response, data: data)
-            return data
+            for attempt in 0..<4 {
+                let (data, response) = try await session.data(for: request)
+                guard let http = response as? HTTPURLResponse else {
+                    throw NativeGooglePhotosError.invalidResponse
+                }
+                if http.statusCode == 401, !forceRefresh { break }
+                if shouldRetry(http.statusCode, method: method, attempt: attempt) {
+                    try await Task.sleep(for: .seconds(retryDelay(response: http, attempt: attempt)))
+                    continue
+                }
+                try validate(response, data: data)
+                return data
+            }
         }
         throw NativeGooglePhotosError.invalidResponse
+    }
+
+    private func shouldRetry(_ status: Int, method: String, attempt: Int) -> Bool {
+        guard attempt < 3 else { return false }
+        if status == 429 { return true }
+        return method == "GET" && [500, 502, 503, 504].contains(status)
+    }
+
+    private func retryDelay(response: HTTPURLResponse, attempt: Int) -> TimeInterval {
+        let fallback = min(300, pow(2, Double(attempt)))
+        guard let value = response.value(forHTTPHeaderField: "Retry-After") else { return fallback }
+        if let seconds = TimeInterval(value) { return min(300, max(0, seconds)) }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss z"
+        return min(300, max(fallback, formatter.date(from: value)?.timeIntervalSinceNow ?? 0))
     }
 
     private func validate(_ response: URLResponse, data: Data) throws {
@@ -168,6 +234,7 @@ private struct MediaResult: Decodable { let status: GoogleStatus?; let mediaItem
 private struct GoogleStatus: Decodable { let code: Int?; let message: String? }
 private struct GoogleErrorEnvelope: Decodable { let error: GoogleError }
 private struct GoogleError: Decodable { let message: String }
+private struct Account: Decodable { let sub: String }
 
 private extension Array {
     func chunks(of size: Int) -> [[Element]] {

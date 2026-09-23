@@ -1,7 +1,6 @@
 import SwiftUI
 
 struct DashboardView: View {
-    @ObservedObject var backend: BackendController
     @ObservedObject var model: PhotoRelayViewModel
     @ObservedObject var curator: CuratorController
 

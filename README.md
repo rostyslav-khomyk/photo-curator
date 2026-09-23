@@ -11,14 +11,13 @@ Photo Curator is the native macOS workspace for turning a large Photos library i
 - Add significant places such as Home and Work to improve local titles and grouping context.
 - Let background curation continue newest-to-oldest while foreground review remains responsive.
 
-Google Photos integration is started only when requested. The small helper under
-`GooglePhotosHelper/` communicates through private local pipes and opens a temporary
-localhost callback only during OAuth; Photo Curator does not keep a web server running.
+Google Photos integration is native Swift. It opens a temporary localhost callback only
+during system-browser OAuth, stores reusable credentials in Keychain, and does not keep
+a web server or helper process running.
 
 ## Build and Run
 
 ```bash
-uv sync --group dev
 ./Scripts/build_app.sh
 open "dist/Photo Curator.app"
 ```
@@ -27,7 +26,6 @@ Run the native test suite with:
 
 ```bash
 swift test
-uv run pytest
 ```
 
 Run the warning gate and deterministic 100,000-photo performance baseline with:
@@ -60,7 +58,7 @@ On 2026-09-21, the complete live library was verified with:
 - Oldest Moment dated 1998-08-25
 - 56.5 MB persisted Moments catalog
 - 206 native tests passed, 11 skipped, 0 failed
-- 47 Google helper tests passed
+- Native Google OAuth, REST, and safe-sync tests pass as part of the Swift suite
 
 See [CURATOR_PLAN.md](Docs/CURATOR_PLAN.md) for the product direction and
 [CURATOR_DEVELOPMENT.md](Docs/CURATOR_DEVELOPMENT.md) for implementation history, and

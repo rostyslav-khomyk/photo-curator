@@ -63,7 +63,7 @@ final class PhotoRelayViewModel: ObservableObject {
         }
         if !albumLoadAttempted && !isLoadingAlbums { loadAlbums() }
     }
-    @Published var isWorking = false { didSet { if !isWorking { backend.stop() } } }
+    @Published var isWorking = false
     @Published private(set) var isAborting = false
     @Published private var activeUploadID: String?
     var canAbortUpload: Bool { isWorking && activeUploadID != nil }
@@ -103,39 +103,36 @@ final class PhotoRelayViewModel: ObservableObject {
     }
 
     func checkGoogleAccess(interactive: Bool = false) async {
-        guard !isWorking, !googleCredentials.isEmpty else { return }
+        guard !isWorking, let googleOAuth else { return }
         isWorking = true
         defer { isWorking = false }
         do {
-            let csrf = try await fetchCSRFToken()
-            var request = URLRequest(url: backend.dashboardURL.appendingPathComponent("google-access"))
-            request.httpMethod = "POST"
-            request.timeoutInterval = interactive ? 330 : 40
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue(csrf, forHTTPHeaderField: "X-CSRF-Token")
-            request.httpBody = try JSONSerialization.data(withJSONObject: [
-                "credentials": googleCredentials, "interactive": interactive
-            ])
-            let (data, response) = try await backend.data(for: request)
-            guard (response as? HTTPURLResponse)?.statusCode == 200,
-                  let result = try JSONSerialization.jsonObject(with: data) as? [String: String],
-                  let status = result["status"] else { throw RelayError.noResponse }
-            googleNeedsRecovery = status == "needs_connection"
-            if status != "unavailable" {
-                googleConnected = status == "connected"
-            }
+            if interactive { try await googleOAuth.authorize(scopes: Self.googleScopes) }
+            _ = try await googleOAuth.accessToken(scopes: Self.googleScopes, forceRefresh: false)
+            googleNeedsRecovery = false
+            googleConnected = true
+        } catch GoogleOAuthError.authorizationRequired {
+            googleNeedsRecovery = true
+            googleConnected = false
         } catch {
             // A transient check failure must not clear the saved login or force consent.
         }
     }
 
-    private let backend: BackendController
     private let photosSource = PhotosLibrarySource()
     private let googleCredentials: String
+    private let googleOAuth: NativeGoogleOAuth?
+    private let googleClient: NativeGooglePhotosClient?
+    private let googleSync: NativeGoogleSync?
     private let albumMapping: String
+    private static let googleScopes: Set<String> = [
+        NativeGoogleOAuth.identityScope,
+        NativeGooglePhotosClient.appendScope,
+        NativeGooglePhotosClient.readScope,
+        NativeGooglePhotosClient.editScope,
+    ]
 
-    init(backend: BackendController) {
-        self.backend = backend
+    init() {
         let defaults = UserDefaults.standard
         frameAlbumID = defaults.string(forKey: "frameAlbumID") ?? ""
         frameAlbumTitle = defaults.string(forKey: "frameAlbumTitle") ?? "Desk Travels"
@@ -146,6 +143,19 @@ final class PhotoRelayViewModel: ObservableObject {
             ?? FileManager.default.homeDirectoryForCurrentUser
                 .appendingPathComponent("Pictures/Photo Relay").path
         googleCredentials = Self.prepareGoogleCredentials(defaults: defaults)
+        if googleCredentials.isEmpty {
+            googleOAuth = nil
+            googleClient = nil
+            googleSync = nil
+        } else {
+            let oauth = NativeGoogleOAuth(credentialsURL: URL(fileURLWithPath: googleCredentials))
+            let client = NativeGooglePhotosClient(tokens: oauth)
+            let ledger = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("Photo Relay/photo_curator_uploads.sqlite3")
+            googleOAuth = oauth
+            googleClient = client
+            googleSync = try? NativeGoogleSync(client: client, ledgerURL: ledger)
+        }
         albumMapping = defaults.string(forKey: "albumMapping")
             ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("Photo Relay/album_mapping.json").path
@@ -229,7 +239,7 @@ final class PhotoRelayViewModel: ObservableObject {
 
     func signInToGoogle(showAlbumPicker: Bool = false) {
         guard !isWorking else { return }
-        guard !googleCredentials.isEmpty else {
+        guard let googleOAuth, let googleClient else {
             errorMessage = "Google sign-in is not configured in this build of Photo Relay."
             return
         }
@@ -237,22 +247,10 @@ final class PhotoRelayViewModel: ObservableObject {
         activity = "Connecting to Google Photos in your browser…"
         Task {
             do {
-                let csrf = try await fetchCSRFToken()
-                var request = URLRequest(url: backend.dashboardURL.appendingPathComponent("frame-albums"))
-                request.httpMethod = "POST"
-                request.timeoutInterval = 330
-                request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                request.setValue(csrf, forHTTPHeaderField: "X-CSRF-Token")
-                request.httpBody = try JSONSerialization.data(
-                    withJSONObject: ["credentials": googleCredentials]
-                )
-                let (data, response) = try await backend.data(for: request)
-                guard let http = response as? HTTPURLResponse else { throw RelayError.noResponse }
-                let result = try JSONDecoder().decode(GoogleAlbumsResponse.self, from: data)
-                guard http.statusCode == 200 else {
-                    throw RelayError.message(result.error ?? "Google Photos could not be connected.")
+                if try await googleOAuth.isConnected(scopes: Self.googleScopes) == false {
+                    try await googleOAuth.authorize(scopes: Self.googleScopes)
                 }
-                googleAlbums = result.albums ?? []
+                googleAlbums = try await googleClient.listAlbums()
                 googleConnected = true
                 if showAlbumPicker {
                     showsGoogleAlbumPicker = true
@@ -377,23 +375,19 @@ final class PhotoRelayViewModel: ObservableObject {
     }
 
     func clearGoogleAlbum(id: String) {
-        guard googleConnected, !isWorking, !id.isEmpty else { return }
+        guard googleConnected, !isWorking, !id.isEmpty, let googleSync else { return }
         isWorking = true
         activity = "Clearing the Google Photos album…"
         Task {
             do {
-                let data = try await post("clear-google-album", body: [
-                    "credentials": googleCredentials,
-                    "album_id": id,
-                ])
-                let result = try JSONDecoder().decode(GoogleAlbumClearResponse.self, from: data)
+                let removed = try await googleSync.clearAlbum(id)
                 googleAlbums = googleAlbums.map { album in
                     album.id == id
                         ? GoogleAlbum(id: album.id, title: album.title,
-                                      mediaItemsCount: String(max(0, album.count - result.removed)))
+                                      mediaItemsCount: String(max(0, album.count - removed)))
                         : album
                 }
-                activity = "Cleared \(result.removed) photo(s) from the Google album. The photos remain in your library."
+                activity = "Cleared \(removed) photo(s) from the Google album. The photos remain in your library."
             } catch {
                 errorMessage = error.localizedDescription
                 activity = "Could not clear the Google Photos album."
@@ -409,31 +403,25 @@ final class PhotoRelayViewModel: ObservableObject {
                 activity = "Export complete: \(items.count) item(s)."
                 return
             }
-            let encodedItems = items.map { ["path": $0.path, "album": $0.album] }
+            guard let googleSync else { throw RelayError.message("Google Photos is not configured.") }
             preparedGoogleItems = items
-            var destinations: [String: [String: String]] = [:]
+            var destinations: [String: NativeGoogleSync.DestinationChoice] = [:]
             for source in Set(items.map(\.album)) {
                 switch destinationMode {
-                case .matching: destinations[source] = ["title": source]
+                case .matching: destinations[source] = .init(id: nil, title: source)
                 case .custom:
                     guard let id = customAlbumMappings[source] else {
                         throw RelayError.message("Choose a Google destination for \(source).")
                     }
-                    destinations[source] = ["id": id]
+                    destinations[source] = .init(id: id, title: nil)
                 case .frame:
                     destinations[source] = frameAlbumID.isEmpty
-                        ? ["title": frameAlbumTitle.trimmingCharacters(in: .whitespacesAndNewlines)]
-                        : ["id": frameAlbumID]
+                        ? .init(id: nil, title: frameAlbumTitle.trimmingCharacters(in: .whitespacesAndNewlines))
+                        : .init(id: frameAlbumID, title: nil)
                 }
             }
-            let body: [String: Any] = [
-                "items": encodedItems,
-                "credentials": googleCredentials,
-                "destinations": destinations,
-            ]
             activity = "Checking your Google destination before making changes…"
-            let data = try await post("prepare-frame-sync", body: body)
-            syncReview = try JSONDecoder().decode(SyncReview.self, from: data)
+            syncReview = try await googleSync.prepare(items: items, choices: destinations)
             showsSyncReview = true
             activity = "Review how to update your Google album."
         } catch {
@@ -454,7 +442,7 @@ final class PhotoRelayViewModel: ObservableObject {
     }
 
     func confirmSync(replace: Bool, skipUnresolved: Bool) {
-        guard let review = syncReview else { return }
+        guard let review = syncReview, let googleSync else { return }
         let unresolved = Set(review.unresolvedFiles ?? [])
         pendingGoogleAssetIDs = Set(preparedGoogleItems.compactMap { item in
             guard !skipUnresolved || !unresolved.contains(item.path) else { return nil }
@@ -466,76 +454,29 @@ final class PhotoRelayViewModel: ObservableObject {
         activity = "Starting Google Photos sync…"
         Task {
             do {
-                _ = try await post("start-frame-sync", body: ["token": review.token, "mode": replace ? "replace" : "append", "skip_unresolved": skipUnresolved])
+                try await googleSync.start(token: review.token, replace: replace, skipUnresolved: skipUnresolved)
                 activeUploadID = review.token
                 await monitorUpload(expectedRunID: review.token)
-            } catch let error as RelayError {
+            } catch {
                 isWorking = false
                 clearPendingGoogleAssets()
                 errorMessage = error.localizedDescription
                 activity = "Sync did not start. Review the selection again."
-            } catch {
-                // A lost start response does not mean the upload failed to start.
-                activity = "Checking whether Google Photos sync started…"
-                await monitorUpload(expectedRunID: review.token)
             }
         }
     }
 
     func restoreUploadIfNeeded() async {
-        guard !isWorking else { return }
-        guard let (data, _) = try? await backend.data(from: backend.dashboardURL.appendingPathComponent("control-state")),
-              let state = try? JSONDecoder().decode(ControlState.self, from: data), state.running else { return }
+        guard !isWorking, let state = await googleSync?.snapshot(), state.running else { return }
         isWorking = true
         await monitorUpload()
     }
 
     func abortUpload() {
-        guard canAbortUpload, !isAborting, let token = activeUploadID else { return }
+        guard canAbortUpload, !isAborting, googleSync != nil else { return }
         isAborting = true
         activity = "Aborting; waiting for any in-flight Google request to finish…"
-        Task {
-            do {
-                _ = try await post("abort-frame-sync", body: ["token": token])
-            } catch {
-                isAborting = false
-                if isWorking {
-                    errorMessage = "Could not confirm the abort request: \(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    private func post(_ endpoint: String, body: [String: Any]) async throws -> Data {
-        let encodedBody = try JSONSerialization.data(withJSONObject: body)
-        for attempt in 0..<2 {
-            var request = URLRequest(url: backend.dashboardURL.appendingPathComponent(endpoint))
-            request.httpMethod = "POST"
-            request.timeoutInterval = 360
-            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-            request.setValue(try await fetchCSRFToken(), forHTTPHeaderField: "X-CSRF-Token")
-            request.httpBody = encodedBody
-            let (data, response) = try await backend.data(for: request)
-            guard let http = response as? HTTPURLResponse else { throw RelayError.noResponse }
-            if (200..<300).contains(http.statusCode) { return data }
-            // A restarted helper has a new CSRF token. Refresh once without repeating
-            // remote work: rejected requests never reach the route handler.
-            if http.statusCode == 403, attempt == 0 { continue }
-            let message = (try? JSONDecoder().decode(ServiceError.self, from: data))?.error
-            throw RelayError.message(message ?? Self.serviceFailureMessage(status: http.statusCode))
-        }
-        throw RelayError.message("The local sync service could not verify this request. Try again.")
-    }
-
-    private static func serviceFailureMessage(status: Int) -> String {
-        switch status {
-        case 403:
-            "The local sync service could not verify this request. Try again."
-        case 413:
-            "This selection is too large for the local sync service. Select fewer photos and try again."
-        default:
-            "The local sync service could not complete the request (error \(status))."
-        }
+        Task { await googleSync?.abort() }
     }
 
     private func monitorUpload(expectedRunID: String? = nil) async {
@@ -545,11 +486,12 @@ final class PhotoRelayViewModel: ObservableObject {
         }
         while true {
             try? await Task.sleep(for: .seconds(1))
-            do {
-                let (data, _) = try await backend.data(
-                    from: backend.dashboardURL.appendingPathComponent("control-state")
-                )
-                let state = try JSONDecoder().decode(ControlState.self, from: data)
+            guard let state = await googleSync?.snapshot() else {
+                isWorking = false
+                clearPendingGoogleAssets()
+                errorMessage = "Google Photos is not configured."
+                return
+            }
                 if let expectedRunID, state.progress?.runID != expectedRunID {
                     if state.running {
                         activity = "Waiting for the local service to identify this sync…"
@@ -574,7 +516,7 @@ final class PhotoRelayViewModel: ObservableObject {
                     clearPendingGoogleAssets()
                     errorMessage = error
                     activity = "Google Photos upload failed."
-                } else if state.lastExitCode == 0 {
+                } else if state.succeeded {
                     googleUploadedAssetIDs.formUnion(pendingGoogleAssetIDs)
                     UserDefaults.standard.set(Array(googleUploadedAssetIDs), forKey: "google.uploadedAssetIDs.v1")
                     clearPendingGoogleAssets()
@@ -588,9 +530,6 @@ final class PhotoRelayViewModel: ObservableObject {
                     activity = "No active sync. Review your selection and try again."
                 }
                 return
-            } catch {
-                activity = "Reconnecting to the local sync service. Your upload may still be running…"
-            }
         }
     }
 
@@ -604,13 +543,6 @@ final class PhotoRelayViewModel: ObservableObject {
         pendingGoogleAssetIDs = []
         preparedGoogleItems = []
         UserDefaults.standard.removeObject(forKey: "google.pendingAssetIDs.v1")
-    }
-
-    private func fetchCSRFToken() async throws -> String {
-        let (data, _) = try await backend.data(
-            from: backend.dashboardURL.appendingPathComponent("auth-state")
-        )
-        return try JSONDecoder().decode(AuthState.self, from: data).csrfToken
     }
 
     private static func prepareGoogleCredentials(defaults: UserDefaults) -> String {
@@ -643,36 +575,17 @@ final class PhotoRelayViewModel: ObservableObject {
         let token = url.deletingLastPathComponent().appendingPathComponent(
             "\(url.deletingPathExtension().lastPathComponent)_token.\(url.pathExtension)"
         )
-        guard let data = try? Data(contentsOf: token),
+        if let data = try? Data(contentsOf: token),
+           let contents = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let refreshToken = contents["refresh_token"] as? String, !refreshToken.isEmpty {
+            return true
+        }
+        guard let data = try? Data(contentsOf: url),
               let contents = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let refreshToken = contents["refresh_token"] as? String else { return false }
-        return !refreshToken.isEmpty
+              let client = (contents["installed"] ?? contents["web"]) as? [String: Any],
+              let clientID = client["client_id"] as? String else { return false }
+        return (try? KeychainGoogleTokenStore().load(clientID: clientID)) != nil
     }
-}
-
-private struct AuthState: Decodable {
-    let csrfToken: String
-    enum CodingKeys: String, CodingKey { case csrfToken = "csrf_token" }
-}
-
-private struct GoogleAlbumsResponse: Decodable {
-    let albums: [GoogleAlbum]?
-    let error: String?
-}
-
-private struct ControlState: Decodable {
-    let running: Bool
-    let lastExitCode: Int?
-    let error: String?
-    let progress: TransferProgress?
-    enum CodingKeys: String, CodingKey {
-        case running, error, progress
-        case lastExitCode = "last_exit_code"
-    }
-}
-
-private struct ServiceError: Decodable {
-    let error: String?
 }
 
 private enum RelayError: LocalizedError {

@@ -45,7 +45,7 @@ struct SyncReviewSheet: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Label("An earlier upload needs attention", systemImage: "exclamationmark.triangle")
                         .font(.headline)
-                    Text("Google did not confirm: \((review.unresolvedFiles ?? []).joined(separator: ", ")). These photos may already be in your Google library, even if no album exists.")
+                    Text("Google did not confirm: \((review.unresolvedFiles ?? []).map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", ")). These photos may already be in your Google library, even if no album exists.")
                         .font(.callout).foregroundStyle(.secondary)
                     Toggle("Leave unresolved photos out and add the rest", isOn: $skipUnresolved)
                     Text("No retry, no deletion. Confirmed uploads will be reused. Replacement is unavailable while photos are left out.")
