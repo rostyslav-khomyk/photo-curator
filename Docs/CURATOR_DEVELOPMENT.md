@@ -17,6 +17,12 @@ carry the narrative or highlight layers. This is a quality failure, not a storag
 The activation comparison now also requires a structural quality gate. The live catalog and Photos
 library were not modified.
 
+Following owner workflow review, raw `giantMomentCount` is no longer an activation failure. A first
+or rare visit to a significant place can naturally produce hundreds of photos, especially when
+family members contribute overlapping phone captures. Such photos belong to one coherent event;
+redundancy belongs in hierarchical highlight selection, while splitting requires positive boundary
+evidence. Fragmented days, generic narratives, and lost highlight layers remain guarded regressions.
+
 ## Independent architecture review incorporated (2026-09-21)
 
 - Made SQLite ownership explicit: write transactions are synchronous, nonescaping, and never cross

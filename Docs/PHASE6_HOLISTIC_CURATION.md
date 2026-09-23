@@ -10,8 +10,10 @@
   Moments workspace.
 - Activation requires equal corpus coverage and reviewed false-join/false-split measurements. False
   joins carry three times the comparison cost of false splits.
-- A separate structural gate rejects increased fragmented days, giant Moments, generic titles, or
-  complete loss of an existing highlight layer even if benchmark error counts improve.
+- A separate structural gate rejects increased fragmented days, generic titles, or complete loss of
+  an existing highlight layer even if benchmark error counts improve. Raw Moment size is diagnostic,
+  not a failure: a coherent first visit to a significant venue may legitimately contain hundreds of
+  photos from several family phones.
 - Activation and rollback replace the active derived projection in one transaction. User edits,
   protected membership, Photos publication receipts, and unfinished publication operations must
   retain their Moment identities or activation fails closed.
@@ -26,6 +28,9 @@
   recorded distance, calibrated boundary evidence, and long pauses can create a boundary.
 - Missing GPS, OCR, or visual evidence remains unknown rather than negative evidence.
 - Season and capture density never alter event boundaries.
+- Large Moments split only on supported event boundaries, never because they exceed a photo-count
+  threshold. Overlapping captures and near-duplicates from family phones remain in the shared event;
+  highlight selection suppresses redundant alternatives without fragmenting the Moment.
 - Optional Story parents require repeated strong place identity across adjacent Moments. They do not
   replace Moments or infer meaning from busy months.
 - Hierarchical highlights first allocate representative photos per Moment, then allocate Story-level

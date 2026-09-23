@@ -90,6 +90,14 @@ final class HolisticCurationGenerationTests: XCTestCase {
         let structuralRegression = CurationGenerationComparison.compare(active: active, candidate: fragmented)
         XCTAssertFalse(structuralRegression.structuralQualityPassed)
         XCTAssertFalse(structuralRegression.canRecommendActivation)
+
+        let significantVisit = CurationGenerationMetrics(photoCount: 100, momentCount: 8, highlightCount: 0,
+            singletonCount: 0, smallMomentCount: 0, largeMomentCount: 1, giantMomentCount: 1,
+            fragmentedDayCount: 0, crossDayMomentCount: 0, genericTitleCount: 0,
+            falseJoinCount: 0, falseSplitCount: 0)
+        let largeButCoherent = CurationGenerationComparison.compare(active: active, candidate: significantVisit)
+        XCTAssertTrue(largeButCoherent.structuralQualityPassed)
+        XCTAssertTrue(largeButCoherent.canRecommendActivation)
     }
 
     func testOverviewReportsSeasonalityWithoutChangingCandidates() {

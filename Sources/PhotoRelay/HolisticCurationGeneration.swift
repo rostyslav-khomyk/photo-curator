@@ -165,7 +165,6 @@ struct CurationGenerationComparison: Equatable, Sendable {
         }
         let activeCost = cost(active), candidateCost = cost(candidate)
         let structuralQualityPassed = candidate.fragmentedDayCount <= active.fragmentedDayCount
-            && candidate.giantMomentCount <= active.giantMomentCount
             && candidate.genericTitleCount <= active.genericTitleCount
             && (active.highlightCount == 0 || candidate.highlightCount > 0)
         return Self(active: active, candidate: candidate,

@@ -656,6 +656,9 @@ it was not activated.
 
 - Add adaptive logical-day/scene boundaries, optional Story parents, hierarchical highlight
   allocation, and grounded titles as a candidate generation, reusing the current evidence cache.
+- Treat Moment size as descriptive rather than erroneous. Significant or rare venue visits and
+  overlapping captures from several family phones may form large coherent Moments; require positive
+  boundary evidence before splitting and handle repeated views in highlight selection.
 - Add the aggregate Library Overview and active-versus-candidate comparison.
 - Validate against the current corpus audit and frozen owner-reviewed benchmark. Report false joins
   separately from false splits, with false joins weighted more heavily.
