@@ -77,6 +77,34 @@ final class MaintenanceResetTests: XCTestCase {
         XCTAssertEqual(localCounts.1, 1)
     }
 
+    func testResetReplaysFromEveryDurablePhase() async throws {
+        let phases: [CuratorResetPhase] = [.requested, .deletingContainers, .verifyingPhotos,
+            .erasingLocalData, .recreatingCatalog, .completed]
+        for phase in phases {
+            let fixture = fixture()
+            var operation = try await fixture.coordinator.begin(containers: containers(), reclaimableBytes: 42)
+            operation.phase = phase
+            if phase == .verifyingPhotos || phase == .erasingLocalData ||
+                phase == .recreatingCatalog || phase == .completed {
+                await fixture.photos.deleteContainers(containers())
+            }
+            if phase == .recreatingCatalog || phase == .completed {
+                await fixture.local.eraseCuratorData()
+            }
+            if phase == .completed {
+                await fixture.local.recreateCatalog()
+            }
+            try fixture.journal.save(operation)
+
+            let completed = try await fixture.coordinator.resume()
+
+            XCTAssertEqual(completed.phase, .completed, "Failed replay from \(phase.rawValue)")
+            let localCounts = await fixture.local.counts()
+            XCTAssertEqual(localCounts.0, 1, "Unexpected erasure count from \(phase.rawValue)")
+            XCTAssertEqual(localCounts.1, 1, "Unexpected recreation count from \(phase.rawValue)")
+        }
+    }
+
     func testChangedAssetOrFavoriteCountStopsBeforeLocalErasure() async throws {
         let fixture = fixture()
         _ = try await fixture.coordinator.begin(containers: containers(), reclaimableBytes: 42)

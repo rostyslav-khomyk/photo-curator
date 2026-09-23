@@ -678,7 +678,8 @@ inferred from names. Full evidence reanalysis is also wired through the existing
 it preserves metadata and user work instead of causing another PhotoKit scan. Normal rebuild now
 stages a complete shadow generation and presents an active-versus-candidate comparison without
 changing the live workspace. Acceptance remains blocked until Catalog v2 owns the runtime projection
-and the private false-join/false-split benchmark passes.
+and the private false-join/false-split benchmark passes. Automated replay covers every durable reset
+phase; qualification against a real Photos test library remains deliberately manual.
 
 - Add storage reporting, versioned curation rebuild, full evidence reanalysis, and the crash-resumable
   destructive reset described below.

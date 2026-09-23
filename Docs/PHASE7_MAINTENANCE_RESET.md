@@ -29,6 +29,9 @@
   from the current catalog and evidence, then compares Moment, singleton, highlight, large-Moment,
   fragmented-day, and generic-title counts with the active generation. It does not change active
   memberships or external state.
+- Automated replay now covers every durable reset phase: requested, deleting containers, verifying
+  Photos, erasing local data, recreating the catalog, and completed. Each resume reaches completion
+  with exactly one logical local erasure and recreation.
 
 ## Current safety boundary
 
@@ -43,7 +46,5 @@ over an activated generation and the owner-reviewed false-join/false-split bench
 
 - Cut the runtime workspace over to the active Catalog v2 generation, then add benchmark-gated
   candidate acceptance and rollback controls.
-- Test interruption at every durable phase, including app termination between Photos verification
-  and local catalog erasure.
 - Verify on a copied owner catalog and a Photos test library that unrelated same-named containers,
   assets, Favorites, Significant Places, Google authorization, and ordinary preferences survive.

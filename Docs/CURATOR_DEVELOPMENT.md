@@ -56,6 +56,11 @@ no Apply action: the legacy worker can still republish its grouping into Catalog
 may become active until that runtime ownership is removed and the owner-reviewed boundary benchmark
 passes. These maintenance checkpoints did not mutate the live Photos library or owner catalog.
 
+The reset interruption matrix now resumes independently from every persisted phase, including the
+restart boundary after Photos verification, a repeated local erase, a repeated catalog recreation,
+and an already completed operation. All paths complete idempotently with one logical erase and one
+recreation. Live Photos test-library qualification remains intentionally uninvoked.
+
 ## Independent architecture review incorporated (2026-09-21)
 
 - Made SQLite ownership explicit: write transactions are synchronous, nonescaping, and never cross
