@@ -126,12 +126,21 @@ enum MomentContinuity {
 
 struct MomentContinuityStore {
     let root: URL
+    let cache: DerivedCacheStore?
+
+    init(root: URL, cache: DerivedCacheStore? = nil) {
+        self.root = root
+        self.cache = cache ?? (try? DerivedCacheStore(url: DerivedCacheStore.adjacentToLegacyDirectory(root)))
+    }
+
     private func file(_ pair: MomentContinuityPair) -> URL { root.appendingPathComponent(pair.id + ".json") }
     func load(_ pair: MomentContinuityPair) throws -> MomentContinuityRecord? {
         let url = file(pair)
-        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
-        guard (try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= 64 * 1024 else { return nil }
-        guard let record = try? JSONDecoder().decode(MomentContinuityRecord.self, from: Data(contentsOf: url)),
+        let data = cache?.data(namespace: .momentContinuity, key: pair.id, maximumBytes: 64 * 1024, legacyURL: url)
+            ?? ((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { size in
+                size <= 64 * 1024 ? try? Data(contentsOf: url) : nil
+            })
+        guard let data, let record = try? JSONDecoder().decode(MomentContinuityRecord.self, from: data),
               record.fingerprint == (try MomentContinuity.fingerprint(pair)), record.matches.count <= 6,
               Set(record.matches.map(\.earlier)).count == record.matches.count,
               Set(record.matches.map(\.later)).count == record.matches.count,
@@ -151,12 +160,15 @@ struct MomentContinuityStore {
                   && pair.later.photos.contains { $0.id == edge.later }
                   && edge.distance.isFinite && (0...EvidenceGrouping.defaultCutoff).contains(edge.distance) }),
               record.boundaryEstimate.map({ $0.probability.isFinite && (0...1).contains($0.probability) }) ?? true else { throw PublicationFailure.invalidRequest }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let lock = try PublicationJournalLock(journal: file(pair)); defer { withExtendedLifetime(lock) {} }
         let data = try JSONEncoder().encode(record)
         guard data.count <= 64 * 1024 else { throw PublicationFailure.invalidRequest }
-        try data.write(to: file(pair), options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file(pair).path)
+        if let cache {
+            try cache.set(data, namespace: .momentContinuity, key: pair.id, maximumBytes: 64 * 1024)
+        } else {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try data.write(to: file(pair), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file(pair).path)
+        }
     }
     func apply(_ moments: [PhotoMoment], protected: Set<String>) throws -> [PhotoMoment] {
         var assigned = Set<String>(), merged: [PhotoMoment] = []

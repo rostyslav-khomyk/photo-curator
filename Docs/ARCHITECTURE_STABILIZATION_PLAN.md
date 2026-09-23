@@ -634,6 +634,11 @@ and packaged-app Instruments qualification remain open.
 
 ### Phase 5: Cache and disk normalization, 3-5 days
 
+Implementation and automated migration coverage are tracked in
+[`PHASE5_CACHE_AND_DISK.md`](PHASE5_CACHE_AND_DISK.md). The shared Caches SQLite store, lazy
+legacy fallback, bounded utility-priority migration, storage reporting, and low-disk policy pass;
+packaged owner-library file-count and Instruments qualification remain open.
+
 - Consolidate small evidence files into the derived cache database.
 - Move rebuildable data to Caches, add storage reporting, low-disk policy, and bounded maintenance.
 - Exit gate: file count and write amplification fall materially, with no reanalysis loop after relaunch.

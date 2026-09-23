@@ -611,6 +611,7 @@ struct CuratorSettingsView: View {
     @ObservedObject private var meaningfulPlaces = MeaningfulPlacesStore.shared
     @State private var addingPlace = false
     @State private var editingPlace: MeaningfulPlace?
+    @State private var storageSummary = "Calculating local storage…"
 
     var body: some View {
         Form {
@@ -694,8 +695,25 @@ struct CuratorSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section("Local Storage") {
+                Text(storageSummary)
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Refresh Storage Summary") {
+                    Task { storageSummary = await Task.detached(priority: .utility) {
+                        StorageMaintenance.storageSummary()
+                    }.value }
+                }
+                Text("Rebuildable visual, text, grouping, and caption evidence is kept in the standard macOS Caches folder. Photo Curator pauses new cache writes when free space falls below 2 GB.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Button("Open Diagnostics…") { diagnostics = true }
         }.padding(24).frame(width: 540)
+            .task {
+                storageSummary = await Task.detached(priority: .utility) {
+                    StorageMaintenance.storageSummary()
+                }.value
+            }
             .sheet(isPresented: $addingPlace) {
                 MeaningfulPlaceEditor(store: meaningfulPlaces)
             }

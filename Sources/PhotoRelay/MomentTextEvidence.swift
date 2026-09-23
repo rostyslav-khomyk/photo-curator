@@ -19,19 +19,29 @@ struct PhotoTextEvidence: Codable {
 actor MomentTextEvidenceStore {
     static let engine = "vision-ocr-accurate-v1-\(ProcessInfo.processInfo.operatingSystemVersionString)"
     let directory: URL
+    private let cache: DerivedCacheStore?
 
-    init(directory: URL) { self.directory = directory }
+    init(directory: URL, cache: DerivedCacheStore? = nil) {
+        self.directory = directory
+        self.cache = cache ?? (try? DerivedCacheStore(url: DerivedCacheStore.adjacentToLegacyDirectory(directory)))
+    }
+
+    static func cacheKey(_ id: String) -> String {
+        SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
 
     private func url(_ id: String) -> URL {
-        let key = SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined()
-        return directory.appendingPathComponent(key + ".json")
+        directory.appendingPathComponent(Self.cacheKey(id) + ".json")
     }
 
     func cached(_ photo: IndexedPhoto) -> PhotoTextEvidence? {
         let file = url(photo.id)
-        guard let size = try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize,
-              size <= 128 * 1024,
-              let data = try? Data(contentsOf: file),
+        let data = cache?.data(namespace: .textEvidence, key: Self.cacheKey(photo.id),
+                               maximumBytes: 128 * 1024, legacyURL: file)
+            ?? ((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { size in
+                size <= 128 * 1024 ? try? Data(contentsOf: file) : nil
+            })
+        guard let data,
               let value = try? JSONDecoder().decode(PhotoTextEvidence.self, from: data),
               value.assetID == photo.id, value.revision == photo.analysisRevision,
               value.engine == Self.engine else { return nil }
@@ -42,12 +52,16 @@ actor MomentTextEvidenceStore {
         try Task.checkCancellation()
         let value = PhotoTextEvidence(assetID: photo.id, revision: photo.analysisRevision,
                                       engine: Self.engine, lines: Array(lines.prefix(100)))
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
-                                               attributes: [.posixPermissions: 0o700])
         let data = try JSONEncoder().encode(value)
         guard data.count <= 128 * 1024 else { throw NarrativeFailure.invalidMetadata }
-        try data.write(to: url(photo.id), options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url(photo.id).path)
+        if let cache {
+            try cache.set(data, namespace: .textEvidence, key: Self.cacheKey(photo.id), maximumBytes: 128 * 1024)
+        } else {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                                   attributes: [.posixPermissions: 0o700])
+            try data.write(to: url(photo.id), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url(photo.id).path)
+        }
         return value
     }
 
@@ -124,7 +138,7 @@ struct MomentTextEvidenceView: View {
         .task {
             let directory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
                 .appendingPathComponent("Photo Relay/curator/text-evidence")
-            let store = MomentTextEvidenceStore(directory: directory)
+            let store = MomentTextEvidenceStore(directory: directory, cache: try? DerivedCacheStore.production())
             let loader = CuratorThumbnailLoader(provider: PhotoKitThumbnailProvider())
             var failed = 0
             for (index, photo) in moment.photos.enumerated() {

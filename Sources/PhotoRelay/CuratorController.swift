@@ -20,6 +20,7 @@ enum MomentPreparationStep: Equatable {
 
 actor CuratorWorker {
     private let url: URL
+    private let cacheURL: URL
     private var store: CuratorStore?
     private var fetch: PHFetchResult<PHAsset>?
     private var cursor = 0
@@ -43,11 +44,12 @@ actor CuratorWorker {
     private var largeWindowCursor: [String: Int] = [:]
     private var largeWindowRemaining: [String: Int] = [:]
     private var largeWindowScanPending = false
+    private lazy var derivedCache = try? DerivedCacheStore(url: cacheURL)
     private lazy var context = BackgroundMomentContext(root: url.deletingLastPathComponent().appendingPathComponent("background-context"),
-        textDirectory: url.deletingLastPathComponent().appendingPathComponent("text-evidence"))
+        textDirectory: url.deletingLastPathComponent().appendingPathComponent("text-evidence"), cache: derivedCache)
 
     private var textStore: MomentTextEvidenceStore {
-        MomentTextEvidenceStore(directory: url.deletingLastPathComponent().appendingPathComponent("text-evidence"))
+        MomentTextEvidenceStore(directory: url.deletingLastPathComponent().appendingPathComponent("text-evidence"), cache: derivedCache)
     }
 
     private var checkpointStore: PhotoLibraryCheckpointStore {
@@ -131,7 +133,10 @@ actor CuratorWorker {
         if fullScan { scanRemovals.insert(assetID) }
         try database().deletePhotos(ids: [assetID])
     }
-    func maintainStorage() throws { try database().maintain() }
+    func maintainStorage() throws {
+        try database().maintain()
+        try derivedCache?.maintain()
+    }
 
     func indexedPhotoCount() throws -> Int { try database().counts().total }
 
@@ -157,11 +162,11 @@ actor CuratorWorker {
     }
 
     private var automaticStore: AutomaticMomentStore {
-        AutomaticMomentStore(root: url.deletingLastPathComponent().appendingPathComponent("automatic-moments"))
+        AutomaticMomentStore(root: url.deletingLastPathComponent().appendingPathComponent("automatic-moments"), cache: derivedCache)
     }
 
     private var continuityStore: MomentContinuityStore {
-        MomentContinuityStore(root: url.deletingLastPathComponent().appendingPathComponent("event-continuity"))
+        MomentContinuityStore(root: url.deletingLastPathComponent().appendingPathComponent("event-continuity"), cache: derivedCache)
     }
 
     private func continuityProtection(_ moments: [PhotoMoment], protection: MomentGroupingProtection) throws -> Set<String> {
@@ -231,7 +236,7 @@ actor CuratorWorker {
         let remaining = largeWindowRemaining[key, default: windows.count]
         largeWindowRemaining[key] = (remaining == 0 ? windows.count : remaining) - 1
         largeWindowScanPending = largeWindowRemaining[key, default: 0] > 0
-        let checkpoints = LargeMomentWindowStore(root: automaticStore.root)
+        let checkpoints = LargeMomentWindowStore(root: automaticStore.root, cache: derivedCache)
         let generation = metadataGeneration
         var labels: [String: [String]] = [:], text: [String: [PhotoTextLine]] = [:]
         var results: [String: CuratorVisionResult] = [:]
@@ -396,7 +401,10 @@ actor CuratorWorker {
         return nil
     }
 
-    init(url: URL) { self.url = url }
+    init(url: URL, cacheURL: URL? = nil) {
+        self.url = url
+        self.cacheURL = cacheURL ?? url.deletingLastPathComponent().appendingPathComponent("analysis-cache.sqlite3")
+    }
 
     private func database() throws -> CuratorStore {
         if let store { return store }
@@ -805,7 +813,7 @@ final class CuratorController: ObservableObject {
         autoPublishEnabled = CuratorPolicy.automaticPublicationEnabled()
         let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Photo Relay/curator/index.sqlite3")
-        worker = CuratorWorker(url: url)
+        worker = CuratorWorker(url: url, cacheURL: DerivedCacheStore.productionURL())
         catalog = try? CatalogV2Store(url: url.deletingLastPathComponent()
             .appendingPathComponent(CatalogV2Migrator.catalogName))
         if let pilot = CuratorPilot.range() {
@@ -814,7 +822,10 @@ final class CuratorController: ObservableObject {
             period = .custom
         }
         CuratorTelemetry.shared.record(.launch, counts: ["enabled": enabled ? 1 : 0, "boundedPilot": CuratorPilot.range() == nil ? 0 : 1])
-        StorageMaintenance.run()
+        Task.detached(priority: .utility) {
+            StorageMaintenance.run()
+            StorageMaintenance.migrateLegacyEvidence()
+        }
         Task {
             if let catalog {
                 do {

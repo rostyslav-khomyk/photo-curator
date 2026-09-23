@@ -15,10 +15,13 @@ actor BackgroundMomentContext {
     let root: URL
     private let classifier = NarrativeVisualContext()
     private let textStore: MomentTextEvidenceStore
+    private let cache: DerivedCacheStore?
     private var preparing = false
-    init(root: URL, textDirectory: URL? = nil) {
+    init(root: URL, textDirectory: URL? = nil, cache: DerivedCacheStore? = nil) {
         self.root = root
-        self.textStore = MomentTextEvidenceStore(directory: textDirectory ?? root.appendingPathComponent("text-evidence"))
+        self.cache = cache ?? (try? DerivedCacheStore(url: DerivedCacheStore.adjacentToLegacyDirectory(root)))
+        self.textStore = MomentTextEvidenceStore(directory: textDirectory ?? root.appendingPathComponent("text-evidence"),
+                                                 cache: self.cache)
     }
 
     private func key(_ value: String) -> String {
@@ -28,17 +31,28 @@ actor BackgroundMomentContext {
         root.appendingPathComponent("labels-" + key(photo.id + photo.analysisRevision + NarrativeVisualContext.version + ProcessInfo.processInfo.operatingSystemVersionString) + ".json")
     }
     private func read<T: Decodable>(_ type: T.Type, at url: URL) -> T? {
-        guard let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize, size < 128 * 1024,
-              let data = try? Data(contentsOf: url) else { return nil }
+        let namespace: DerivedCacheNamespace = url.lastPathComponent.hasPrefix("labels-") ? .visualLabels : .momentCaptions
+        let key = url.deletingPathExtension().lastPathComponent
+        let data = cache?.data(namespace: namespace, key: key, maximumBytes: 128 * 1024, legacyURL: url)
+            ?? ((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { size in
+                size < 128 * 1024 ? try? Data(contentsOf: url) : nil
+            })
+        guard let data else { return nil }
         return try? JSONDecoder().decode(type, from: data)
     }
     private func write<T: Encodable>(_ value: T, at url: URL) throws {
         try Task.checkCancellation()
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let data = try JSONEncoder().encode(value)
         guard data.count < 128 * 1024 else { throw NarrativeFailure.invalidMetadata }
-        try data.write(to: url, options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        let namespace: DerivedCacheNamespace = url.lastPathComponent.hasPrefix("labels-") ? .visualLabels : .momentCaptions
+        let key = url.deletingPathExtension().lastPathComponent
+        if let cache {
+            try cache.set(data, namespace: namespace, key: key, maximumBytes: 128 * 1024)
+        } else {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try data.write(to: url, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        }
     }
     func hasLabels(_ photo: IndexedPhoto) -> Bool { read([String].self, at: labelsURL(photo)) != nil }
     func cachedLabels(_ photo: IndexedPhoto) -> [String]? { read([String].self, at: labelsURL(photo)) }
@@ -109,7 +123,6 @@ actor BackgroundMomentContext {
         let metadata = MomentNarrativeMetadata(dateLabel: moment.start.formatted(date: .abbreviated, time: .omitted),
             photoCount: photos.count, favoriteCount: moment.favorites, verifiedPlace: place?.friendlyName,
             contextEvidence: evidence, placeRole: place?.meaningfulLabel)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
         let suggestion = try await LocalMomentNarrative(cacheURL: root.appendingPathComponent("caption-choices.json")).suggest(metadata, model: model)
         let narrative = MomentNarrative(version: MomentNarrative.version, headline: suggestion.text.title, deck: nil,
             story: suggestion.text.description, place: place?.friendlyName, date: metadata.dateLabel,

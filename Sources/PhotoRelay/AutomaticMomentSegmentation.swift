@@ -116,21 +116,35 @@ enum AutomaticMomentSegmentation {
 
 struct AutomaticMomentStore {
     let root: URL
+    let cache: DerivedCacheStore?
+    let namespace: DerivedCacheNamespace
+
+    init(root: URL, cache: DerivedCacheStore? = nil,
+         namespace: DerivedCacheNamespace = .automaticMoments) {
+        self.root = root
+        self.cache = cache ?? (try? DerivedCacheStore(url: DerivedCacheStore.adjacentToLegacyDirectory(root)))
+        self.namespace = namespace
+    }
+
     func discard(_ id: String) throws {
         let file = url(id)
-        guard FileManager.default.fileExists(atPath: file.path) else { return }
-        let lock = try PublicationJournalLock(journal: file)
-        defer { withExtendedLifetime(lock) {} }
-        try FileManager.default.removeItem(at: file)
+        if let cache { try cache.remove(namespace: namespace, key: key(id)) }
+        if FileManager.default.fileExists(atPath: file.path) { try FileManager.default.removeItem(at: file) }
+    }
+    private func key(_ id: String) -> String {
+        SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined()
     }
     private func url(_ id: String) -> URL {
-        root.appendingPathComponent(SHA256.hash(data: Data(id.utf8)).map { String(format: "%02x", $0) }.joined() + ".json")
+        root.appendingPathComponent(key(id) + ".json")
     }
     func load(_ id: String) throws -> AutomaticMomentRecord? {
         let file = url(id)
-        guard FileManager.default.fileExists(atPath: file.path) else { return nil }
-        guard (try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0) <= 256 * 1024 else { throw PublicationFailure.corruptJournal }
-        let record = try JSONDecoder().decode(AutomaticMomentRecord.self, from: Data(contentsOf: file))
+        let data = cache?.data(namespace: namespace, key: key(id), maximumBytes: 256 * 1024, legacyURL: file)
+            ?? ((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize).flatMap { size in
+                size <= 256 * 1024 ? try? Data(contentsOf: file) : nil
+            })
+        guard let data else { return nil }
+        let record = try JSONDecoder().decode(AutomaticMomentRecord.self, from: data)
         let members = record.segments.flatMap(\.members)
         guard record.version == 1, !record.segments.isEmpty,
               record.segments.allSatisfy({ !$0.members.isEmpty }),
@@ -147,13 +161,15 @@ struct AutomaticMomentStore {
               Set(members).count == members.count,
               Set(members) == Set(moment.photos.map(\.id)),
               record.fingerprint == (try AutomaticMomentSegmentation.fingerprint(moment)) else { throw PublicationFailure.invalidRequest }
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
-        let lock = try PublicationJournalLock(journal: url(moment.id))
-        defer { withExtendedLifetime(lock) {} }
         let data = try JSONEncoder().encode(record)
         guard data.count <= 256 * 1024 else { throw PublicationFailure.invalidRequest }
-        try data.write(to: url(moment.id), options: .atomic)
-        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url(moment.id).path)
+        if let cache {
+            try cache.set(data, namespace: namespace, key: key(moment.id), maximumBytes: 256 * 1024)
+        } else {
+            try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try data.write(to: url(moment.id), options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url(moment.id).path)
+        }
     }
     func apply(_ moment: PhotoMoment, protected: Set<String>) throws -> [PhotoMoment] {
         var pending = moment
@@ -163,7 +179,7 @@ struct AutomaticMomentStore {
         }
         if moment.photos.count > 512,
            try load(moment.id)?.segments.contains(where: { protected.contains($0.id) }) != true {
-            return [try LargeMomentWindowStore(root: root).project(moment)]
+            return [try LargeMomentWindowStore(root: root, cache: cache).project(moment)]
         }
         pending.groupingState = moment.photos.count > 512 ? .conservative : .preparing
         pending.groupingReason = moment.photos.count > 512

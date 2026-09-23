@@ -11,11 +11,12 @@ final class MomentTextEvidenceTests: XCTestCase {
     func testCacheSurvivesReopeningAndRejectsEdits() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let store = MomentTextEvidenceStore(directory: directory)
+        let cache = try DerivedCacheStore(url: directory.appendingPathComponent("analysis-cache.sqlite3"))
+        let store = MomentTextEvidenceStore(directory: directory, cache: cache)
         let lines = [PhotoTextLine(text: "Madurodam", confidence: 0.95)]
         let saved = try await store.save(lines, for: photo())
         XCTAssertEqual(saved.assetID, photo().id)
-        let reopened = MomentTextEvidenceStore(directory: directory)
+        let reopened = MomentTextEvidenceStore(directory: directory, cache: try DerivedCacheStore(url: cache.url))
         let cached = await reopened.cached(photo())
         XCTAssertEqual(cached?.lines, lines)
         let edited = await reopened.cached(photo(2))
@@ -25,12 +26,13 @@ final class MomentTextEvidenceTests: XCTestCase {
     func testEmptySuccessIsCachedAndCorruptionIsMiss() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let store = MomentTextEvidenceStore(directory: directory)
+        let cache = try DerivedCacheStore(url: directory.appendingPathComponent("analysis-cache.sqlite3"))
+        let store = MomentTextEvidenceStore(directory: directory, cache: cache)
         _ = try await store.save([], for: photo())
         let value = await store.cached(photo())
         XCTAssertEqual(value?.lines, [])
-        let file = try XCTUnwrap(FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil).first)
-        try Data("bad cache".utf8).write(to: file)
+        try cache.set(Data("bad cache".utf8), namespace: .textEvidence,
+                      key: MomentTextEvidenceStore.cacheKey(photo().id))
         let corrupt = await store.cached(photo())
         XCTAssertNil(corrupt)
     }
@@ -53,7 +55,8 @@ final class MomentTextEvidenceTests: XCTestCase {
         }
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
-        let store = MomentTextEvidenceStore(directory: directory)
+        let store = MomentTextEvidenceStore(directory: directory,
+                                            cache: try DerivedCacheStore(url: directory.appendingPathComponent("analysis-cache.sqlite3")))
         let files = try FileManager.default.contentsOfDirectory(at: URL(fileURLWithPath: path), includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "jpeg" && !$0.lastPathComponent.contains(" (1)") }
         XCTAssertEqual(files.count, 30)

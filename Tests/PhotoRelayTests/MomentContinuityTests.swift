@@ -125,7 +125,8 @@ final class MomentContinuityTests: XCTestCase {
         let base = MomentGrouping.group(pair.photos)
         let actualPair = MomentContinuityPair(earlier: base[1], later: base[0])
         try store.save(proposal(actualPair), pair: actualPair)
-        let automatic = AutomaticMomentStore(root: root.appendingPathComponent("automatic-moments"))
+        let automatic = AutomaticMomentStore(root: root.appendingPathComponent("automatic-moments"),
+            cache: try DerivedCacheStore(url: root.appendingPathComponent("analysis-cache.sqlite3")))
         try automatic.save(.init(fingerprint: AutomaticMomentSegmentation.fingerprint(base[1]), segments: [
             .init(id: "named-child", members: base[1].photos.map(\.id), reason: "test")]), for: base[1])
         let worker = CuratorWorker(url: root.appendingPathComponent("index.sqlite3"))

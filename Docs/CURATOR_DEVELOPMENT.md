@@ -2043,3 +2043,21 @@ Photos access, network research or private-photo inspection in this subchunk.
   production build passes complete concurrency checking with zero warnings.
 - Copied owner-library forced termination and packaged-app Instruments qualification remain open.
   No catalog wipe, Photos mutation, deployment, or indexing restart occurred.
+
+## Architecture stabilization Phase 5 cache and disk normalization (2026-09-23)
+
+- Consolidated OCR, visual-label, caption, segmentation, large-window, and continuity evidence into
+  one WAL-mode `analysis-cache.sqlite3` under the standard macOS Caches directory.
+- Added per-record legacy fallback: a JSON record remains authoritative until its SQLite commit
+  succeeds, after which the JSON and matching sidecar lock are removed. Relaunch therefore reuses
+  evidence instead of scheduling a full reanalysis.
+- Replaced launch-time recursive evidence-directory scans with utility-priority migration bounded to
+  500 records per transaction and 10,000 records per launch. New evidence writes go directly to the
+  database while migration resumes across launches.
+- Added a 2 GB derived-payload budget, one-year expiry in bounded batches, passive WAL maintenance,
+  and a 2 GB free-space floor for new cache writes. Settings now reports cache records, database size,
+  free disk space, and the low-disk state.
+- The full native suite passes 218 tests with 12 opt-in skips and zero failures. The production build
+  passes complete strict-concurrency checking with warnings as errors. Packaged owner-library
+  migration/file-count and Instruments qualification remain open.
+- No catalog wipe, Photos mutation, deployment, or indexing restart occurred.

@@ -214,7 +214,8 @@ struct GroupingSuggestionsView: View {
                 catch { editError = "Saved groups could not be read. They have not been replaced. Close this review and check storage before continuing."; return }
                 let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
                     .appendingPathComponent("Photo Relay/curator")
-                let store = MomentTextEvidenceStore(directory: root.appendingPathComponent("text-evidence"))
+                let store = MomentTextEvidenceStore(directory: root.appendingPathComponent("text-evidence"),
+                                                    cache: try? DerivedCacheStore.production())
                 let loader = CuratorThumbnailLoader(provider: PhotoKitThumbnailProvider())
                 var failed = 0
                 var textFailed = 0

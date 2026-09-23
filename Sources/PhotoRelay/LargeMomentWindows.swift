@@ -34,7 +34,17 @@ enum LargeMomentWindows {
 /// Reuses validated, atomic records in a separate namespace, never the catalog store.
 struct LargeMomentWindowStore {
     let root: URL
-    private var records: AutomaticMomentStore { AutomaticMomentStore(root: root.appendingPathComponent("internal-windows")) }
+    let cache: DerivedCacheStore?
+
+    init(root: URL, cache: DerivedCacheStore? = nil) {
+        self.root = root
+        self.cache = cache ?? (try? DerivedCacheStore(url: DerivedCacheStore.adjacentToLegacyDirectory(root)))
+    }
+
+    private var records: AutomaticMomentStore {
+        AutomaticMomentStore(root: root.appendingPathComponent("internal-windows"), cache: cache,
+                             namespace: .largeMomentWindows)
+    }
 
     func save(_ record: AutomaticMomentRecord, for window: LargeMomentWindows.Window) throws {
         try records.save(record, for: window.moment)

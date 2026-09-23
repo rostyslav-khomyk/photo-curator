@@ -271,7 +271,7 @@ struct MomentNarrativeSheet: View {
             .appendingPathComponent("Photo Relay/curator/narrative-cache.json")
         let textDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Photo Relay/curator/text-evidence")
-        let textStore = MomentTextEvidenceStore(directory: textDir)
+        let textStore = MomentTextEvidenceStore(directory: textDir, cache: try? DerivedCacheStore.production())
 
         var metadata = MomentNarrativeMetadata(
             dateLabel: moment.start.formatted(date: .abbreviated, time: .omitted),
