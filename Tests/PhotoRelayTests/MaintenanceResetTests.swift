@@ -32,6 +32,12 @@ private actor ResetLocalFake: CuratorResetLocalData {
 
 @MainActor
 final class MaintenanceResetTests: XCTestCase {
+    func testManagedFolderRejectsAnyUnownedChild() {
+        let managed = Set(["root", "year", "album"])
+        XCTAssertTrue(containsOnlyManagedContainers(Set(["year", "album"]), managedIDs: managed))
+        XCTAssertFalse(containsOnlyManagedContainers(Set(["album", "personal"]), managedIDs: managed))
+    }
+
     func testResetIsDurableIdempotentAndPreservesPhotoCounts() async throws {
         let fixture = fixture()
         let operation = try await fixture.coordinator.begin(containers: containers(), reclaimableBytes: 42)
@@ -75,6 +81,51 @@ final class MaintenanceResetTests: XCTestCase {
         let localCounts = await fixture.local.counts()
         XCTAssertEqual(localCounts.0, 0)
         XCTAssertEqual(localCounts.1, 0)
+    }
+
+    func testPhotosOnlyRunStopsAtSafeRestartBoundary() async throws {
+        let fixture = fixture()
+        _ = try await fixture.coordinator.begin(containers: containers(), reclaimableBytes: 42)
+
+        let operation = try await fixture.coordinator.resumeThroughPhotos()
+
+        XCTAssertEqual(operation.phase, .erasingLocalData)
+        let localCounts = await fixture.local.counts()
+        XCTAssertEqual(localCounts.0, 0)
+        XCTAssertEqual(localCounts.1, 0)
+    }
+
+    func testLaunchBootstrapErasesGeneratedStateButPreservesPreferences() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let suite = UUID().uuidString
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let support = root.appendingPathComponent("support")
+        let cache = root.appendingPathComponent("cache")
+        try FileManager.default.createDirectory(at: support, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        try Data([1]).write(to: support.appendingPathComponent("old"))
+        try Data([2]).write(to: cache.appendingPathComponent("old"))
+        defaults.set(["moment": "Mine"], forKey: "curator.momentTitles.v1")
+        defaults.set(["Home"], forKey: "curator.meaningfulPlaces.v1")
+        defaults.set(1.25, forKey: "curator.fontSizeScale")
+        let journal = CuratorResetJournal(url: root.appendingPathComponent("journal/reset.json"))
+        try journal.save(CuratorResetOperation(id: UUID(), phase: .erasingLocalData,
+            containers: [], before: PhotoLibraryAssetCounts(assets: 1, favorites: 1),
+            reclaimableBytes: 2, startedAt: Date(), updatedAt: Date()))
+        let local = CuratorLocalDataReset(supportRoot: support, cacheRoot: cache, defaults: defaults)
+
+        let completed = try CuratorResetBootstrap.finishLocalResetIfNeeded(
+            journal: journal, localData: local)
+
+        XCTAssertEqual(completed?.phase, .completed)
+        XCTAssertNil(defaults.object(forKey: "curator.momentTitles.v1"))
+        XCTAssertNotNil(defaults.object(forKey: "curator.meaningfulPlaces.v1"))
+        XCTAssertEqual(defaults.double(forKey: "curator.fontSizeScale"), 1.25)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: support.appendingPathComponent("index.sqlite3").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: support.appendingPathComponent(CatalogV2Migrator.catalogName).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: cache.appendingPathComponent("old").path))
     }
 
     private func fixture() -> (coordinator: CuratorResetCoordinator, photos: ResetPhotosFake,

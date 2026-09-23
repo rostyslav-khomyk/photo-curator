@@ -717,6 +717,7 @@ final class CuratorController: ObservableObject {
     @Published var customEnd = Date()
     @Published private(set) var syncBusy = false
     @Published private(set) var diagnosticRunning = false
+    @Published private(set) var maintenanceBusy = false
     @Published private(set) var diagnosticReport = "Tests up to 12 photos in the selected period. No downloads, uploads, or album changes."
     private var diagnosticTask: Task<Void, Never>?
     private var syncSubscription: AnyCancellable?
@@ -751,6 +752,7 @@ final class CuratorController: ObservableObject {
     private var contextStep = 0
     private var lastWaitLog = Date.distantPast
     private var systemSleeping = false
+    private var maintenancePaused = false
 
     @Published var autoPublishEnabled: Bool
     private var publishingMomentIDs: Set<String> = []
@@ -811,6 +813,11 @@ final class CuratorController: ObservableObject {
             UserDefaults.standard.set(true, forKey: "curatorPilotLifted")
         }
         enabled = UserDefaults.standard.bool(forKey: "curatorEnabled")
+        if let operation = try? CuratorResetJournal.production().load(), operation.phase != .completed {
+            enabled = false
+            maintenancePaused = true
+            activity = "Resuming the requested Photo Curator reset…"
+        }
         autoPublishEnabled = CuratorPolicy.automaticPublicationEnabled()
         let url = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Photo Relay/curator/index.sqlite3")
@@ -828,6 +835,7 @@ final class CuratorController: ObservableObject {
             StorageMaintenance.migrateLegacyEvidence()
         }
         Task {
+            guard !maintenancePaused else { return }
             if let catalog {
                 do {
                     let input = try await worker.catalogMigrationInput()
@@ -876,7 +884,10 @@ final class CuratorController: ObservableObject {
         }
         startScheduler()
         observePolicyChanges()
-        Task { await refreshOverview(reusingVisibleMoments: true) }
+        if !maintenancePaused { Task { await refreshOverview(reusingVisibleMoments: true) } }
+        if maintenancePaused {
+            Task { await resumeInterruptedResetIfNeeded() }
+        }
         if UserDefaults.standard.bool(forKey: "curatorPrioritizePilotOnLaunch") {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
@@ -891,7 +902,97 @@ final class CuratorController: ObservableObject {
         wakeScheduler(.policyChanged)
     }
 
+    func nuclearResetPreview() async throws -> CuratorResetPreview {
+        guard !syncBusy else {
+            throw NSError(domain: "PhotoCurator.Reset", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Wait for the current Google operation to finish before resetting."])
+        }
+        guard let catalog else { throw PublicationFailure.catalogUnavailable }
+        let containers = try await catalog.managedPhotoContainers()
+        let publications = try await catalog.publicationCount()
+        let local = CuratorLocalDataReset.production()
+        let bytes = await Task.detached(priority: .utility) { local.reclaimableBytes() }.value
+        let library = try await PhotoKitAlbumAdapter.shared.assetCounts()
+        return CuratorResetPreview(containers: containers, publishedAlbums: publications,
+            reclaimableBytes: bytes, library: library)
+    }
+
+    func performNuclearReset(_ preview: CuratorResetPreview) async throws {
+        guard !maintenanceBusy, !syncBusy else { throw PublicationFailure.conflictingOperation }
+        let current = try await nuclearResetPreview()
+        guard current.containers == preview.containers,
+              current.publishedAlbums == preview.publishedAlbums,
+              current.library == preview.library else {
+            throw NSError(domain: "PhotoCurator.Reset", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "The library changed after the reset summary was prepared. Review the updated summary and confirm again."])
+        }
+        maintenanceBusy = true
+        maintenancePaused = true
+        activity = "Pausing Photo Curator safely…"
+        analysisTask?.cancel()
+        metadataTask?.cancel()
+        diagnosticTask?.cancel()
+        let analysis = analysisTask
+        let metadata = metadataTask
+        let diagnostic = diagnosticTask
+        await analysis?.value
+        await metadata?.value
+        await diagnostic?.value
+        await library.stop()
+
+        do {
+            let local = CuratorLocalDataReset.production()
+            let coordinator = CuratorResetCoordinator(photos: PhotoKitAlbumAdapter.shared,
+                localData: local, journal: .production())
+            _ = try await coordinator.begin(containers: preview.containers,
+                reclaimableBytes: preview.reclaimableBytes)
+            let operation = try await coordinator.resumeThroughPhotos()
+            guard operation.phase == .erasingLocalData else {
+                throw PublicationFailure.verificationPending
+            }
+            activity = "Reset verified. Reopen Photo Curator to rebuild from zero."
+            await scheduler.stop()
+            schedulerTask?.cancel()
+            NSApp.terminate(nil)
+        } catch {
+            maintenancePaused = false
+            maintenanceBusy = false
+            wakeScheduler(.policyChanged)
+            throw error
+        }
+    }
+
+    private func resumeInterruptedResetIfNeeded() async {
+        guard let operation = try? CuratorResetJournal.production().load(), operation.phase != .completed else {
+            maintenancePaused = false
+            return
+        }
+        guard operation.phase == .requested || operation.phase == .deletingContainers ||
+                operation.phase == .verifyingPhotos else {
+            maintenanceBusy = false
+            errorMessage = "Photo Curator could not recreate its local catalog. Your Photos library was left intact; reopen Settings after resolving the storage error."
+            return
+        }
+        maintenanceBusy = true
+        do {
+            let local = CuratorLocalDataReset.production()
+            let coordinator = CuratorResetCoordinator(photos: PhotoKitAlbumAdapter.shared,
+                localData: local, journal: .production())
+            let updated = try await coordinator.resumeThroughPhotos()
+            if updated.phase == .erasingLocalData || updated.phase == .recreatingCatalog {
+                activity = "Reset verified. Reopen Photo Curator to rebuild from zero."
+                await scheduler.stop()
+                schedulerTask?.cancel()
+                NSApp.terminate(nil)
+            }
+        } catch {
+            maintenanceBusy = false
+            errorMessage = "Photo Curator could not resume the reset: \(error.localizedDescription)"
+        }
+    }
+
     func setFavorite(_ favorite: Bool, photoID: String) async throws {
+        guard !maintenancePaused else { throw PublicationFailure.conflictingOperation }
         let operation = UUID()
         await library.expect(operation: operation, assetIDs: [photoID], effect: .update)
         do {
@@ -907,6 +1008,7 @@ final class CuratorController: ObservableObject {
     }
 
     func moveToRecentlyDeleted(photoID: String) async throws {
+        guard !maintenancePaused else { throw PublicationFailure.conflictingOperation }
         let operation = UUID()
         await library.expect(operation: operation, assetIDs: [photoID], effect: .removal)
         do {
@@ -923,6 +1025,7 @@ final class CuratorController: ObservableObject {
 
     func mergeMoments(_ source: [PhotoMoment], title: String, decisions: MomentReviewDecisions,
                       expectedRevision: Int) async throws {
+        guard !maintenancePaused else { throw PublicationFailure.conflictingOperation }
         let sourceText = Dictionary(uniqueKeysWithValues: source.map { moment in
             (moment.id, {
                 let value = MomentPresentation.narrative(moment, customTitle: decisions.titles[moment.id],
@@ -1210,6 +1313,7 @@ final class CuratorController: ObservableObject {
     }
 
     private func scheduleWork(for events: Set<CurationScheduler.Event>) async {
+        guard !maintenancePaused else { return }
         guard !diagnosticRunning else { return }
         guard startupStateLoaded else { return }
         guard PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized else {
@@ -1538,6 +1642,7 @@ final class CuratorController: ObservableObject {
     }
 
     func publishToPhotos(moment: PhotoMoment, decisions: MomentReviewDecisions) async throws -> CuratedAlbumReceipt {
+        guard !maintenancePaused else { throw PublicationFailure.conflictingOperation }
         let interval = CuratorPerformance.begin("Photos publication")
         defer { CuratorPerformance.end("Photos publication", interval) }
         let place = await CuratorGeocodingService.shared.place(for: moment)

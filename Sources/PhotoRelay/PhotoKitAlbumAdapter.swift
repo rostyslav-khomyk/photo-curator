@@ -241,8 +241,19 @@ extension PhotoKitAlbumAdapter: CuratorResetPhotos {
     }
 
     func verifyOwnership(of containers: [ManagedPhotoContainer]) async throws {
+        let knownIDs = Set(containers.map(\.id))
         for container in containers where containerExists(container) {
             guard isInRecordedHierarchy(container) else { throw PublicationFailure.destinationConflict }
+            if container.kind != .album {
+                let list = PHCollectionList.fetchCollectionLists(
+                    withLocalIdentifiers: [container.id], options: nil).firstObject
+                let children = list.map { PHCollection.fetchCollections(in: $0, options: nil) }
+                var childIDs = Set<String>()
+                children?.enumerateObjects { child, _, _ in childIDs.insert(child.localIdentifier) }
+                guard containsOnlyManagedContainers(childIDs, managedIDs: knownIDs) else {
+                    throw PublicationFailure.destinationConflict
+                }
+            }
         }
     }
 

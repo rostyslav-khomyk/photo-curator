@@ -677,6 +677,8 @@ struct CuratorSettingsView: View {
     @State private var addingPlace = false
     @State private var editingPlace: MeaningfulPlace?
     @State private var storageSummary = "Calculating local storage…"
+    @State private var resetPreview: CuratorResetPreview?
+    @State private var loadingResetPreview = false
 
     var body: some View {
         Form {
@@ -772,8 +774,32 @@ struct CuratorSettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section("Maintenance") {
+                Text("Rebuild and reanalysis controls will appear here after their candidate comparison and time-estimate gates pass.")
+                    .font(.caption).foregroundStyle(.secondary)
+                Button("Reset Photo Curator…", role: .destructive) {
+                    loadingResetPreview = true
+                    Task {
+                        do { resetPreview = try await curator.nuclearResetPreview() }
+                        catch { curator.errorMessage = error.localizedDescription }
+                        loadingResetPreview = false
+                    }
+                }
+                .disabled(loadingResetPreview || curator.maintenanceBusy || curator.syncBusy)
+                if loadingResetPreview { ProgressView().controlSize(.small) }
+                Text("Removes local curation and only Photos containers whose creation Photo Curator can prove. Original photos, videos, Favorites, Google Photos, Significant Places, and display preferences are preserved.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Button("Open Diagnostics…") { diagnostics = true }
         }.padding(24).frame(width: 540)
+            .alert("Photo Curator", isPresented: Binding(
+                get: { curator.errorMessage != nil },
+                set: { if !$0 { curator.errorMessage = nil } })) {
+                Button("OK") { curator.errorMessage = nil }
+            } message: {
+                Text(curator.errorMessage ?? "")
+            }
             .task {
                 storageSummary = await Task.detached(priority: .utility) {
                     StorageMaintenance.storageSummary()
@@ -791,6 +817,63 @@ struct CuratorSettingsView: View {
                     CuratorDiagnosticsView(curator: curator)
                 }.frame(minWidth: 820, minHeight: 600)
             }
+            .sheet(item: $resetPreview) { preview in
+                NuclearResetConfirmationView(preview: preview, curator: curator) {
+                    resetPreview = nil
+                }
+            }
+    }
+}
+
+private struct NuclearResetConfirmationView: View {
+    let preview: CuratorResetPreview
+    @ObservedObject var curator: CuratorController
+    let close: () -> Void
+    @State private var understandsLoss = false
+
+    private var reclaimed: String {
+        ByteCountFormatter.string(fromByteCount: preview.reclaimableBytes, countStyle: .file)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Reset Photo Curator").font(.title2.bold())
+            Text("This removes your local Moment titles, selections, merges, review decisions, analysis, and publication history. It cannot be undone.")
+            GroupBox("Verified effects") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Delete \(preview.verifiedAlbums) proven Photo Curator albums and \(preview.verifiedFolders) proven folders")
+                    Text("Reclaim approximately \(reclaimed) of generated local data")
+                    Text("Preserve \(preview.library.assets.formatted()) Photos assets and \(preview.library.favorites.formatted()) Favorites")
+                    if preview.unverifiedAlbums > 0 {
+                        Text("Leave \(preview.unverifiedAlbums) legacy Photos albums untouched because their creation ownership cannot be proven")
+                            .foregroundStyle(.orange)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Text("The app will quit after Photos confirms the container changes. Reopen Photo Curator to complete the clean rebuild.")
+                .font(.callout).foregroundStyle(.secondary)
+            Toggle("I understand that my Photo Curator edits and curation will be permanently removed", isOn: $understandsLoss)
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel, action: close)
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(curator.maintenanceBusy)
+                Button("Reset Photo Curator", role: .destructive) {
+                    Task {
+                        do { try await curator.performNuclearReset(preview) }
+                        catch {
+                            curator.errorMessage = error.localizedDescription
+                            close()
+                        }
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(!understandsLoss || curator.maintenanceBusy)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+        .interactiveDismissDisabled(curator.maintenanceBusy)
     }
 }
 

@@ -20,9 +20,18 @@ struct PhotoRelayApp: App {
 
     init() {
         CuratorLaunchPerformance.shared.start()
+        let bootstrapError: String?
+        do {
+            _ = try CuratorResetBootstrap.finishLocalResetIfNeeded()
+            bootstrapError = nil
+        } catch {
+            bootstrapError = "Photo Curator could not finish its reset safely: \(error.localizedDescription)"
+        }
         let model = PhotoRelayViewModel(backend: BackendController.shared)
+        let curator = CuratorController(model: model)
+        if let bootstrapError { curator.errorMessage = bootstrapError }
         _model = StateObject(wrappedValue: model)
-        _curator = StateObject(wrappedValue: CuratorController(model: model))
+        _curator = StateObject(wrappedValue: curator)
     }
 
     var body: some Scene {

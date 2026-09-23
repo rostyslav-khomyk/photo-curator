@@ -436,6 +436,8 @@ actor CatalogV2Store {
         return result
     }
 
+    func publicationCount() throws -> Int { try scalar("SELECT COUNT(*) FROM publications") }
+
     private func recordManagedContainers(_ receipt: CuratedAlbumReceipt) throws {
         let created = Set(receipt.createdContainerIDs)
         guard !created.isEmpty else { return }

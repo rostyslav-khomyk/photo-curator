@@ -40,6 +40,14 @@ Favorite totals, and only then permit local erasure and catalog recreation. The 
 action remains disabled until worker quiescence, safe relaunch/recreation, and copied-library
 interruption tests are complete.
 
+The operational reset checkpoint adds an exact confirmation sheet and restart boundary. It reports
+verified containers, unverified legacy albums, reclaimable local storage, Photos assets, and Favorites,
+then revalidates that snapshot before proceeding. Active curator tasks are canceled and awaited and
+publication is blocked. After identifier-verified PhotoKit deletion and unchanged asset/Favorite
+counts, the app quits. Its next launch removes generated local state and Curator logs and recreates
+empty legacy and Catalog v2 schemas before constructing controllers. Significant Places, Google state,
+and ordinary preferences are preserved. Automated tests cover this boundary; it was not run live.
+
 ## Independent architecture review incorporated (2026-09-21)
 
 - Made SQLite ownership explicit: write transactions are synchronous, nonescaping, and never cross

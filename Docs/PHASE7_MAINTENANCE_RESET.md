@@ -14,19 +14,23 @@
   container deletion, Photos verification, local erasure, catalog recreation, and completion.
 - Reset replay is idempotent. Photos asset and Favorite counts must match the pre-reset snapshot
   before local data can be erased.
+- Settings prepares an exact reset summary, revalidates it at confirmation, pauses curator work,
+  waits for metadata/analysis tasks, blocks publication, and runs only the Photos-facing phases.
+- Local erasure uses a restart boundary. The app quits after Photos verification; on the next launch
+  generated state and Curator logs are removed and empty SQLite schemas are created before any
+  controller opens them. The reset receipt remains outside the erased directories.
 
 ## Current safety boundary
 
-The destructive Settings action is not enabled yet. Existing legacy albums have no creation proof
-and therefore cannot be deleted automatically. They remain visible for manual review. The next
-checkpoint must quiesce all owners, finish local erasure/recreation at launch without open SQLite
-handles, resume an interrupted journal, and expose exact counts in the confirmation sheet.
+The destructive Settings action is enabled, but has not been exercised against the owner's live
+library. Existing legacy albums have no creation proof and therefore cannot be deleted automatically;
+the confirmation calls out that count and leaves those albums for manual review. Reset requires the
+user to reopen the app after its safe quit boundary.
 
 ## Remaining gate
 
 - Add `Rebuild Curation with Latest Algorithm...` and comparison acceptance.
 - Add full evidence invalidation with time and disk estimates.
-- Add the nuclear confirmation and safe relaunch path.
 - Test interruption at every durable phase, including app termination between Photos verification
   and local catalog erasure.
 - Verify on a copied owner catalog and a Photos test library that unrelated same-named containers,
