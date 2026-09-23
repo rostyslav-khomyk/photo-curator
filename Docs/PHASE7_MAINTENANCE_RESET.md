@@ -19,6 +19,11 @@
 - Local erasure uses a restart boundary. The app quits after Photos verification; on the next launch
   generated state and Curator logs are removed and empty SQLite schemas are created before any
   controller opens them. The reset receipt remains outside the erased directories.
+- `Reanalyze Entire Library...` reports the indexed-photo count, current cache size, and a rough
+  utility-priority duration before confirmation. It requeues every Vision job in one transaction,
+  clears rebuildable derived evidence, and resumes the event-driven scheduler without forcing a
+  PhotoKit metadata rescan. Titles, choices, merges, publications, Significant Places, Favorites,
+  and Google state remain intact.
 
 ## Current safety boundary
 
@@ -30,7 +35,6 @@ user to reopen the app after its safe quit boundary.
 ## Remaining gate
 
 - Add `Rebuild Curation with Latest Algorithm...` and comparison acceptance.
-- Add full evidence invalidation with time and disk estimates.
 - Test interruption at every durable phase, including app termination between Photos verification
   and local catalog erasure.
 - Verify on a copied owner catalog and a Photos test library that unrelated same-named containers,

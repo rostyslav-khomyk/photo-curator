@@ -678,6 +678,7 @@ struct CuratorSettingsView: View {
     @State private var editingPlace: MeaningfulPlace?
     @State private var storageSummary = "Calculating local storage…"
     @State private var resetPreview: CuratorResetPreview?
+    @State private var reanalysisPreview: CuratorReanalysisPreview?
     @State private var loadingResetPreview = false
 
     var body: some View {
@@ -775,8 +776,17 @@ struct CuratorSettingsView: View {
             }
 
             Section("Maintenance") {
-                Text("Rebuild and reanalysis controls will appear here after their candidate comparison and time-estimate gates pass.")
+                Text("A curation rebuild will appear here after its candidate comparison gate passes.")
                     .font(.caption).foregroundStyle(.secondary)
+                Button("Reanalyze Entire Library…") {
+                    loadingResetPreview = true
+                    Task {
+                        do { reanalysisPreview = try await curator.entireLibraryReanalysisPreview() }
+                        catch { curator.errorMessage = error.localizedDescription }
+                        loadingResetPreview = false
+                    }
+                }
+                .disabled(loadingResetPreview || curator.maintenanceBusy || curator.syncBusy)
                 Button("Reset Photo Curator…", role: .destructive) {
                     loadingResetPreview = true
                     Task {
@@ -822,6 +832,66 @@ struct CuratorSettingsView: View {
                     resetPreview = nil
                 }
             }
+            .sheet(item: $reanalysisPreview) { preview in
+                ReanalysisConfirmationView(preview: preview, curator: curator) {
+                    reanalysisPreview = nil
+                }
+            }
+    }
+}
+
+private struct ReanalysisConfirmationView: View {
+    let preview: CuratorReanalysisPreview
+    @ObservedObject var curator: CuratorController
+    let close: () -> Void
+
+    private var cacheSize: String {
+        ByteCountFormatter.string(fromByteCount: preview.currentCacheBytes, countStyle: .file)
+    }
+
+    private var duration: String {
+        let formatter = DateComponentsFormatter()
+        formatter.allowedUnits = [.day, .hour]
+        formatter.unitsStyle = .full
+        formatter.maximumUnitCount = 2
+        return formatter.string(from: preview.estimatedSeconds) ?? "several hours"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Reanalyze Entire Library").font(.title2.bold())
+            Text("Photo Curator will discard derived visual, text, grouping, and narrative evidence, then analyze (preview.photos.formatted()) indexed photos again at utility priority.")
+            GroupBox("Estimate") {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Rough processing time: (duration)")
+                    Text("Clear (cacheSize) now; the analysis cache will grow again as work completes")
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Text("Moment titles, manual choices, merges, Significant Places, Photos albums, Favorites, Google uploads, and indexed photo metadata are preserved. The estimate varies with photo availability, Mac load, and thermal conditions.")
+                .font(.callout).foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel", role: .cancel, action: close)
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(curator.maintenanceBusy)
+                Button("Reanalyze") {
+                    Task {
+                        do {
+                            try await curator.reanalyzeEntireLibrary(preview)
+                            close()
+                        } catch {
+                            curator.errorMessage = error.localizedDescription
+                            close()
+                        }
+                    }
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(curator.maintenanceBusy)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+        .interactiveDismissDisabled(curator.maintenanceBusy)
     }
 }
 

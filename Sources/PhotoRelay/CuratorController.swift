@@ -153,6 +153,33 @@ actor CuratorWorker {
         try database().clearVerificationProgress()
     }
 
+    func reanalysisPreview() throws -> CuratorReanalysisPreview {
+        let photos = try database().counts().total
+        let bytes = (try? derivedCache?.stats().fileBytes) ?? 0
+        return CuratorReanalysisPreview(photos: photos, currentCacheBytes: bytes)
+    }
+
+    func reanalyzeEntireLibrary() throws -> Int {
+        let count = try database().requeueAllAnalysis(analyzer: CuratorVisionAnalyzer.version)
+        try derivedCache?.removeAll()
+        try StorageMaintenance.removeLegacyDerivedEvidence(at: url.deletingLastPathComponent())
+        textCandidates = []
+        textCursor = 0
+        textScope = nil
+        textScanStarted = false
+        captionGroups = nil
+        captionScope = nil
+        captionCursor = 0
+        captionRemaining = 0
+        captionSweepChanged = false
+        continuityPairs.removeAll()
+        largeWindowCursor.removeAll()
+        largeWindowRemaining.removeAll()
+        largeWindowScanPending = false
+        metadataGeneration += 1
+        return count
+    }
+
     func prioritizeAnalysis(_ photos: [IndexedPhoto]) throws {
         let db = try database()
         for photo in photos {
@@ -915,6 +942,47 @@ final class CuratorController: ObservableObject {
         let library = try await PhotoKitAlbumAdapter.shared.assetCounts()
         return CuratorResetPreview(containers: containers, publishedAlbums: publications,
             reclaimableBytes: bytes, library: library)
+    }
+
+    func entireLibraryReanalysisPreview() async throws -> CuratorReanalysisPreview {
+        guard !syncBusy, !maintenanceBusy else { throw PublicationFailure.conflictingOperation }
+        return try await worker.reanalysisPreview()
+    }
+
+    func reanalyzeEntireLibrary(_ preview: CuratorReanalysisPreview) async throws {
+        guard !maintenanceBusy, !syncBusy else { throw PublicationFailure.conflictingOperation }
+        guard try await worker.reanalysisPreview().photos == preview.photos else {
+            throw NSError(domain: "PhotoCurator.Reanalysis", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "The indexed library changed after this estimate was prepared. Review the updated estimate and confirm again."])
+        }
+        maintenanceBusy = true
+        maintenancePaused = true
+        activity = "Preparing a fresh local analysis…"
+        analysisTask?.cancel()
+        metadataTask?.cancel()
+        let analysis = analysisTask
+        let metadata = metadataTask
+        await analysis?.value
+        await metadata?.value
+        do {
+            let queued = try await worker.reanalyzeEntireLibrary()
+            analyzedThisSession = 0
+            deferredThisSession = 0
+            contextStep = 0
+            revision += 1
+            metadataReady = indexedCount > 0
+            foregroundActive = false
+            foregroundRange = nil
+            maintenancePaused = false
+            maintenanceBusy = false
+            activity = "Fresh local analysis queued for \(queued.formatted()) photos."
+            wakeScheduler(.userRequested)
+        } catch {
+            maintenancePaused = false
+            maintenanceBusy = false
+            wakeScheduler(.policyChanged)
+            throw error
+        }
     }
 
     func performNuclearReset(_ preview: CuratorResetPreview) async throws {

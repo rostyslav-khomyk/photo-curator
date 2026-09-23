@@ -674,7 +674,8 @@ Ownership persistence, the crash-resumable reset state machine, exact confirmati
 quiescence, and startup-time empty-schema recreation are implemented and tracked in
 [`PHASE7_MAINTENANCE_RESET.md`](PHASE7_MAINTENANCE_RESET.md). Copied-library interruption and live
 owner-library qualification remain open. Legacy albums without creation proof are deliberately not
-inferred from names.
+inferred from names. Full evidence reanalysis is also wired through the existing queue and cache;
+it preserves metadata and user work instead of causing another PhotoKit scan.
 
 - Add storage reporting, versioned curation rebuild, full evidence reanalysis, and the crash-resumable
   destructive reset described below.

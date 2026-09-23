@@ -128,6 +128,12 @@ final class DerivedCacheStore: @unchecked Sendable {
                                  payloadBytes: sqlite3_column_int64(statement, 1), fileBytes: fileBytes)
     }
 
+    func removeAll() throws {
+        lock.lock()
+        defer { lock.unlock() }
+        try execute("DELETE FROM entries; PRAGMA wal_checkpoint(TRUNCATE);")
+    }
+
     func maintain(maximumPayloadBytes: Int64 = 2 * 1024 * 1024 * 1024,
                   deleteOlderThan cutoff: Date = Date().addingTimeInterval(-365 * 86_400)) throws {
         lock.lock()

@@ -64,4 +64,18 @@ final class DerivedCacheStoreTests: XCTestCase {
         XCTAssertEqual(cache.data(namespace: .momentCaptions, key: "caption", maximumBytes: 100), Data("new".utf8))
         XCTAssertFalse(FileManager.default.fileExists(atPath: legacy.path))
     }
+
+    func testRemoveAllClearsEveryNamespace() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = try DerivedCacheStore(url: root.appendingPathComponent("analysis-cache.sqlite3"))
+        try cache.set(Data("one".utf8), namespace: .visualLabels, key: "a")
+        try cache.set(Data("two".utf8), namespace: .momentCaptions, key: "b")
+
+        try cache.removeAll()
+
+        XCTAssertEqual(try cache.stats().records, 0)
+        XCTAssertNil(cache.data(namespace: .visualLabels, key: "a", maximumBytes: 100))
+        XCTAssertNil(cache.data(namespace: .momentCaptions, key: "b", maximumBytes: 100))
+    }
 }

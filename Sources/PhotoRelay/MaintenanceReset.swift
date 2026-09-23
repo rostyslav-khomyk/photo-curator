@@ -21,6 +21,14 @@ struct CuratorResetPreview: Identifiable, Equatable, Sendable {
     var unverifiedAlbums: Int { max(0, publishedAlbums - verifiedAlbums) }
 }
 
+struct CuratorReanalysisPreview: Identifiable, Equatable, Sendable {
+    let id = UUID()
+    let photos: Int
+    let currentCacheBytes: Int64
+
+    var estimatedSeconds: TimeInterval { TimeInterval(photos) * 2 }
+}
+
 enum CuratorResetPhase: String, Codable, Sendable {
     case requested, deletingContainers, verifyingPhotos, erasingLocalData, recreatingCatalog, completed
 }

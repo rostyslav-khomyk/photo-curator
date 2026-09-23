@@ -227,6 +227,37 @@ final class CuratorStore {
         return (Int(sqlite3_column_int64(statement, 0)), Int(sqlite3_column_int64(statement, 1)))
     }
 
+    func requeueAllAnalysis(analyzer: String) throws -> Int {
+        try execute("BEGIN IMMEDIATE")
+        do {
+            let photos = try prepare("SELECT payload FROM photos")
+            let enqueue = try prepare("""
+                INSERT INTO analysis_jobs(asset,revision,analyzer,priority,state,token,lease,result)
+                VALUES(?,?,?,0,'pending',NULL,NULL,NULL)
+                ON CONFLICT(asset) DO UPDATE SET revision=excluded.revision,analyzer=excluded.analyzer,
+                  priority=0,state='pending',token=NULL,lease=NULL,result=NULL
+                """)
+            defer { sqlite3_finalize(photos); sqlite3_finalize(enqueue) }
+            var count = 0
+            while sqlite3_step(photos) == SQLITE_ROW {
+                guard let bytes = sqlite3_column_blob(photos, 0) else { throw failure() }
+                let data = Data(bytes: bytes, count: Int(sqlite3_column_bytes(photos, 0)))
+                let photo = try JSONDecoder().decode(IndexedPhoto.self, from: data)
+                sqlite3_reset(enqueue); sqlite3_clear_bindings(enqueue)
+                sqlite3_bind_text(enqueue, 1, photo.id, -1, transient)
+                sqlite3_bind_text(enqueue, 2, photo.analysisRevision, -1, transient)
+                sqlite3_bind_text(enqueue, 3, analyzer, -1, transient)
+                guard sqlite3_step(enqueue) == SQLITE_DONE else { throw failure() }
+                count += 1
+            }
+            try execute("COMMIT")
+            return count
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
+
     /// Revision is the caller's asset/edit fingerprint; analyzer includes algorithm version.
     /// Re-enqueueing identical work preserves both completed results and active leases.
     func enqueueAnalysis(asset: String, revision: String, analyzer: String, priority: Int = 0) throws {

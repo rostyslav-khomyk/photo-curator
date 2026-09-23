@@ -52,6 +52,14 @@ enum StorageMaintenance {
         try? fileManager.removeItem(at: directory)
     }
 
+    static func removeLegacyDerivedEvidence(at support: URL,
+                                            fileManager: FileManager = .default) throws {
+        for name in ["text-evidence", "background-context", "automatic-moments", "event-continuity"] {
+            let directory = support.appendingPathComponent(name, isDirectory: true)
+            if fileManager.fileExists(atPath: directory.path) { try fileManager.removeItem(at: directory) }
+        }
+    }
+
     static func trim(_ directory: URL, maximumBytes: Int, deleteOlderThan cutoff: Date,
                      fileManager: FileManager = .default) {
         guard let enumerator = fileManager.enumerator(at: directory,

@@ -93,6 +93,27 @@ final class AnalysisQueueTests: XCTestCase {
         XCTAssertEqual(try store.claimAnalysis(now: now)?.asset, "z")
     }
 
+    func testFullReanalysisRequeuesCompletedAndLeasedJobs() throws {
+        let store = try CuratorStore(url: url)
+        let photos = [IndexedPhoto(id: "done", created: now, modified: now, latitude: nil,
+                                   longitude: nil, favorite: false, width: 10, height: 10),
+                      IndexedPhoto(id: "leased", created: nil, modified: nil, latitude: nil,
+                                   longitude: nil, favorite: false, width: 20, height: 20)]
+        try store.save(photos, generation: "g")
+        for photo in photos { try store.enqueueAnalysis(asset: photo.id, revision: photo.analysisRevision, analyzer: "old") }
+        let first = try XCTUnwrap(store.claimAnalysis(now: now))
+        XCTAssertTrue(try store.finishAnalysis(first, result: Data("old".utf8)))
+        _ = try XCTUnwrap(store.claimAnalysis(now: now))
+
+        XCTAssertEqual(try store.requeueAllAnalysis(analyzer: "new"), 2)
+
+        let requeued = [try XCTUnwrap(store.claimAnalysis(now: now)),
+                        try XCTUnwrap(store.claimAnalysis(now: now))]
+        XCTAssertEqual(Set(requeued.map(\.asset)), Set(photos.map(\.id)))
+        XCTAssertTrue(requeued.allSatisfy { $0.analyzer == "new" })
+        XCTAssertNil(try store.claimAnalysis(now: now))
+    }
+
     func testTwoConnectionsDoNotClaimSameUnexpiredWork() throws {
         let first = try CuratorStore(url: url)
         let second = try CuratorStore(url: url)
