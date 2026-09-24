@@ -15,6 +15,67 @@ struct PhotoTextEvidence: Codable {
     let lines: [PhotoTextLine]
 }
 
+enum TextRecognitionFailure: Error {
+    case timedOut
+}
+
+private final class TextRecognitionOperation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let request = VNRecognizeTextRequest()
+    private var continuation: CheckedContinuation<[PhotoTextLine], Error>?
+    private var completed = false
+    private var terminalResult: Result<[PhotoTextLine], Error>?
+
+    init() {
+        request.recognitionLevel = .accurate
+        request.revision = 3
+    }
+
+    func run(_ image: CGImage, timeout: TimeInterval) async throws -> [PhotoTextLine] {
+        try await withCheckedThrowingContinuation { continuation in
+            lock.lock()
+            if let terminalResult {
+                lock.unlock()
+                continuation.resume(with: terminalResult)
+                return
+            }
+            self.continuation = continuation
+            lock.unlock()
+            DispatchQueue.global(qos: .utility).async { [self] in
+                do {
+                    try VNImageRequestHandler(cgImage: image, orientation: .up).perform([request])
+                    let lines: [PhotoTextLine] = (request.results ?? []).prefix(100).compactMap { observation -> PhotoTextLine? in
+                        guard let candidate = observation.topCandidates(1).first else { return nil }
+                        return PhotoTextLine(text: String(candidate.string.prefix(500)),
+                                             confidence: candidate.confidence)
+                    }
+                    finish(.success(lines))
+                } catch { finish(.failure(error)) }
+            }
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout) { [self] in
+                request.cancel()
+                finish(.failure(TextRecognitionFailure.timedOut))
+            }
+        }
+    }
+
+    func cancel() {
+        request.cancel()
+        finish(.failure(CancellationError()))
+    }
+
+    private func finish(_ result: Result<[PhotoTextLine], Error>) {
+        lock.lock()
+        guard !completed else { lock.unlock(); return }
+        completed = true
+        terminalResult = result
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(with: result)
+    }
+}
+
 /// OCR output is evidence, not a verified place or an instruction to the model.
 actor MomentTextEvidenceStore {
     static let engine = "vision-ocr-accurate-v1-\(ProcessInfo.processInfo.operatingSystemVersionString)"
@@ -65,17 +126,14 @@ actor MomentTextEvidenceStore {
         return value
     }
 
-    func recognize(_ image: CGImage) throws -> [PhotoTextLine] {
+    func recognize(_ image: CGImage) async throws -> [PhotoTextLine] {
         try Task.checkCancellation()
         guard image.width <= 2048, image.height <= 2048 else { throw NarrativeFailure.invalidMetadata }
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.revision = 3
-        try VNImageRequestHandler(cgImage: image, orientation: .up).perform([request])
-        try Task.checkCancellation()
-        return (request.results ?? []).prefix(100).compactMap { observation in
-            guard let candidate = observation.topCandidates(1).first else { return nil }
-            return PhotoTextLine(text: String(candidate.string.prefix(500)), confidence: candidate.confidence)
+        let operation = TextRecognitionOperation()
+        return try await withTaskCancellationHandler {
+            try await operation.run(image, timeout: 20)
+        } onCancel: {
+            operation.cancel()
         }
     }
 }

@@ -227,8 +227,12 @@ struct CuratorLocalDataReset: CuratorResetLocalData, @unchecked Sendable {
     func recreateCatalog() async throws { try recreateSynchronously() }
 
     func eraseSynchronously(fileManager: FileManager = .default) throws {
+        var retired: [URL] = []
         for root in [supportRoot, cacheRoot] where fileManager.fileExists(atPath: root.path) {
-            try fileManager.removeItem(at: root)
+            let destination = root.deletingLastPathComponent().appendingPathComponent(
+                ".photo-curator-reset-\(UUID().uuidString)", isDirectory: true)
+            try fileManager.moveItem(at: root, to: destination)
+            retired.append(destination)
         }
         if let logsRoot, let files = try? fileManager.contentsOfDirectory(at: logsRoot,
             includingPropertiesForKeys: nil) {
@@ -239,6 +243,13 @@ struct CuratorLocalDataReset: CuratorResetLocalData, @unchecked Sendable {
         for key in ["curator.momentTitles.v1", "curator.momentDescriptions.v1",
                     "curator.manualReview.v1", "curator.namedMomentMembers.v1"] {
             defaults.removeObject(forKey: key)
+        }
+        if !retired.isEmpty {
+            let retiredRoots = retired
+            Task.detached(priority: .background) {
+                let cleanup = FileManager.default
+                for root in retiredRoots { try? cleanup.removeItem(at: root) }
+            }
         }
     }
 

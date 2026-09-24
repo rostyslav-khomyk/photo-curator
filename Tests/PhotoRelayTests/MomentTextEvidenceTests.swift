@@ -37,6 +37,20 @@ final class MomentTextEvidenceTests: XCTestCase {
         XCTAssertNil(corrupt)
     }
 
+    func testRecognitionCancellationAlwaysReturns() async throws {
+        let context = try XCTUnwrap(CGContext(data: nil, width: 32, height: 32, bitsPerComponent: 8,
+            bytesPerRow: 128, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue))
+        let image = try XCTUnwrap(context.makeImage())
+        let store = MomentTextEvidenceStore(directory: FileManager.default.temporaryDirectory)
+        let task = Task { try await store.recognize(image) }
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("Expected cancellation")
+        } catch is CancellationError {}
+    }
+
     func testSelectedCluePrecedesGenericLabelsWithoutVerifyingPlace() throws {
         let metadata = MomentNarrativeMetadata(dateLabel: "Today", photoCount: 30, favoriteCount: 16,
             verifiedPlace: nil, visualLabels: ["people"], textClue: "madurodam")

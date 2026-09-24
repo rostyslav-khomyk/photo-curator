@@ -2132,3 +2132,23 @@ and verifies all selected media before removing old album membership. Legacy JSO
 imported into Keychain while upgrading an existing installation.
 Validation: 256 Swift tests passed, 13 opt-in tests skipped, zero failures. The release app bundle
 builds and signs without an Engine directory, Python runtime, helper executable, or web assets.
+
+## Clean-room owner-library correction (2026-09-24)
+
+- The first clean-room run indexed all 109,007 available Photos assets, but Catalog v2 received only
+  the 200-Moment display page. The UI therefore stopped in March 2026 even though the durable source
+  index covered August 1998 through September 2026. In-place projection repair expanded the real
+  catalog from 201 to 5,270 Moments without rescanning Photos.
+- Complete projection now occurs only when the compact catalog is incomplete or grouping changes;
+  routine refreshes continue enriching the bounded 200-card page.
+- A live process sample found unattended analysis blocked inside Vision OCR for more than two hours.
+  OCR now has a cancellable 20-second deadline; a pathological image records empty text evidence so
+  visual analysis continues. The real queue resumed after relaunch.
+- Reset no longer waits for analysis tasks that may be inside framework code. Generated directories
+  are atomically moved aside at bootstrap and deleted in the background instead of recursively
+  deleting 1.66 GB on the launch path.
+- The reset sheet now states explicitly that albums without proven Photo Curator ownership remain in
+  Photos and allows the safety text to wrap without truncation.
+- Verification: 257 native tests passed, 13 opt-in tests skipped, zero failures; release build 1104
+  passed signing verification. The owner confirmed scrolling from the newest Moments to the beginning
+  of the library before starting a second clean-room run.

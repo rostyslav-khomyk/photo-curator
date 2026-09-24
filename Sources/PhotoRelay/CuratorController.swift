@@ -344,7 +344,9 @@ actor CuratorWorker {
     func prepareText(_ photo: IndexedPhoto, image: CGImage) async throws {
         let store = textStore
         if await store.cached(photo) == nil {
-            let lines = try await store.recognize(image)
+            let lines: [PhotoTextLine]
+            do { lines = try await store.recognize(image) }
+            catch TextRecognitionFailure.timedOut { lines = [] }
             _ = try await store.save(lines, for: photo)
         }
         try await context.capture(photo, image: image)
@@ -574,7 +576,9 @@ actor CuratorWorker {
     }
 
     func overview(range: DateInterval, thresholds: [SimilarityCategory: Float], balanced: Bool, limit: Int = 200,
-                  protection: MomentGroupingProtection = .init(), preparedPrefix: [PhotoMoment] = []) async throws -> (moments: [PhotoMoment], total: Int, undated: Int, available: Int, activeIDs: Set<String>) {
+                  protection: MomentGroupingProtection = .init(), preparedPrefix: [PhotoMoment] = []) async throws ->
+        (moments: [PhotoMoment], catalogMoments: [PhotoMoment], total: Int, undated: Int,
+         available: Int, activeIDs: Set<String>) {
         let db = try database()
         let counts = try db.counts()
         let grouped = try preparedCatalog(protection: protection)
@@ -641,7 +645,9 @@ actor CuratorWorker {
         }
         moments = reused + moments
         try MomentsCatalog(updated: Date(), moments: moments).save(to: url.deletingLastPathComponent().appendingPathComponent("moments-catalog.json"))
-        return (moments, counts.total, counts.undated, grouped.count, Set(grouped.map(\.id)))
+        let prepared = Dictionary(uniqueKeysWithValues: moments.map { ($0.id, $0) })
+        let catalogMoments = grouped.map { prepared[$0.id] ?? $0 }
+        return (moments, catalogMoments, counts.total, counts.undated, grouped.count, Set(grouped.map(\.id)))
     }
 
     /// Refreshes cached narrative and selection for one already-projected card.
@@ -1047,12 +1053,8 @@ final class CuratorController: ObservableObject {
         analysisTask?.cancel()
         metadataTask?.cancel()
         diagnosticTask?.cancel()
-        let analysis = analysisTask
-        let metadata = metadataTask
-        let diagnostic = diagnosticTask
-        await analysis?.value
-        await metadata?.value
-        await diagnostic?.value
+        // Local workers may be inside an uncooperative Vision request. The catalog is
+        // erased only after relaunch, so reset must not wait for those tasks to unwind.
         await library.stop()
 
         do {
@@ -1295,7 +1297,7 @@ final class CuratorController: ObservableObject {
         } catch { errorMessage = error.localizedDescription }
     }
 
-    func refreshOverview(reusingVisibleMoments: Bool = false) async {
+    func refreshOverview(reusingVisibleMoments: Bool = false, projectCompleteCatalog: Bool = false) async {
         guard !overviewLoading else { return }
         let interval = CuratorPerformance.begin("Moment overview")
         defer { CuratorPerformance.end("Moment overview", interval) }
@@ -1323,7 +1325,11 @@ final class CuratorController: ObservableObject {
             MomentGroupingProtection.captureLegacy(overview.moments, defaults: .standard)
             moments = overview.moments
             if let catalog {
-                try await catalog.synchronize(moments: overview.moments, activeMomentIDs: overview.activeIDs)
+                let projectionIsIncomplete = momentSummaries.count != overview.available
+                try await catalog.synchronize(
+                    moments: projectCompleteCatalog || projectionIsIncomplete
+                        ? overview.catalogMoments : overview.moments,
+                    activeMomentIDs: overview.activeIDs)
                 await reloadMomentSummaries()
             }
             availableMoments = overview.available
@@ -1544,7 +1550,7 @@ final class CuratorController: ObservableObject {
                     } else if !wasForeground {
                         nextReconciliationAnalysisStep = contextStep + 4
                     }
-                    if result.finished { await refreshOverview() }
+                    if result.finished { await refreshOverview(projectCompleteCatalog: true) }
                 } catch {
                     activity = "Curator paused: \(error.localizedDescription)"
                     enabled = false
@@ -1600,7 +1606,7 @@ final class CuratorController: ObservableObject {
                         return
                     }
                     if step == .changed {
-                        await refreshOverview()
+                        await refreshOverview(projectCompleteCatalog: true)
                         return
                     }
                 }
@@ -1623,7 +1629,7 @@ final class CuratorController: ObservableObject {
                     guard token == revision else { return }
                     if step != .caughtUp {
                         if case .presentationChanged(let id) = step { await refreshVisibleMoment(id) }
-                        else if step == .changed { await refreshOverview() }
+                        else if step == .changed { await refreshOverview(projectCompleteCatalog: true) }
                         return
                     }
                     if allowAutomaticPublication && autoPublishEnabled {

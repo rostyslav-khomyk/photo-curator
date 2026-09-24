@@ -975,10 +975,13 @@ private struct NuclearResetConfirmationView: View {
                     Text("Reclaim approximately \(reclaimed) of generated local data")
                     Text("Preserve \(preview.library.assets.formatted()) Photos assets and \(preview.library.favorites.formatted()) Favorites")
                     if preview.unverifiedAlbums > 0 {
-                        Text("Leave \(preview.unverifiedAlbums) legacy Photos albums untouched because their creation ownership cannot be proven")
+                        Text("Keep the Photos albums referenced by \(preview.unverifiedAlbums.formatted()) older publication records. Photo Curator cannot prove it created those albums, so they will remain in Photos.")
                             .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
-                }.frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
             }
             Text("The app will quit after Photos confirms the container changes. Reopen Photo Curator to complete the clean rebuild.")
                 .font(.callout).foregroundStyle(.secondary)
