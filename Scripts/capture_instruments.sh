@@ -10,7 +10,7 @@ APP="$1"
 TEMPLATE="${2:-Time Profiler}"
 SECONDS="${3:-45}"
 OUTPUT="${4:-$(pwd)/Artifacts/Instruments/$(date -u +%Y%m%dT%H%M%SZ)-${TEMPLATE// /-}.trace}"
-EXECUTABLE="$APP/Contents/MacOS/PhotoRelay"
+EXECUTABLE="$APP/Contents/MacOS/PhotoCurator"
 
 if [[ ! -x "$EXECUTABLE" ]]; then
     echo "Photo Curator executable not found at $EXECUTABLE" >&2

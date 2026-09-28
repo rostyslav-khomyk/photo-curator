@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>Photo Curator</string>
     <key>CFBundleExecutable</key>
-    <string>PhotoRelay</string>
+    <string>PhotoCurator</string>
     <key>CFBundleIdentifier</key>
     <string>com.rostyslavkhomyk.PhotoCurator</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -15,7 +15,7 @@
     <key>CFBundleName</key>
     <string>Photo Curator</string>
     <key>CFBundleIconFile</key>
-    <string>PhotoRelay</string>
+    <string>PhotoCurator</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

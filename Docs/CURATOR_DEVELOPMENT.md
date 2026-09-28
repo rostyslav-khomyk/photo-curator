@@ -1,5 +1,127 @@
 # Background Curator: Development Record
 
+## Diagnostics cleanup and Photos Story folders (2026-09-27 evening)
+
+Diagnostics is status + Export Diagnostics only. Removed Rebuild curation,
+Test 12 recent photos, Historical metadata audit, and owner-album Story inject
+(preview / Apply / Keep-in-rebuilds). `rebuildStories` persists GPS Journeys and
+place outings only. Photos publication writes
+`Photo Curator / Year / yyyy-MM Story / Moment` (ungrouped → `Moments`). Catalog
+schema v11 tracks managed `story` folders.
+
+## Owner album Stories Apply-ready (historical 2026-09-27 evening)
+
+Validated preview produced 25 Stories. Owner-album Apply / Keep-in-rebuilds were
+later removed from Diagnostics and `rebuildStories`. Offline helpers remain for
+audits/tests only.
+
+## Owner album Story review and gated preview (historical 2026-09-27)
+
+Owner classified pre-2007 `albumStoryCandidates` into Journey (9), Outing (7),
+People (5), Event (3), and Skip (9). Only Journey/Outing were Story-eligible.
+Live preview (2026-09-27): 15/16 matched; Glasgow / Slavsko / Chicago spanned
+hundreds of days. Builder clusters Moments with a **seven-day** gap. Shipping
+merge via Diagnostics Apply / Keep-in-rebuilds was later removed.
+
+Photos sidebar screenshots (2006–2012 and later year folders) confirmed the
+hierarchy conventions: year folders are containers; place folders nest outings
+(e.g. Mariupol 2006 → In the city / Belosarayka); pure season albums are Skip;
+`Velosypedy-*` / `Ровери:*` are bike outings; utility/address/photoframe albums
+are non-Story. `AlbumOutlinePatterns` encodes those signals for candidate
+scoring. A private draft of later unclassified titles sits under `Artifacts/`
+for a future owner pass — not shipping.
+
+## Historical audit fields and content-revision adoption (2026-09-27)
+
+The in-app Historical Metadata Audit now aggregates `addedDate`, adjustment state /
+timestamps, native ratings, content types, media subtypes, bursts, and album
+location-name coverage, and proposes non-shipping `albumStoryCandidates` from
+user albums (provenance `userAlbum`). Captions/keywords remain collected but were
+already shown to be weak on the owner pre-2007 corpus.
+
+`IndexedPhoto.visualContentRevision` fingerprints dimensions plus adjustment
+state and ignores metadata-only `modificationDate` changes. Completed analysis
+jobs are adopted onto the new metadata revision when that fingerprint matches;
+OCR/label/display evidence keys use the content fingerprint so transport support
+can recover without mass cache relabelling. Shipping Stories still do not activate
+album-derived unlocated candidates.
+
+## Historical metadata audit moved in-app (historical 2026-09-27)
+
+The read-only pre-2007 album/caption/keyword audit previously lived behind
+Diagnostics **Export Historical Metadata Audit…**. That UI entry is gone; prefer
+the living algorithm map and PROJECT_STATE for the current Diagnostics surface.
+
+## Phase 6 Journey transport inference implemented (2026-09-27)
+
+Journey stop evidence now records a conservative candidate leg from the previous stop: air,
+overland, or unknown, with straight-line distance, elapsed time, and confidence. The deterministic
+classifier rejects physically implausible air speeds and does not pretend timing alone can
+distinguish car, train, or ferry.
+
+The isolated owner-catalog audit rebuilt 37 Stories in 0.8 seconds: 127 overland legs, 14 plausible
+air legs, and 42 unknown. All 28 legs in the 2022 road trip classified as overland. No live catalog
+or Photos content was modified.
+
+## Phase 6 Journey place enrichment implemented (2026-09-27)
+
+Journey stops now use macOS 26+ `MKReverseGeocodingRequest` with a `CLGeocoder` compatibility fallback.
+Results are deduplicated at roughly 100 metres, persisted in the existing derived SQLite cache, and
+applied to Story evidence with a raw-blob compare-and-swap after all asynchronous work finishes. The
+existing scheduler performs four lookups per pass, yields between batches, rotates past failed stops,
+and retries failed sweeps after one hour. Settings exposes an Apple Maps naming control and explains
+that no photo pixels accompany lookups.
+
+The copied owner audit populated 54 cache records in its first sweep. Rebuilding the copied Story
+projection and replaying the cache produced grounded names through 2024 without changing Journey or
+Moment membership. The live catalog and Photos library were not modified.
+
+## Phase 6 Journey qualification implemented (2026-09-27)
+
+Catalog v2 schema version 9 now persists typed Journey/outing Stories and compact ordered stop
+evidence. The Journey builder conservatively prevents a weak, simultaneous family-phone coordinate
+branch from steering route boundaries or titles while retaining that Moment in the Story. A v8
+migration discards only the rebuildable Story projection.
+
+The isolated owner-catalog audit produced 36 Journeys and one outing across 746 Moments and 32,047
+photos in 0.9 seconds. The 2022 route remains one 72-Moment, 9,865-photo Journey and the 2026 France
+route remains one 37-Moment, 2,235-photo Journey. No live catalog or Photos content was modified.
+
+## Phase 6 Journey Story foundation implemented (2026-09-27)
+
+Catalog v2 now derives deterministic closed home-to-home Journey Stories from compact Moment/GPS
+rows. It requires repeated distant evidence, bridges bounded missing-GPS periods and incidental Home
+captures from another family phone, and prevents overlapping place Stories. On an isolated owner
+catalog copy, it recognizes the 2022 trip as 73 Moments/9,805 photos and the 2026 trip as 37
+Moments/2,202 photos. A full Story rebuild takes about 1.1 seconds off the main actor; no-op catalog
+synchronization now bypasses it using the existing Moment revision fingerprint.
+
+The owner audit subsequently exposed legacy `0,0` coordinates. The shared geocoding and Journey
+projection boundaries now reject invalid coordinates, and verified ordered Moment place labels
+produce deterministic Journey titles. A bounded Apple reverse-geocoding audit names older candidates
+without treating its network enrichment as membership evidence.
+
+## Phase 6 Journey Story plan (2026-09-26)
+
+Owner review established that a repeated vacation base is not necessarily the Story boundary. The
+the next Phase 6 slice would infer complete home-to-home journeys from the GPS timeline, retain city visits
+and travel legs as ordered Moments, bridge bounded missing-GPS periods, and use Vision/OCR only as
+supporting transport evidence. Optional MapKit validation remains network-disclosed and nonessential.
+The plan and owner acceptance cases are recorded in `Docs/PHASE6_JOURNEY_STORIES.md`.
+macOS 27 adds a stronger optional enrichment path: multimodal Foundation Models with guided output,
+read-only tools, and Evaluations-based qualification. Route membership remains deterministic; Apple
+Intelligence names and explains the evidence but cannot alter the catalog or Photos library.
+
+## Phase 6 Story hierarchy completed (2026-09-26)
+
+Catalog schema 8 now persists rebuildable Story parents and ordered Moment membership. The Moments
+workspace exposes a Story shelf and child-Moment browser while keeping existing Moment review and
+Highlights unchanged. Conservative Story derivation groups same-day venue continuations and city
+districts, permits a repeated trip base to bridge short excursions for up to two weeks, excludes
+routine places, and retains one-day arrival/departure shoulders. A copied owner catalog rebuilds the
+projection in about 30 ms and recognizes the Fréjus trip. Clean-room reset now disables automatic
+Photos publication while preserving Google sync history and ordinary preferences.
+
 ## Phase 6 generation foundation (2026-09-23)
 
 Catalog v2 schema version 6 now supports isolated, complete-corpus curation generations with
@@ -82,7 +204,7 @@ recreation. Live Photos test-library qualification remains intentionally uninvok
 - Replaced the Flask-backed legacy engine with a focused `GooglePhotosHelper` process.
   It exposes only the native JSON-line protocol and uses a temporary standard-library
   loopback server during Google OAuth.
-- The existing bundle identifier and `Photo Relay` application-support paths remain
+- The existing bundle identifier and `Photo Curator` application-support paths remain
   unchanged so macOS Photos consent and the user's catalog survive the source cleanup.
 - Verification passed 203 native tests (10 opt-in skips), 47 Google helper tests,
   release packaging, and strict deep code-signature validation.
@@ -181,8 +303,8 @@ Completed and polished Chunk 10 (Local Narrative Model & Grounded Text Generatio
 Resolved initial thumbnail stall on permission consent and introduced complete font accessibility controls:
 1. **Thumbnail Auto-Refresh on Photos Consent Grant:**
    - **Root Cause**: On initial launch of an ad-hoc signed build, thumbnails in the viewport rendered while `PHPhotoLibrary.authorizationStatus` was still `.notDetermined`. They immediately caught `.permissionDenied` and displayed `"Not available locally"`. Because their SwiftUI `.task(id:)` only watched static photo identifiers, granting consent never triggered a re-fetch until manual scrolling recycled the cells.
-   - **Fix in `PhotoKitThumbnailProvider`**: When status is `.notDetermined`, the provider intercepts the request, triggers/awaits `PHPhotoLibrary.requestAuthorization`, performs the fetch immediately upon approval, and broadcasts `.photoRelayPhotosAccessChanged`.
-   - **Fix in `SimilarityThumbnail`**: Bound the loading task to a reactive `refreshCount` and registered listeners for both `.photoRelayPhotosAccessChanged` and `NSApplication.didBecomeActiveNotification`. When authorization is granted or the app regains focus from the macOS prompt, any failed/empty thumbnails automatically reload without requiring user interaction.
+   - **Fix in `PhotoKitThumbnailProvider`**: When status is `.notDetermined`, the provider intercepts the request, triggers/awaits `PHPhotoLibrary.requestAuthorization`, performs the fetch immediately upon approval, and broadcasts `.photoCuratorPhotosAccessChanged`.
+   - **Fix in `SimilarityThumbnail`**: Bound the loading task to a reactive `refreshCount` and registered listeners for both `.photoCuratorPhotosAccessChanged` and `NSApplication.didBecomeActiveNotification`. When authorization is granted or the app regains focus from the macOS prompt, any failed/empty thumbnails automatically reload without requiring user interaction.
    - **Fix in `MomentsWorkspace`**: Automatically refreshes moment covers, titles, and place resolutions as soon as authorization changes.
 2. **Settings Text Size Slider & Prominent Typography for Glasses Wearers:**
    - **App Settings Font Size Slider**: Added a dedicated *Display & Accessibility* section in `CuratorSettingsView` with an interactive text size slider (range: 85% to 160%, default 100%) persisting in `@AppStorage("curator.fontSizeScale")`.
@@ -305,7 +427,7 @@ Release build passed (30.80s). No redeployment or indexing scope changes in this
 
 User approved Photos. Telemetry at 12:29:23/27 UTC restored 446 automatic selections;
 12:29:55 waiting reason 5 confirms the permission gate cleared and idle gating remains.
-No new deployment or library changes. Only PhotoRelay native executable running;
+No new deployment or library changes. Only PhotoCurator native executable running;
 temporary Google pipe helper has exited. August-only pilot remains enabled.
 
 Read-only jq audit of app-owned catalog: 1,132 memberships and unique assets, 47 Moments,
@@ -345,7 +467,7 @@ final window-title and automatic album-loading UI verification remain outstandin
 No port 8080 listener returned by lsof (unrelated unreachable SMB mount warning).
 Before final relaunch only the native app was running; startup credential validation
 can temporarily start the pipe engine. No Photos mutations or Google uploads performed.
-Telemetry remains in ~/Library/Logs/Photo Relay/curator.jsonl for compatibility.
+Telemetry remains in ~/Library/Logs/Photo Curator/curator.jsonl for compatibility.
 
 ## Native Pilot, Telemetry and Rebranding (2026-09-11)
 
@@ -404,7 +526,7 @@ Deployment precheck: no valid installed code-signing identity; dist bundle exist
 
 Inspected the already-approved C03 two-page and C05 contact sheets. Wrote private
 quality-reference.json (0600), with provisional visual-role indices, not person names
-or verified event labels. New opt-in PHOTO_RELAY_QUALITY_REPORT test performs hash-checked
+or verified event labels. New opt-in PHOTO_CURATOR_QUALITY_REPORT test performs hash-checked
 local Vision/OCR and production selection on those 36 samples; held-out samples rejected.
 No network, live library/index, production changes, or new conversation-AI sample scope.
 
@@ -419,7 +541,7 @@ UI/Favorites acceptance remain; no live restart or redeployment.
 
 ## Full Export Structural Validation (2026-09-11)
 
-Added explicit PHOTO_RELAY_VALIDATION_REPORT opt-in test. All 624 C03 and 684 held-out
+Added explicit PHOTO_CURATOR_VALIDATION_REPORT opt-in test. All 624 C03 and 684 held-out
 February JPEG copies are hash-verified and analyzed locally at 1024px, using fresh temp
 stores, existing OCR/Vision and deterministic caption fallback. No PhotoKit, network,
 folder-name inputs, cloud LLM, source changes or conversation-AI image inspection.
@@ -630,7 +752,7 @@ limited/denied, and explains restricted access. Rechecks when app becomes active
 No TCC resets, library writes, or permission request during tests. Existing scanning
 and permission flows are otherwise unchanged; banner is not a scheduler gate.
 
-build_app.sh accepts PHOTO_RELAY_SIGNING_IDENTITY, warns about ad-hoc persistence,
+build_app.sh accepts PHOTO_CURATOR_SIGNING_IDENTITY, warns about ad-hoc persistence,
 and verifies signature. security find-identity found zero valid code-signing identities.
 Swift tests: 83 executed, 4 opt-in skipped, zero failures. New banner compiled;
 interactive permission states not tested. No packaged rebuild/relaunch yet.
@@ -651,7 +773,7 @@ proposals do not replace edited drafts. Saved grouping applies in this review UI
 it does not yet replace the top-level time-based Moments list or feed publication.
 
 GroupReviewStore persists a versioned global asset-membership archive in Application
-Support/Photo Relay/curator/group-review.json. Stable UUIDs, titles and explicit
+Support/Photo Curator/curator/group-review.json. Stable UUIDs, titles and explicit
 memberships override future automatic regrouping. New/unreviewed assets stay in
 automatic residual groups instead of joining a saved group silently. Save updates
 only visible memberships, preserving out-of-range members. Names belong to a whole
@@ -741,7 +863,7 @@ clue before passing it into caption candidates. No automatic place-name assertio
 Raw OCR is never treated as model instructions; the existing model selects an index
 from bounded candidate text. Manual draft remains separate from suggestions.
 
-Cache: Application Support/Photo Relay/curator/text-evidence, hashed asset filenames,
+Cache: Application Support/Photo Curator/curator/text-evidence, hashed asset filenames,
 atomic per-photo JSON, 0600 files/0700 directory, 128 KiB read/write bound, 100 lines,
 500 characters per recognized line. Asset ID, IndexedPhoto.analysisRevision and
 engine/OS version must match. Empty successful OCR cached; failed loads not cached.
@@ -751,7 +873,7 @@ No cache eviction policy yet. User corrections are session clues; only saved tit
 description persists. Background queue integration and semantic grouping remain next.
 
 Validation: swift test, 69 tests with 3 opt-in skipped and zero failures. Separate
-PHOTO_RELAY_OCR_TEST_FOLDER run analyzed all 30 previously exported August 30 photos
+PHOTO_CURATOR_OCR_TEST_FOLDER run analyzed all 30 previously exported August 30 photos
 and asserted the Madurodam sign recognition (3.46 seconds). No Photos modifications,
 downloads or uploads during this acceptance test. UI layout/interactions still need
 acceptance after app relaunch. This is not a claim of end-to-end GUI verification.
@@ -762,7 +884,7 @@ Completed Photos UI export and local Vision OCR/faces/classification on 30 uniqu
 images (39 exported entries included nine byte-identical Top Results duplicates).
 See `CURATOR_AUGUST30_CASE_STUDY.md` for evidence, semantic groups and next steps.
 Private copies/EXIF/OCR/contact sheets live outside this repository in Pictures/Photo
-Relay Analysis/2026-08-30. Added reproducible exported-copy-only analysis script.
+Photo Curator Analysis/2026-08-30. Added reproducible exported-copy-only analysis script.
 No app deployment, Photos album edits or Google image uploads. Only one GPS-bearing
 image; 29 compressed timestamps combine multiple outings/gatherings. OCR recognized
 Madurodam. Two zero-face detections were false negatives on visual inspection: none
@@ -787,7 +909,7 @@ marks possible subjects/uncertainty; free-form hallucinated names/events still p
 Cache prompt version bumped to avoid old date-only results. Progress and inspected/label
 summary shown in suggestion sheet. Empty labels fall back to date/count templates.
 
-Actual exported JPEG in user's Photo Relay export folder read via ImageIO, bounded1024
+Actual exported JPEG in user's Photo Curator export folder read via ImageIO, bounded1024
 thumbnail -> Vision -> real Apple text model: 4 labels, valid candidate0, test passed11.578s.
 No original Photos DB access, image modification, upload, or saved title edits. This tests
 real pixels/backend, not the failing UI transport or full live PhotoKit request in the sheet.
@@ -831,7 +953,7 @@ https://developer.apple.com/documentation/foundationmodels/systemlanguagemodel
 Local SDK interface verified before implementation. Synthetic fake-model tests cover cache
 restart/version/input invalidation, availability, malformed response, missing place and errors.
 Verification: 61 deterministic tests passed before opt-in smoke addition. All four narrative
-tests then passed with PHOTO_RELAY_TEST_LOCAL_MODEL=1, including actual Apple on-device
+tests then passed with PHOTO_CURATOR_TEST_LOCAL_MODEL=1, including actual Apple on-device
 inference over synthetic metadata (10.917s). No user library accessed. Installed app unchanged.
 
 ## Identity Resolver and Journal Hardening (2026-09-08)
@@ -1174,7 +1296,7 @@ working Google sync implementation with an untested alternative.
 ## Product Contract (2026-09-07)
 
 - Persona: Mac user with a Nest Hub on the desk who travels and wants to revisit memories.
-- Photo Relay lives in the menu bar. Photos remains the originals and album backend.
+- Photo Curator lives in the menu bar. Photos remains the originals and album backend.
 - Gradually index the entire authorized library (back to 1998), then analyze locally
   during idle periods. Keep durable progress/results across restarts.
 - Discover moments using time, location, and eventually visual content and quality.
@@ -1194,7 +1316,7 @@ were deliberately left out. The client handles explicit HTTP 429 with cancellabl
 backoff and keeps unknown POST outcomes protected from blind retry. Do not wipe the
 upload ledger. OAuth consent consolidation is not yet implemented or requested again.
 
-Native app: `PhotoRelay/Sources/PhotoRelay/`. Python local engine: `../src/icloudpd/`.
+Native app: `PhotoCurator/Sources/PhotoCurator/`. Python local engine: `../src/icloudpd/`.
 Build: `./Scripts/build_app.sh` from repository root. Native tests:
 `swift test`. Python tests: `TZ=UTC .venv/bin/pytest -q`.
 Baseline: 320 Python tests passed, 4 skipped; 6 native tests passed.
@@ -1257,7 +1379,7 @@ Design choices:
 - The first usable milestone is metadata preparation, not best-photo selection. Next
   concrete work is a bounded, cached on-device thumbnail analysis stage, followed by
   review and safe Photos album publication. Do not expose these as completed features.
-- Release app rebuilt at `../dist/Photo Relay.app`; deep/strict code-signature verification
+- Release app rebuilt at `../dist/Photo Curator.app`; deep/strict code-signature verification
   passed. The running app was not restarted. Live Moments UI and 111k-library throughput
   still need user acceptance testing.
 
@@ -1288,7 +1410,7 @@ Design choices:
 #### Researched Publication Design (Not Implemented Yet)
 
 Photos supports nested folders of ordinary albums. Use this visible hierarchy:
-`Photo Relay / Moments / 2026 / 2026-08-30 - <reviewed moment title>`.
+`Photo Curator / Moments / 2026 / 2026-08-30 - <reviewed moment title>`.
 Each published moment is an ordinary PHAssetCollection containing references to existing
 assets, not copied originals and not an Apple Memory or Smart Album. Folder separation
 organizes the sidebar, but cannot hide these photos from All Photos or all search results.
@@ -1305,8 +1427,8 @@ in the app index. Once visual curation exists, opt-in automatic publishing can m
 qualified moments under the managed folder; explicit review can publish a selection now.
 Tune minimum quality/diversity and merging before enabling historical auto-publication.
 
-Photo Relay's album browser currently fetches albums as a flat list. Before publishing,
-add separate "My Albums" and "Photo Relay Moments" sections, with year grouping and
+Photo Curator's album browser currently fetches albums as a flat list. Before publishing,
+add separate "My Albums" and "Photo Curator Moments" sections, with year grouping and
 search across both. Classify by persisted managed album IDs, NOT names or folder alone.
 Do not show the same album in both sections. Manually created albums remain untouched.
 
@@ -1433,14 +1555,14 @@ The running app was not restarted, and its named Moment/selection was not modifi
 # Generated-state reset checkpoint (2026-09-09, 23:34 CEST)
 
 User requested step 1 of the clean evaluation workflow while exporting a new dataset,
-explicitly declining a database backup. Photo Relay and its backend were not running.
+explicitly declining a database backup. Photo Curator and its backend were not running.
 Removed the generated index.sqlite3 and WAL/SHM, automatic-moments, background-context,
 text-evidence, moments-catalog.json and narrative-cache.json (including cache lock files)
-from the live app's Application Support/Photo Relay/curator directory. No backup made.
+from the live app's Application Support/Photo Curator/curator directory. No backup made.
 About 503 MB of generated state was cleared. Only group-review.json and its lock remain
 in that directory; explicit split/merge corrections were intentionally preserved.
 
-Set only local.icloudpd.photorelay's curatorEnabled preference to false, verified as 0,
+Set only local.icloudpd.photocurator's curatorEnabled preference to false, verified as 0,
 so background work does not immediately repopulate the index. Before/after checksums
 match for preserved app-support files (including credentials, upload ledger, album mapping
 and saved group review) and for all preferences excluding curatorEnabled. Custom titles,
@@ -1455,7 +1577,7 @@ Do not resume analysis or discard preserved corrections implicitly.
 
 # Export/reference audit checkpoint (2026-09-10, 00:10 CEST)
 
-User supplied Pictures/Photo Relay Analysis and explicitly approved representative pixel
+User supplied Pictures/Photo Curator Analysis and explicitly approved representative pixel
 inspection in this conversation (not a claim of on-device AI). Audited exported files
 read-only: 4,534 JPEGs, 108 MOVs, 261 media folders, 15,768,060,845 bytes. All JPEGs retain
 DateTimeOriginal and offsets; 3,868 have GPS; no byte-identical duplicates. No sidecars or
@@ -1467,7 +1589,7 @@ New developer-only macos/evaluation tooling: ExifTool/Node read-only manifest wi
 hashes and private reports outside the export, source-change/symlink/output guards,
 deterministic reference sampling and hash-checked Swift contact-sheet rendering. Four
 Node audit tests pass. No production app changes or redeployment. Private report folder:
-Pictures/Photo Relay Evaluation 2026-09-09 (run started before midnight).
+Pictures/Photo Curator Evaluation 2026-09-09 (run started before midnight).
 
 Inspected 138 approved samples in eight reference cases. Reserved all 684 February JPEGs
 before pixel inspection, keeping neighboring trip days together in the holdout. Folder
@@ -1628,7 +1750,7 @@ Final verification: 131 Swift tests, 7 opt-in skips, no failures; the expanded 9
 reference pilot and metadata baseline passed separately. Native release compilation passed.
 Rendered and visually inspected the context-only placeholder card at 250px on a white/light
 background; no clipped content or utility pixels. Full workspace interaction/relaunch still
-requires release acceptance. Test render is /tmp/PhotoRelay-context-card.png (synthetic only).
+requires release acceptance. Test render is /tmp/PhotoCurator-context-card.png (synthetic only).
 No deployment or live restart. Active plan now starts with the current three remaining gates
 to avoid mistaking historical GCP/earlier 'next' notes for current instructions.
 
@@ -1871,7 +1993,7 @@ Photos access, network research or private-photo inspection in this subchunk.
   containers directly beneath `Photo Curator/<year>` and deleted all 7 found containers through
   public PhotoKit. No photo assets were deleted. The temporary maintenance argument was then removed
   from source.
-- Deleted the derived `~/Library/Application Support/Photo Relay/curator` tree without backup. The
+- Deleted the derived `~/Library/Application Support/Photo Curator/curator` tree without backup. The
   parent application-support directory fell from about 200 MB to 332 KB; Google credentials/config
   outside the curator tree were preserved.
 - Removed `PhotoMoment.suggestedText` and all compatibility reads. `PhotoMoment.narrative` and

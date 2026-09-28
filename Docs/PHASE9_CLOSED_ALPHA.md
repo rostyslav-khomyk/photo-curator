@@ -25,7 +25,7 @@ Keychain profile. It enables the hardened runtime, creates and signs a DMG, subm
 staples and validates the ticket, runs Gatekeeper assessment, and records the SHA-256 digest:
 
 ```bash
-export PHOTO_RELAY_SIGNING_IDENTITY='Developer ID Application: Example (TEAMID)'
+export PHOTO_CURATOR_SIGNING_IDENTITY='Developer ID Application: Example (TEAMID)'
 export PHOTO_CURATOR_NOTARY_PROFILE='PhotoCurator'
 export PHOTO_CURATOR_VERSION='1.0-alpha.1'
 ./Scripts/qualify_alpha.sh release

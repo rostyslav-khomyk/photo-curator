@@ -1,8 +1,9 @@
-# Phase 6: Holistic Curation Generations
+# Phase 6: Holistic Curation Generations and Stories
 
 ## Implemented foundation
 
-- Catalog schema version 6 stores immutable candidate Moment snapshots and aggregate metrics without
+- Catalog schema version 10 stores immutable candidate Moment snapshots, aggregate metrics, and
+  normalized Story parents without
   duplicating indexed photo payloads.
 - Candidate staging is one synchronous SQLite transaction. Unknown, duplicate, missing, or partial
   asset membership fails before a candidate becomes complete.
@@ -35,8 +36,9 @@
   user-defined habitual place and calendar month. Everyday photographs and reference-memory photos
   remain separate roles. Favorites, reviewed/customized Moments, published Moments, and large event
   visits are never changed by this pass.
-- Optional Story parents require repeated strong place identity across adjacent Moments. They do not
-  replace Moments or infer meaning from busy months.
+- Optional Story parents require repeated non-routine place identity across adjacent Moments. City
+  districts roll up to their city, a base place may bridge short excursions, and arrival/departure
+  shoulders are retained. Stories do not replace Moments or infer meaning from busy months.
 - Hierarchical highlights first allocate representative photos per Moment, then allocate Story-level
   highlights from those representatives. Favorites and manual includes are hard constraints when
   present, but the allocator works without Favorites.
@@ -47,9 +49,28 @@ The Moments toolbar now exposes an aggregate-only monthly density view built fro
 It loads no photo pixels and describes low-volume periods as quiet capture periods, not unimportant
 life periods.
 
+## Shipping hierarchy
+
+The workspace now presents `Story -> Moment -> Highlight`: a compact Story shelf opens the ordered
+child Moments, and each Moment retains its independently editable highlights. Story membership is a
+small rebuildable SQLite projection, not duplicated photo membership. The owner-catalog rehearsal
+rebuilds the projection in roughly 30 ms and recognizes the Fréjus family trip while preserving its
+scene-level Moments. Same-day continuations such as Efteling and city districts such as Amsterdam
+are covered by deterministic tests.
+
+The deterministic foundation of [Journey Stories](PHASE6_JOURNEY_STORIES.md) now infers closed
+home-to-home trips from the complete GPS timeline, preserves ordered child Moments, bridges bounded
+missing-location gaps, and supersedes treating a vacation base such as Fréjus as the whole Story.
+Distance/time transport candidates and bounded cached locality naming are now implemented.
+Bounded cached Vision/OCR transport support is connected; route validation and maps remain planned. See the
+[living algorithm map](CURATION_ALGORITHM.md) for the distinction between shipping
+paths, candidate-generation gates and the disconnected Story highlight allocator.
+
 ## Deliberate hold
 
-The shipping UI does not yet start or activate a full-library candidate. Before that switch is
+The shipping UI still does not activate a full-library candidate generation. Stories are safe to
+derive because they do not change Moment membership, titles, reviews, or publication. Before the
+candidate activation switch is
 exposed, run the current 108,999-photo corpus audit and the private owner-reviewed benchmark through
 the generation API. The benchmark must report false joins and false splits separately. Candidate
 activation is intentionally impossible when either measurement is missing.

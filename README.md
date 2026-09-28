@@ -4,8 +4,12 @@ Photo Curator is the native macOS workspace for turning a large Photos library i
 
 ## Current Workflow
 
+See the [visual curation algorithm map](Docs/CURATION_ALGORITHM.md) for the current
+pipeline, implementation gaps and its relationship to UI development, and the
+[resume checkpoint](Docs/PROJECT_STATE.md) for the recorded development state.
+
 - Browse a complete Moments catalog, with the last visible position restored when the app reopens.
-- Prioritize a time range without changing which Moments belong in the catalog.
+- Let visible Moments raise their own analysis priority while full-library curation continues in the background.
 - Review a Moment, edit its title, select highlights, manage Favorites, and delete unwanted photos through PhotoKit.
 - Save curated Moments as albums in Photos, merge selected Moments, or export selected photos to Google Photos.
 - Add significant places such as Home and Work to improve local titles and grouping context.
@@ -53,10 +57,10 @@ hardened-runtime, and notarization gate documented in
 Photo Curator stores its durable catalog and corrections under:
 
 ```text
-~/Library/Application Support/Photo Relay/curator/
+~/Library/Application Support/Photo Curator/curator/
 ```
 
-Supporting app state is stored under `~/Library/Application Support/Photo Relay/`, and rotating logs are written under `~/Library/Logs/Photo Relay/`. Temporary export and OAuth files use system-recommended temporary locations. Rebuilding the app does not intentionally erase the catalog.
+Supporting app state is stored under `~/Library/Application Support/Photo Curator/`, and rotating logs are written under `~/Library/Logs/Photo Curator/`. Temporary export and OAuth files use system-recommended temporary locations. Rebuilding the app does not intentionally erase the catalog.
 
 ## Verified Checkpoint
 

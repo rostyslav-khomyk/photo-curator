@@ -3,14 +3,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "PhotoRelay",
+    name: "PhotoCurator",
     platforms: [.macOS(.v13)],
-    products: [.executable(name: "PhotoRelay", targets: ["PhotoRelay"])],
+    products: [.executable(name: "PhotoCurator", targets: ["PhotoCurator"])],
     targets: [
         .executableTarget(
-            name: "PhotoRelay",
-            path: "Sources/PhotoRelay"
+            name: "PhotoCurator",
+            path: "Sources/PhotoCurator"
         ),
-        .testTarget(name: "PhotoRelayTests", dependencies: ["PhotoRelay"])
+        .testTarget(name: "PhotoCuratorTests", dependencies: ["PhotoCurator"])
     ]
 )

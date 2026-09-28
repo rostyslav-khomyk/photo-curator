@@ -13,9 +13,9 @@ if [[ "$MODE" != "preflight" && "$MODE" != "release" ]]; then
     exit 2
 fi
 if [[ "$MODE" == "release" ]]; then
-    : "${PHOTO_RELAY_SIGNING_IDENTITY:?Set PHOTO_RELAY_SIGNING_IDENTITY to a Developer ID Application identity}"
+    : "${PHOTO_CURATOR_SIGNING_IDENTITY:?Set PHOTO_CURATOR_SIGNING_IDENTITY to a Developer ID Application identity}"
     : "${PHOTO_CURATOR_NOTARY_PROFILE:?Set PHOTO_CURATOR_NOTARY_PROFILE to a notarytool Keychain profile}"
-    if [[ "$PHOTO_RELAY_SIGNING_IDENTITY" != Developer\ ID\ Application:* ]]; then
+    if [[ "$PHOTO_CURATOR_SIGNING_IDENTITY" != Developer\ ID\ Application:* ]]; then
         echo "Release mode requires a Developer ID Application identity." >&2
         exit 1
     fi
@@ -49,7 +49,7 @@ PHOTO_CURATOR_PERFORMANCE=1 PHOTO_CURATOR_PERFORMANCE_COUNT=250000 \
     swift test --filter CuratorPerformanceTests 2>&1 | tee "$OUTPUT/performance-250k.log"
 
 if [[ "$MODE" != "release" ]]; then
-    export PHOTO_RELAY_SIGNING_IDENTITY="-"
+    export PHOTO_CURATOR_SIGNING_IDENTITY="-"
 fi
 
 echo "Building application bundle..."
@@ -66,7 +66,7 @@ if [[ "$MODE" == "release" ]]; then
         exit 1
     fi
     hdiutil create -quiet -volname "Photo Curator" -srcfolder "$APP" -ov -format UDZO "$DMG"
-    codesign --force --timestamp --sign "$PHOTO_RELAY_SIGNING_IDENTITY" "$DMG"
+    codesign --force --timestamp --sign "$PHOTO_CURATOR_SIGNING_IDENTITY" "$DMG"
     xcrun notarytool submit "$DMG" --keychain-profile "$PHOTO_CURATOR_NOTARY_PROFILE" --wait \
         2>&1 | tee "$OUTPUT/notarization.txt"
     xcrun stapler staple "$DMG" 2>&1 | tee "$OUTPUT/stapler.txt"

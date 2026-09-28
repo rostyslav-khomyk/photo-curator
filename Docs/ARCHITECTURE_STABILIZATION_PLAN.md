@@ -648,6 +648,22 @@ packaged owner-library file-count and Instruments qualification remain open.
 
 ### Phase 6: Holistic curation generations, 5-8 days
 
+Status: generation isolation and the first complete `Story -> Moment -> Highlight` browsing slice
+are implemented. Stories are normalized, rebuildable parents over ordered Moments; they do not
+duplicate assets or alter reviewed Moment membership. Full candidate activation remains gated by the
+owner-reviewed false-join/false-split benchmark.
+
+The planned Phase 6 Journey Story extension treats the Story as a home-to-home movement episode,
+with city visits, a vacation base, excursions, and travel legs retained as ordered Moments. See
+`Docs/PHASE6_JOURNEY_STORIES.md`. Local GPS chronology is authoritative; Vision/OCR only supports
+transport interpretation, and optional MapKit route validation is bounded, cached, and disclosed.
+Shipping adaptive evidence **defers** Vision/OCR for metadata-rich GPS captures while
+attribute-thin work remains (viewport can boost immediately). Journey stop reverse-geocode runs on
+the analysis scheduler before OCR interleave so titles do not wait for a full-library cache fill.
+On macOS 27, a runtime-gated Foundation Models enrichment may produce typed grounded Story narratives
+from that deterministic dossier and bounded representative images. It cannot change membership or
+perform writes; deterministic output remains the fallback and the macOS 13 deployment target remains.
+
 The generation schema, isolated candidate read model, adaptive boundary scaffold, identity safety,
 atomic activation/rollback, aggregate overview, conservative Stories, and hierarchical highlight
 allocation are implemented and tracked in

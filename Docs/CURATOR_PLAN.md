@@ -1,5 +1,44 @@
 # Curator Plan
 
+## Current Checkpoint: Album Stories Apply-ready (2026-09-27)
+
+Validated live preview (25 Stories after seven-day gap split). Apply is one click:
+it enables Keep-in-rebuilds, merges album Stories after GPS, and refreshes the
+Stories sidebar. Multi-cluster albums get year titles; `Images from:` is stripped.
+Slavsko3 Moments overlap Slavsko. Next: owner Applies, then route map remains deferred.
+
+## Current Checkpoint: Album Stories gap-split + opt-in merge (2026-09-27)
+
+Live preview matched 15/16 Journey/Outing albums but glued multi-year trips.
+`UnlocatedAlbumStoryBuilder` now splits at seven-day Moment gaps.
+`rebuildStories(additionalStories:)` can merge them; Diagnostics toggle defaults
+**off**. Next: owner re-exports preview, then optionally Applies.
+
+## Current Checkpoint: Owner album review → gated Story preview (2026-09-27)
+
+Owner labeled Journey/Outing/People/Event/Skip for the historical album list.
+Diagnostics can export an owner-album Story preview against catalog Moments
+without shipping into `rebuildStories`. Next: inspect preview membership quality
+on the live library, then decide merge rules for unlocated Stories.
+
+## Current Checkpoint: Extended historical audit + content revision (2026-09-27)
+
+Historical Diagnostics export now measures the remaining public PhotoKit fields
+discussed for unlocated history (`addedDate`, adjustments, rating, subtypes,
+bursts, album location names) and lists review-gated album Story candidates.
+Vision job results adopt across metadata-only revision churn via
+`visualContentRevision`. Owner action: re-export the audit and mark which
+candidates are real local journeys before any shipping integration.
+
+## Current Checkpoint: In-app historical metadata audit (2026-09-27)
+
+The CLI historical probe never prompted for Photos access because it is not the
+Photo Curator app bundle. Measurement now uses Settings → Open Diagnostics… →
+Export Historical Metadata Audit… under the app's existing Photos permission.
+Next: owner runs that export, then we measure album/caption/keyword coverage for
+unlocated pre-2007 Stories before any cloud enrichment. Content-revision
+separation and live queue progress remain the parallel evidence-gap work.
+
 ## Architecture stabilization proposal (2026-09-21)
 
 The current product plan is now complemented by
@@ -127,7 +166,7 @@ expanding pilot dates. No album creation, uploads, or full-library expansion yet
 
 User authorized deployment and unattended bounded background pilot, logging, native-only
 cleanup, and rebranding. Visible name is Photo Curator; bundle ID, executable, existing
-support/log paths and credentials stay stable. Icon now uses a curator sparkle, not relay
+support/log paths and credentials stay stable. Icon now uses a curator sparkle, not a transfer
 arrow. Dashboard opens Moments. Pilot defaults curatorPilotStart/End constrain metadata,
 analysis, text and preparation requests; intended month August 2026. UI shows dates.
 
@@ -348,7 +387,7 @@ Current provider is a tested building block, NOT active background enrichment.
 
 Photos access banner implemented: check public authorization state, offer initial
 request or Privacy Settings only when full access is absent, recheck on activation.
-Build supports PHOTO_RELAY_SIGNING_IDENTITY and verifies its signature. This Mac has
+Build supports PHOTO_CURATOR_SIGNING_IDENTITY and verifies its signature. This Mac has
 no valid signing identities; ad-hoc signing remains the fallback and cannot promise
 permission persistence. Not redeployed yet.
 
@@ -482,8 +521,8 @@ This document records agreed requirements separately from proposed implementatio
 
 ## Proposed Organization and Outstanding Choices
 
-- Proposed Photos hierarchy: Photo Relay / Moments / Year / dated descriptive album.
-  In our browser, separate My Albums and Photo Relay Moments by persisted ownership IDs.
+- Proposed Photos hierarchy: Photo Curator / Moments / Year / dated descriptive album.
+  In our browser, separate My Albums and Photo Curator Moments by persisted ownership IDs.
 - Raw metadata fragments stay in the index. Qualified sets can be published automatically
   once enabled; reviewed sets can use Save & Sync. Publication thresholds remain undecided.
 - Still to decide: collection length and variety, trip vs day vs recurring-theme grouping,
@@ -590,7 +629,7 @@ Small-range user acceptance of scheduler is next, then selection and thumbnail r
 No Photos mutations; album creation remains the final feature.
 
 2026-09-07 correction: database/OSXPhotos integration is PARKED, not a prerequisite.
-Use public PhotoKit inside Photo Relay with its Photos permission; no Codex Full Disk
+Use public PhotoKit inside Photo Curator with its Photos permission; no Codex Full Disk
 Access required. Added explicit Moments > Test Local Photos diagnostic using 12 local
 thumbnails and Vision. User-run acceptance remains pending. All Photos writes stay LAST.
 Older database-adapter chunks below are historical proposals, not the active next step.

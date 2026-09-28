@@ -23,7 +23,7 @@ composition, redundancy, covers and full-visit omissions separately.
 
 ## Repeatable Sample Audit
 
-`PHOTO_RELAY_QUALITY_REPORT=REPORT_FOLDER swift test --filter ExportedReferenceBaselineTests/testOptInReviewedSelectionQuality`
+`PHOTO_CURATOR_QUALITY_REPORT=REPORT_FOLDER swift test --filter ExportedReferenceBaselineTests/testOptInReviewedSelectionQuality`
 
 The private report folder supplies `quality-reference.json` with case IDs, named roles
 and one-based indices into approved reference samples. Context-only reference indices

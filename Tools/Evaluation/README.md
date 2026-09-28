@@ -2,10 +2,10 @@
 
 `owner-benchmark.example.json` defines the public, synthetic shape of the versioned owner benchmark.
 Keep the real reviewed fixture in the private report folder selected by
-`PHOTO_RELAY_REFERENCE_REPORT`; never place stable photo identifiers, titles, or judgments in source
+`PHOTO_CURATOR_REFERENCE_REPORT`; never place stable photo identifiers, titles, or judgments in source
 control. Phase 1 cannot cut over until that private fixture is versioned and owner-approved.
 
-For a large-visit-only rerun, add `PHOTO_RELAY_VALIDATION_LARGE_ONLY=1` to the structural
+For a large-visit-only rerun, add `PHOTO_CURATOR_VALIDATION_LARGE_ONLY=1` to the structural
 gate command below. It does not rerun or overwrite the holdout report. Reports now retain
 the exact production selection and display evidence in each catalog entry, not only counts.
 After explicit shortlist-review authorization, run
@@ -14,7 +14,7 @@ large-visit selected photos (maximum 64) into a new private directory. It verifi
 and export path containment; no Photos/network calls. Never render a holdout as a shortcut.
 
 Full local structural gate (explicit opt-in):
-`PHOTO_RELAY_VALIDATION_REPORT=REPORT_FOLDER swift test --filter ExportedReferenceBaselineTests/testOptInLargeVisitAndHoldoutValidation`
+`PHOTO_CURATOR_VALIDATION_REPORT=REPORT_FOLDER swift test --filter ExportedReferenceBaselineTests/testOptInLargeVisitAndHoldoutValidation`
 verifies source hashes and analyzes all 624 C03 copies followed by all 684 held-out
 February copies with on-device Vision/OCR. Uses temporary indexes, no PhotoKit/network,
 no folder names as model inputs, and deterministic caption fallback. Saves private
@@ -39,7 +39,7 @@ ExifTool and Node are required for the audit; macOS Swift/AppKit render contact 
    February photos are held out together, never rendered. Contact sheets may contain
    private information; do not commit or upload them to research services.
 4. Run the app metadata baseline and local evidence pilot with
-   `PHOTO_RELAY_REFERENCE_REPORT=REPORT_FOLDER swift test --filter ExportedReferenceBaselineTests`
+   `PHOTO_CURATOR_REFERENCE_REPORT=REPORT_FOLDER swift test --filter ExportedReferenceBaselineTests`
    from the repository root. Only metadata is passed to the existing grouping function.
    It writes `metadata-baseline.json` in the private report folder. A separate test calls
    existing background OCR/classification on 90 already-approved samples at the production

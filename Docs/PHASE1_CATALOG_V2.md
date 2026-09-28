@@ -53,7 +53,7 @@ rather than a permanent library total.
 Run the private rehearsal explicitly with:
 
 ```bash
-PHOTO_CURATOR_PHASE1_CATALOG="$HOME/Library/Application Support/Photo Relay/curator" \
+PHOTO_CURATOR_PHASE1_CATALOG="$HOME/Library/Application Support/Photo Curator/curator" \
   swift test --filter CatalogV2Tests/testOptInCopiedRealCatalogMigration
 ```
 

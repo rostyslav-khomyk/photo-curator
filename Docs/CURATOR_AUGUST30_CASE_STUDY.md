@@ -4,7 +4,7 @@ Tested September 9, 2026. No app redeploy or library edits. Exported using Photo
 not private Photos database access. Search selected 39 entries (30 results plus nine
 duplicate Top Results). SHA-256 deduplication confirmed 30 unique exported JPEGs.
 Copies and private OCR/EXIF output are outside the repository:
-`~/Pictures/Photo Relay Analysis/2026-08-30/`.
+`~/Pictures/Photo Curator Analysis/2026-08-30/`.
 
 Ran `swift Tools/analyze_exported_photos.swift <export-folder>`: all 30 succeeded.
 Vision accurate OCR, face rectangles, image classification; ImageIO metadata;

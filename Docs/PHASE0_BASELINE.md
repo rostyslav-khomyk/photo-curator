@@ -74,7 +74,7 @@ Record these scenarios separately:
 5. Quit during analysis, relaunch, and confirm completed source revisions are not repeated.
 
 Capture RSS at start, maximum, and settled end; longest main-thread stall; idle CPU; first visible
-thumbnail latency; and signpost durations. Available signposts use subsystem `com.photorrelay.app`,
+thumbnail latency; and signpost durations. Available signposts use subsystem `com.photocurator.app`,
 category `Performance`: `Launch to interactive`, `Moment overview`, `Thumbnail request`,
 `Metadata batch`, `Analysis step`, and `Photos publication`.
 
@@ -85,7 +85,7 @@ repeated on the oldest supported alpha Mac. A debug launch is not an acceptable 
 
 The public format is illustrated by
 `Tools/Evaluation/owner-benchmark.example.json`. The real fixture belongs beside the private exported
-reference report and is selected explicitly through `PHOTO_RELAY_REFERENCE_REPORT`; it must not be
+reference report and is selected explicitly through `PHOTO_CURATOR_REFERENCE_REPORT`; it must not be
 committed. Before Phase 1 migration starts, the owner must freeze a version covering dense trips,
 quiet periods, old scans, missing GPS, home/work life, celebrations, venues, and recent GPS-rich days.
 Each case records expected joins/splits, optional Story membership, title, and required highlights.
