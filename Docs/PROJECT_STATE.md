@@ -76,7 +76,9 @@ Panama must be one Journey; mid-route Home zigzags removed).
 - The Moments grid and Story list stay scrollable during a library overview.
   Workspace commands live in the window toolbar. Do not strip
   `fullSizeContentView` or force the title bar opaque: SwiftUI's safe-area top
-  inset is what keeps All Moments and Journey titles below the toolbar. Do not swizzle NSScrollView frames. Inset repair must not
+  inset is what keeps All Moments and Journey titles below the toolbar. The
+  sidebar List and detail column must keep `idealHeight: 0`, or a long Journey
+  list sizes the split taller than the window and All Moments hangs off the top. Do not swizzle NSScrollView frames. Inset repair must not
   cover the window or take scroll events.
 
 Peak finalized titles observed this soak (quality bar to preserve): Bucharest,

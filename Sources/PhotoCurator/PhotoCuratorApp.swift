@@ -124,6 +124,11 @@ struct WindowContentInsetRepair: NSViewRepresentable {
 
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
+            NotificationCenter.default.removeObserver(self)
+            if let window {
+                NotificationCenter.default.addObserver(self, selector: #selector(windowResized),
+                    name: NSWindow.didResizeNotification, object: window)
+            }
             repair()
         }
 
@@ -132,11 +137,18 @@ struct WindowContentInsetRepair: NSViewRepresentable {
             repair()
         }
 
+        /// SwiftUI assigns the split's frame during the resize pass; fit it after that pass.
+        @objc private func windowResized() {
+            repair()
+            DispatchQueue.main.async { [weak self] in self?.repair() }
+        }
+
+        deinit { NotificationCenter.default.removeObserver(self) }
+
         func repair() {
             guard !correcting, let window, let content = window.contentView else { return }
             correcting = true
             defer { correcting = false }
-            SplitViewFrameClamp.install()
             var ancestor: NSView? = self
             while let current = ancestor {
                 disableIntrinsicSizing(current)
@@ -146,7 +158,15 @@ struct WindowContentInsetRepair: NSViewRepresentable {
             for subview in content.subviews {
                 disableIntrinsicSizing(subview)
                 clampNegativeInsets(subview)
-                guard isSwiftUIHost(subview) else { continue }
+                guard isSwiftUIHost(subview) else {
+                    // The NavigationSplitView wrapper adopts the list/grid ideal height and is
+                    // centered, hanging above the window. It already honors the safe area inside,
+                    // so it fills the content view rather than the chrome-free rect.
+                    if containsSplitView(subview), subview.frame != content.bounds {
+                        subview.frame = content.bounds
+                    }
+                    continue
+                }
                 // Only shrink a host that grew past the chrome-free rect.
                 // Do not stretch it into the toolbar, and do not move a correctly
                 // inset host (that is the empty-margin bug).
@@ -169,21 +189,51 @@ struct WindowContentInsetRepair: NSViewRepresentable {
                 || frame.maxX > fill.maxX + 1 || frame.maxY > fill.maxY + 1
         }
 
-        /// NavigationSplitView's NSSplitView adopts the list's ideal height, which is
-        /// taller than the window, so neither column scrolls. Keep every split inside
-        /// its parent and let it resize its columns to that height.
+        /// NavigationSplitView's NSSplitView can keep the list's ideal height, which is taller
+        /// than the window, so neither column scrolls. Fit it to its parent's current bounds on
+        /// every pass; never cache a frame (a cached clamp froze the split at a stale height).
         private func clampSplitViews(in view: NSView) {
             if let split = view as? NSSplitView {
-                SplitViewFrameClamp.install(on: split)
-                let fitted = SplitViewFrameClamp.visibleFrame(for: split, requested: split.frame)
-                if fitted != split.frame {
-                    split.frame = fitted
-                    split.adjustSubviews()
+                disableIntrinsicSizing(inColumnsOf: split)
+                var chain: [NSView] = []
+                var current: NSView = split
+                while let parent = current.superview, current !== view.window?.contentView {
+                    chain.append(current)
+                    current = parent
                 }
-                SplitViewFrameClamp.fitColumns(split)
+                // Outermost wrapper first, so each view fits an already-fitted parent.
+                var changed = false
+                for fitted in chain.reversed() {
+                    guard let parent = fitted.superview, parent !== view.window?.contentView,
+                          fitted.frame != parent.bounds else { continue }
+                    fitted.frame = parent.bounds
+                    changed = true
+                }
+                if changed { split.adjustSubviews() }
+                return
             }
             for subview in view.subviews {
                 clampSplitViews(in: subview)
+            }
+        }
+
+        private func containsSplitView(_ view: NSView, depth: Int = 0) -> Bool {
+            if view is NSSplitView { return true }
+            guard depth < 4 else { return false }
+            return view.subviews.contains { containsSplitView($0, depth: depth + 1) }
+        }
+
+        /// Column hosting views publish the full List/grid height as intrinsic size, which
+        /// becomes the split's fitting size. Stop below nested splits; they get their own pass.
+        private func disableIntrinsicSizing(inColumnsOf split: NSSplitView) {
+            var pending = split.subviews
+            var visited = 0
+            while let view = pending.popLast(), visited < 400 {
+                visited += 1
+                disableIntrinsicSizing(view)
+                if !(view is NSSplitView), !(view is NSScrollView) {
+                    pending.append(contentsOf: view.subviews)
+                }
             }
         }
 
@@ -206,113 +256,6 @@ struct WindowContentInsetRepair: NSViewRepresentable {
                     right: max(0, insets.right))
             }
         }
-    }
-}
-
-/// SwiftUI sizes the Moments split view to the list's ideal height, which is
-/// taller than the window, so the columns never scroll. `NSSplitView` may not
-/// implement `setFrame:` itself, and Key-Value Observing can sit in front of it.
-/// Clamp every class in that chain.
-private enum SplitViewFrameClamp {
-    private typealias SetFrame = @convention(c) (AnyObject, Selector, NSRect) -> Void
-    private static var installed: Set<ObjectIdentifier> = []
-    private static let selector = #selector(setter: NSView.frame)
-    private static let encoding = "v@:{CGRect={CGPoint=dd}{CGSize=dd}}"
-    private static var depth = 0
-    /// Re-entrant `setFrame:` calls must hit `NSView`'s implementation. Looking the
-    /// method up again returns this hook and overflows the stack.
-    private static let viewSetFrame: SetFrame = {
-        let method = class_getInstanceMethod(NSView.self, #selector(setter: NSView.frame))
-        return unsafeBitCast(method_getImplementation(method!), to: SetFrame.self)
-    }()
-    private static var computing: Set<ObjectIdentifier> = []
-    private static var locks: [ObjectIdentifier: NSRect] = [:]
-
-    static func install() {
-        install(on: NSSplitView.self)
-    }
-
-    static func install(on view: NSSplitView) {
-        var current: AnyClass? = object_getClass(view)
-        while let cls = current, cls != NSView.self {
-            install(on: cls)
-            current = class_getSuperclass(cls)
-        }
-    }
-
-    /// Keep the split inside its parent. Do not clamp NSScrollView frames —
-    /// that clips List/grid content from the top.
-    static func visibleFrame(for split: NSSplitView, requested: NSRect) -> NSRect {
-        guard let parent = split.superview else { return requested }
-        return clampPreservingTop(requested, to: parent.bounds)
-    }
-
-    /// Shrink a too-tall frame without moving its top edge. AppKit y=0 is the
-    /// bottom; keeping minY clips the title and All Moments under the chrome.
-    private static func clampPreservingTop(_ requested: NSRect, to limit: NSRect) -> NSRect {
-        guard !limit.isNull, limit.width > 2, limit.height > 2 else { return requested }
-        var frame = requested
-        if frame.minX < limit.minX { frame.origin.x = limit.minX }
-        if frame.width > limit.width { frame.size.width = limit.width }
-        if frame.maxX > limit.maxX { frame.origin.x = limit.maxX - frame.width }
-        if frame.height > limit.height {
-            let top = min(frame.maxY, limit.maxY)
-            frame.size.height = limit.height
-            frame.origin.y = top - frame.size.height
-        }
-        if frame.maxY > limit.maxY { frame.origin.y = limit.maxY - frame.height }
-        if frame.minY < limit.minY {
-            frame.origin.y = limit.minY
-            if frame.maxY > limit.maxY { frame.size.height = limit.height }
-        }
-        return frame
-    }
-
-    /// Column wrappers follow the split. Leave NSScrollView frames to SwiftUI.
-    static func fitColumns(_ split: NSSplitView) {
-        guard depth < 6 else { return }
-        depth += 1
-        defer { depth -= 1 }
-        for subview in split.subviews {
-            let fitted = clampPreservingTop(subview.frame, to: split.bounds)
-            if fitted != subview.frame { subview.frame = fitted }
-        }
-    }
-
-    private static func install(on cls: AnyClass) {
-        let key = ObjectIdentifier(cls)
-        guard installed.insert(key).inserted else { return }
-        let block: @convention(block) (NSSplitView, NSRect) -> Void = { split, rect in
-            let id = ObjectIdentifier(split)
-            if computing.contains(id) {
-                viewSetFrame(split, selector, locks[id] ?? rect)
-                return
-            }
-            computing.insert(id)
-            defer {
-                locks[id] = nil
-                computing.remove(id)
-            }
-            let next = visibleFrame(for: split, requested: rect)
-            if next != rect { locks[id] = next }
-            viewSetFrame(split, selector, next)
-        }
-        let imp = imp_implementationWithBlock(block)
-        if classImplements(selector, on: cls), let method = class_getInstanceMethod(cls, selector) {
-            _ = method_setImplementation(method, imp)
-        } else {
-            _ = class_addMethod(cls, selector, imp, encoding)
-        }
-    }
-
-    private static func classImplements(_ selector: Selector, on cls: AnyClass) -> Bool {
-        var count: UInt32 = 0
-        guard let methods = class_copyMethodList(cls, &count) else { return false }
-        defer { free(methods) }
-        for index in 0..<Int(count) where method_getName(methods[index]) == selector {
-            return true
-        }
-        return false
     }
 }
 

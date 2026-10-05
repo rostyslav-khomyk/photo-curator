@@ -134,6 +134,9 @@ struct CuratorView: View {
             }
         }
         .listStyle(.sidebar)
+        // A List's ideal height is all of its rows; reported upward it makes the split
+        // taller than the window and pushes All Moments above the toolbar.
+        .frame(minHeight: 0, idealHeight: 0, maxHeight: .infinity)
         .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 420)
     }
 
@@ -356,8 +359,10 @@ struct CuratorView: View {
             storiesSidebar
         } detail: {
             momentsDetail
+                .frame(minHeight: 0, idealHeight: 0, maxHeight: .infinity, alignment: .top)
         }
         .navigationSplitViewStyle(.balanced)
+        .frame(minHeight: 0, idealHeight: 0, maxHeight: .infinity)
         .toolbar {
             if selectingJourneys {
                 ToolbarItem(placement: .navigation) {
