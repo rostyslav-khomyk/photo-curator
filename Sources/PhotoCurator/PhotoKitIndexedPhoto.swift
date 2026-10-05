@@ -27,6 +27,11 @@ extension IndexedPhoto {
         if #available(macOS 27, *) {
             photo.rating = asset.rating.rawValue
         }
+        if let resource = PHAssetResource.assetResources(for: asset).first(where: {
+            $0.type == .photo || $0.type == .fullSizePhoto
+        }) {
+            photo.sourceUTI = resource.uniformTypeIdentifier
+        }
         return photo
     }
 }

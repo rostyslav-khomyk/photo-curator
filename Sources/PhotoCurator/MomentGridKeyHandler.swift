@@ -39,6 +39,8 @@ struct MomentGridKeyHandler: NSViewRepresentable {
 
     final class WindowTrackingView: NSView {
         var windowChanged: ((Int?) -> Void)?
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+        override var isOpaque: Bool { false }
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             windowChanged?(window?.windowNumber)

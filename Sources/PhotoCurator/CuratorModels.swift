@@ -21,6 +21,13 @@ struct IndexedPhoto: Equatable, Identifiable, Sendable {
     /// `PHAsset.Rating.rawValue`; 0 means unset / older OS.
     var rating: Int = 0
     var burstIdentifier: String? = nil
+    /// PhotoKit/EXIF camera identity when known. Never a hardcoded family roster —
+    /// only a signal for tests and later route reconciliation.
+    var cameraMake: String? = nil
+    var cameraModel: String? = nil
+    /// PhotoKit resource UTI when known (RAW vs JPEG). Used with camera fields to
+    /// spot dedicated still cameras that will never grow GPS.
+    var sourceUTI: String? = nil
 
     /// Job and cache identity. Still includes modificationDate until content adoption rebases it.
     var analysisRevision: String {
@@ -40,7 +47,7 @@ extension IndexedPhoto: Codable {
     enum CodingKeys: String, CodingKey {
         case id, created, modified, latitude, longitude, favorite, width, height
         case similarityCategory, hasAdjustments, adjustmentTimestamp, adjustmentFormatIdentifier
-        case addedDate, rating, burstIdentifier
+        case addedDate, rating, burstIdentifier, cameraMake, cameraModel, sourceUTI
     }
 
     init(from decoder: Decoder) throws {
@@ -61,6 +68,9 @@ extension IndexedPhoto: Codable {
         addedDate = try values.decodeIfPresent(Date.self, forKey: .addedDate)
         rating = try values.decodeIfPresent(Int.self, forKey: .rating) ?? 0
         burstIdentifier = try values.decodeIfPresent(String.self, forKey: .burstIdentifier)
+        cameraMake = try values.decodeIfPresent(String.self, forKey: .cameraMake)
+        cameraModel = try values.decodeIfPresent(String.self, forKey: .cameraModel)
+        sourceUTI = try values.decodeIfPresent(String.self, forKey: .sourceUTI)
     }
 
     func encode(to encoder: Encoder) throws {
@@ -80,6 +90,9 @@ extension IndexedPhoto: Codable {
         try values.encodeIfPresent(addedDate, forKey: .addedDate)
         try values.encode(rating, forKey: .rating)
         try values.encodeIfPresent(burstIdentifier, forKey: .burstIdentifier)
+        try values.encodeIfPresent(cameraMake, forKey: .cameraMake)
+        try values.encodeIfPresent(cameraModel, forKey: .cameraModel)
+        try values.encodeIfPresent(sourceUTI, forKey: .sourceUTI)
     }
 }
 
@@ -116,12 +129,14 @@ enum MomentGrouping {
             if $0.created == $1.created { return $0.id < $1.id }
             return $0.created! < $1.created!
         }
+        let cadence = AdaptiveDayCadence.thresholds(dated, calendar: calendar)
         var groups: [[IndexedPhoto]] = []
         for photo in dated {
             if let previous = groups.last?.last,
                let date = photo.created, let previousDate = previous.created {
                 let sameDay = calendar.isDate(date, inSameDayAs: previousDate)
-                let closeInTime = date.timeIntervalSince(previousDate) <= 2 * 3600
+                let gapLimit = AdaptiveDayCadence.gap(for: previousDate, thresholds: cadence, calendar: calendar)
+                let closeInTime = date.timeIntervalSince(previousDate) <= gapLimit
                 let distance: Double? = {
                     guard let lat = photo.latitude, let lon = photo.longitude,
                           let otherLat = previous.latitude, let otherLon = previous.longitude else { return nil }

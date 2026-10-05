@@ -31,11 +31,14 @@ struct StorySummary: Equatable, Sendable, Identifiable {
     let coverAssetID: String?
     let kind: StoryKind
     let stops: [JourneyStopEvidence]
+    let synopsis: String?
+    let customized: Bool
 
-    /// Sidebar-ready Journey: grounded destination title, not the unresolved `Journey from Home` shell.
+    /// Sidebar-ready Journey: any grounded title, not the unresolved `Journey from …` shell.
+    /// Seasonal names (`Summer holidays in France`) and saved renames count; the shell does not.
     var isFinalizedJourney: Bool {
         kind == .journey
-            && (title.hasPrefix("Journey to ") || title.hasPrefix("Journey via "))
+            && !title.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("Journey from ")
     }
 }
 
@@ -208,7 +211,25 @@ private final class CatalogV2Connection {
                         userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(opened))])
                 }
             }
-            guard sqlite3_exec(opened, "PRAGMA user_version=11;", nil, nil, nil) == SQLITE_OK else {
+            if previousVersion < 12 {
+                guard sqlite3_exec(opened, """
+                    CREATE TABLE IF NOT EXISTS story_edits(
+                      story_id TEXT PRIMARY KEY,title TEXT,synopsis TEXT);
+                    """, nil, nil, nil) == SQLITE_OK else {
+                    throw NSError(domain: "PhotoCurator.CatalogV2", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(opened))])
+                }
+            }
+            if previousVersion < 13 {
+                guard sqlite3_exec(opened, """
+                    CREATE TABLE IF NOT EXISTS story_merges(
+                      id TEXT PRIMARY KEY, moment_ids TEXT NOT NULL, title TEXT);
+                    """, nil, nil, nil) == SQLITE_OK else {
+                    throw NSError(domain: "PhotoCurator.CatalogV2", code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(opened))])
+                }
+            }
+            guard sqlite3_exec(opened, "PRAGMA user_version=13;", nil, nil, nil) == SQLITE_OK else {
                 throw NSError(domain: "PhotoCurator.CatalogV2", code: 1,
                     userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(opened))])
             }
@@ -223,7 +244,7 @@ private final class CatalogV2Connection {
 }
 
 actor CatalogV2Store {
-    static let schemaVersion = 11
+    static let schemaVersion = 13
     private let connection: CatalogV2Connection
     private var db: OpaquePointer? { connection.db }
     private let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
@@ -327,11 +348,18 @@ actor CatalogV2Store {
         }
     }
 
-    /// True when Moments exist but Story membership was wiped (cascaded deletes / failed rebuild).
+    /// Bump when Journey/outing projection rules change so existing Stories recompute.
+    static let storyProjectionEpoch = "story-projection-v55-unlocated-full-names"
+
+    /// True when Moments exist but Story membership was wiped, or Journey rules advanced.
     func needsStoryProjection() throws -> Bool {
         let moments = try scalar("SELECT COUNT(*) FROM moments")
         guard moments > 0 else { return false }
-        return try scalar("SELECT COUNT(*) FROM story_moments") == 0
+        if try scalar("SELECT COUNT(*) FROM story_moments") == 0 { return true }
+        return try scalar("""
+            SELECT COUNT(*) FROM schema_migrations
+            WHERE name='\(Self.storyProjectionEpoch)' AND completed=1
+            """) == 0
     }
 
     func rebuildStories(calendar: Calendar = .current) throws {
@@ -364,15 +392,197 @@ actor CatalogV2Store {
                                                           longitude: sqlite3_column_double(statement, 8))
             }
         }
-        let home = try meaningfulPlace(named: "Home")
-        let stories = StoryHierarchyBuilder.stories(moments, home: home, calendar: calendar,
+        let homes = try homeMeaningfulPlaces()
+        let homeLabel = homes.first(where: {
+            $0.label.compare("Home", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+        })?.label ?? homes.first?.label ?? "Home"
+        // Geocoded city labels are expensive to rediscover; rebuild must not wipe them to
+        // "Journey from Home" and empty the finalized sidebar until OCR/geocode catches up.
+        let preservedPlaces = try preservedJourneyStopPlaces()
+        let leftoverMoments = try momentMemberships()
+        let leftoverPhotos = try experimentalUnlocatedPhotos()
+        let stories = StoryHierarchyBuilder.stories(moments, homes: homes, calendar: calendar,
             coordinate: { coordinates[$0.id] }, placeID: { $0.narrative?.place },
-            support: { facts[$0.id]?.photos ?? 0 })
-        try persistStories(stories, facts: facts)
+            support: { facts[$0.id]?.photos ?? 0 },
+            leftoverMoments: leftoverMoments,
+            leftoverPhotos: leftoverPhotos)
+        let titled = adoptingPreservedJourneyPlaces(stories, preserved: preservedPlaces,
+                                                    homeLabel: homeLabel)
+        let merged = try applyingJourneyMerges(titled)
+        let candidates = try hierarchicalHighlightCandidatesByMoment()
+        let highlightPlan = Dictionary(uniqueKeysWithValues: merged.map { story -> (String, HierarchicalHighlightAllocation) in
+            let storyCandidates = story.momentIDs.flatMap { candidates[$0] ?? [] }
+            let allocation = HierarchicalHighlightAllocator.allocate(storyCandidates) { lhs, rhs in
+                lhs == rhs ? 1 : 0
+            }
+            return (story.id, allocation)
+        })
+        try persistStories(merged, facts: facts, highlights: highlightPlan)
+        try execute("""
+            INSERT OR REPLACE INTO schema_migrations(name,completed_at,completed)
+            VALUES('\(Self.storyProjectionEpoch)',strftime('%s','now'),1)
+            """)
+    }
+
+    /// Moment highlight assets already chosen for display, keyed for Story-level allocation.
+    /// Does not rewrite Moment selections — Moments stay independently editable.
+    private func hierarchicalHighlightCandidatesByMoment() throws
+        -> [String: [HierarchicalHighlightCandidate]] {
+        let statement = try prepare("""
+            SELECT ma.moment_id, ma.asset_id, ma.sequence, COALESCE(a.favorite, 0)
+            FROM moment_assets ma
+            JOIN assets a ON a.id = ma.asset_id
+            WHERE ma.display_role = 'highlight'
+            ORDER BY ma.moment_id, ma.sequence
+            """)
+        defer { sqlite3_finalize(statement) }
+        var result: [String: [HierarchicalHighlightCandidate]] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let momentID = text(statement, 0)
+            let assetID = text(statement, 1)
+            let sequence = Int(sqlite3_column_int64(statement, 2))
+            let favorite = sqlite3_column_int64(statement, 3) != 0
+            var roles: Set<String> = ["highlight", "moment:\(momentID)"]
+            if favorite { roles.insert("favorite") }
+            let quality = favorite ? 1.0 : max(0.2, 1.0 - Double(sequence) * 0.05)
+            result[momentID, default: []].append(
+                HierarchicalHighlightCandidate(id: assetID, momentID: momentID,
+                    quality: quality, protected: favorite, roles: roles))
+        }
+        return result
+    }
+
+    /// City/region labels from the previous Journey evidence keyed by rounded stop coordinates.
+    private func preservedJourneyStopPlaces() throws -> [String: String] {
+        let statement = try prepare("SELECT evidence FROM stories WHERE kind='journey' AND evidence IS NOT NULL")
+        defer { sqlite3_finalize(statement) }
+        let decoder = JSONDecoder()
+        var places: [String: String] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let stops = try? decoder.decode([JourneyStopEvidence].self, from: blob(statement, 0)) else {
+                continue
+            }
+            for stop in stops {
+                guard let place = stop.place?.trimmingCharacters(in: .whitespacesAndNewlines),
+                      !place.isEmpty,
+                      !PlaceNaming.shouldReplaceJourneyStopLabel(place),
+                      !PlaceNaming.labelConflictsWithCoordinates(place, latitude: stop.latitude,
+                                                                 longitude: stop.longitude) else { continue }
+                places[journeyStopCoordinateKey(stop)] = place
+            }
+        }
+        return places
+    }
+
+    private func journeyStopCoordinateKey(_ stop: JourneyStopEvidence) -> String {
+        String(format: "%.3f,%.3f", stop.latitude, stop.longitude)
+    }
+
+    /// Re-applies preserved city labels onto rebuilt stops and retitles Journeys.
+    private func adoptingPreservedJourneyPlaces(
+        _ stories: [CurationStory],
+        preserved: [String: String],
+        homeLabel: String
+    ) -> [CurationStory] {
+        let homes = (try? homeMeaningfulPlaces()) ?? []
+        return stories.map { story in
+            guard story.kind == .journey, !story.stops.isEmpty else { return story }
+            var stops = story.stops.map { stop -> JourneyStopEvidence in
+                let current = stop.place?.trimmingCharacters(in: .whitespacesAndNewlines)
+                if let current, !current.isEmpty, !PlaceNaming.shouldReplaceJourneyStopLabel(current),
+                   !PlaceNaming.labelConflictsWithCoordinates(current, latitude: stop.latitude,
+                                                              longitude: stop.longitude) {
+                    return stop
+                }
+                guard let place = preserved[journeyStopCoordinateKey(stop)],
+                      !PlaceNaming.shouldReplaceJourneyStopLabel(place),
+                      !PlaceNaming.labelConflictsWithCoordinates(place, latitude: stop.latitude,
+                                                                 longitude: stop.longitude) else { return stop }
+                // Never stamp a preserved “Home” onto mid-ocean / abroad messenger pins.
+                if JourneyStoryBuilder.isSecondaryHomeLabel(place, primaryHome: homeLabel) {
+                    return stop
+                }
+                return JourneyStopEvidence(start: stop.start, end: stop.end,
+                    latitude: stop.latitude, longitude: stop.longitude,
+                    momentCount: stop.momentCount, photoCount: stop.photoCount,
+                    place: place, confidence: max(stop.confidence, 0.8),
+                    transportFromPrevious: stop.transportFromPrevious)
+            }
+            stops = JourneyStopSanitizer.removingRouteNoise(stops, homes: homes, homeLabel: homeLabel)
+            stops = JourneyTransportInference.applying(to: stops)
+            let title = JourneyStoryBuilder.title(homeLabel: homeLabel, stops: stops)
+            return CurationStory(id: story.id, start: story.start, end: story.end,
+                momentIDs: story.momentIDs, placeID: title, kind: story.kind, stops: stops)
+        }
+    }
+
+    /// User Journey merges survive `rebuildStories`. A merge applies only when the saved
+    /// Moment set is exactly the union of two or more current Journeys.
+    private func applyingJourneyMerges(_ stories: [CurationStory]) throws -> [CurationStory] {
+        JourneyMergePlan.applying(stories, merges: try journeyMergeRecords())
+    }
+
+    func journeyMergeRecords() throws -> [JourneyMergeRecord] {
+        let statement = try prepare("SELECT id, moment_ids, title FROM story_merges ORDER BY id")
+        defer { sqlite3_finalize(statement) }
+        var records: [JourneyMergeRecord] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let payload = Data(text(statement, 1).utf8)
+            guard let ids = try? JSONDecoder().decode([String].self, from: payload), ids.count >= 2 else {
+                continue
+            }
+            records.append(JourneyMergeRecord(id: text(statement, 0), momentIDs: ids,
+                                              title: optionalText(statement, 2) ?? ""))
+        }
+        return records
+    }
+
+    /// Removes a saved Journey merge (and its title edit) so Stories rebuild from Moments again.
+    func deleteJourneyMerge(id: String) throws {
+        let clearEdit = try prepare("DELETE FROM story_edits WHERE story_id=?")
+        defer { sqlite3_finalize(clearEdit) }
+        sqlite3_bind_text(clearEdit, 1, id, -1, transient)
+        guard sqlite3_step(clearEdit) == SQLITE_DONE else { throw failure() }
+        let clearMerge = try prepare("DELETE FROM story_merges WHERE id=?")
+        defer { sqlite3_finalize(clearMerge) }
+        sqlite3_bind_text(clearMerge, 1, id, -1, transient)
+        guard sqlite3_step(clearMerge) == SQLITE_DONE else { throw failure() }
+    }
+
+    func deleteJourneyMerges(titled title: String) throws {
+        let statement = try prepare("SELECT id FROM story_merges WHERE title=? COLLATE NOCASE")
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, title, -1, transient)
+        var ids: [String] = []
+        while sqlite3_step(statement) == SQLITE_ROW { ids.append(text(statement, 0)) }
+        for id in ids { try deleteJourneyMerge(id: id) }
+    }
+
+    /// Remembers a Journey merge and a title edit. The next story rebuild collapses matching Journeys.
+    func saveJourneyMerge(momentIDs: [String], title: String) throws {
+        let ids = Array(Set(momentIDs)).sorted()
+        guard ids.count >= 2 else { throw failure("Choose at least two Journeys to merge") }
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= 200 else {
+            throw failure("Enter a Journey name up to 200 characters")
+        }
+        let id = JourneyMergePlan.id(momentIDs: ids)
+        let payload = String(data: try JSONEncoder().encode(ids), encoding: .utf8) ?? "[]"
+        let statement = try prepare("""
+            INSERT INTO story_merges(id, moment_ids, title) VALUES(?,?,?)
+            ON CONFLICT(id) DO UPDATE SET moment_ids=excluded.moment_ids, title=excluded.title
+            """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, id, -1, transient)
+        sqlite3_bind_text(statement, 2, payload, -1, transient)
+        sqlite3_bind_text(statement, 3, trimmed, -1, transient)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }
+        try upsertStoryEdit(id: id, title: trimmed, synopsis: nil)
     }
 
     private func persistStories(_ stories: [CurationStory],
-                                facts: [String: (photos: Int, highlights: Int, cover: String?)]) throws {
+                                facts: [String: (photos: Int, highlights: Int, cover: String?)],
+                                highlights: [String: HierarchicalHighlightAllocation] = [:]) throws {
         try execute("BEGIN IMMEDIATE")
         do {
             try execute("DELETE FROM story_moments; DELETE FROM stories")
@@ -382,9 +592,17 @@ actor CatalogV2Store {
                 """)
             let insertMember = try prepare("INSERT INTO story_moments VALUES(?,?,?)")
             defer { sqlite3_finalize(insertStory); sqlite3_finalize(insertMember) }
+            var claimedMoments = Set<String>()
             for story in stories {
                 let values = story.momentIDs.compactMap { facts[$0] }
-                let cover = story.momentIDs.compactMap { id -> (String, Int)? in
+                let allocation = highlights[story.id]
+                let storyHighlightIDs = allocation?.storyHighlights ?? []
+                // Prefer curated Story-level set; fall back to summed Moment counts when Moments
+                // still lack highlight membership (early indexing).
+                let highlightCount = storyHighlightIDs.isEmpty
+                    ? values.reduce(0) { $0 + $1.highlights }
+                    : storyHighlightIDs.count
+                let cover = storyHighlightIDs.first ?? story.momentIDs.compactMap { id -> (String, Int)? in
                     guard let value = facts[id], let cover = value.cover else { return nil }
                     return (cover, value.highlights)
                 }.max { $0.1 < $1.1 }?.0
@@ -394,19 +612,22 @@ actor CatalogV2Store {
                 sqlite3_bind_double(insertStory, 3, story.start.timeIntervalSince1970)
                 sqlite3_bind_double(insertStory, 4, story.end.timeIntervalSince1970)
                 sqlite3_bind_int64(insertStory, 5, Int64(values.reduce(0) { $0 + $1.photos }))
-                sqlite3_bind_int64(insertStory, 6, Int64(values.reduce(0) { $0 + $1.highlights }))
+                sqlite3_bind_int64(insertStory, 6, Int64(highlightCount))
                 bind(cover, to: insertStory, at: 7)
                 sqlite3_bind_int64(insertStory, 8, Int64(story.momentIDs.count))
                 sqlite3_bind_text(insertStory, 9, story.kind.rawValue, -1, transient)
                 if story.stops.isEmpty { sqlite3_bind_null(insertStory, 10) }
                 else { bind(try JSONEncoder().encode(story.stops), to: insertStory, at: 10) }
                 guard sqlite3_step(insertStory) == SQLITE_DONE else { throw failure() }
-                for (sequence, momentID) in story.momentIDs.enumerated() {
+                var sequence = 0
+                for momentID in story.momentIDs {
+                    guard claimedMoments.insert(momentID).inserted else { continue }
                     sqlite3_reset(insertMember); sqlite3_clear_bindings(insertMember)
                     sqlite3_bind_text(insertMember, 1, story.id, -1, transient)
                     sqlite3_bind_text(insertMember, 2, momentID, -1, transient)
                     sqlite3_bind_int64(insertMember, 3, Int64(sequence))
                     guard sqlite3_step(insertMember) == SQLITE_DONE else { throw failure() }
+                    sequence += 1
                 }
             }
             try execute("COMMIT")
@@ -424,6 +645,76 @@ actor CatalogV2Store {
         return MeaningfulPlace(id: id, label: text(statement, 1), address: text(statement, 2),
             latitude: sqlite3_column_double(statement, 3), longitude: sqlite3_column_double(statement, 4),
             radius: sqlite3_column_double(statement, 5))
+    }
+
+    /// Primary Home plus secondary residences (`Home in Ukraine`). Used to start/end Journeys.
+    /// Merges catalog rows with the Settings store so a newly mapped Home is not missed.
+    private func homeMeaningfulPlaces() throws -> [MeaningfulPlace] {
+        let statement = try prepare("""
+            SELECT id,label,address,latitude,longitude,radius FROM meaningful_places
+            WHERE label LIKE 'Home%' COLLATE NOCASE
+            ORDER BY CASE WHEN label = 'Home' COLLATE NOCASE THEN 0 ELSE 1 END, label
+            """)
+        defer { sqlite3_finalize(statement) }
+        var places: [MeaningfulPlace] = []
+        var seen = Set<UUID>()
+        while sqlite3_step(statement) == SQLITE_ROW {
+            guard let id = UUID(uuidString: text(statement, 0)) else { continue }
+            seen.insert(id)
+            places.append(MeaningfulPlace(id: id, label: text(statement, 1), address: text(statement, 2),
+                latitude: sqlite3_column_double(statement, 3), longitude: sqlite3_column_double(statement, 4),
+                radius: sqlite3_column_double(statement, 5)))
+        }
+        for place in MeaningfulPlacesStore.snapshot() where place.label.lowercased().hasPrefix("home") {
+            if seen.insert(place.id).inserted { places.append(place) }
+        }
+        if places.isEmpty, let home = try meaningfulPlace(named: "Home") {
+            return [home]
+        }
+        return places.sorted {
+            let left = $0.label.compare("Home", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+            let right = $1.label.compare("Home", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+            if left != right { return left && !right }
+            return $0.label < $1.label
+        }
+    }
+
+    /// Retitles every Journey from current stop coordinates, clears stuck landmark labels, and
+    /// rebuilds so home start/end anchors and country/season names refresh.
+    func reprocessJourneyPresentation() throws {
+        journeyAttemptedStopKeys.removeAll()
+        let stories = try storySummaries().filter { $0.kind == .journey }
+        let homeLabel = try homeMeaningfulPlaces().first?.label ?? "Home"
+        let encoder = JSONEncoder()
+        try execute("BEGIN IMMEDIATE")
+        do {
+            let update = try prepare("UPDATE stories SET title=?,evidence=? WHERE id=?")
+            defer { sqlite3_finalize(update) }
+            for story in stories {
+                let stops = story.stops.map { stop -> JourneyStopEvidence in
+                    guard PlaceNaming.shouldReplaceJourneyStopLabel(stop.place)
+                        || PlaceNaming.labelConflictsWithCoordinates(stop.place, latitude: stop.latitude,
+                                                                     longitude: stop.longitude) else { return stop }
+                    return JourneyStopEvidence(start: stop.start, end: stop.end,
+                        latitude: stop.latitude, longitude: stop.longitude,
+                        momentCount: stop.momentCount, photoCount: stop.photoCount,
+                        place: nil, confidence: stop.confidence,
+                        transportFromPrevious: stop.transportFromPrevious)
+                }
+                // Country/season titles use coordinates even when place labels are cleared.
+                let title = JourneyStoryBuilder.title(homeLabel: homeLabel, stops: stops)
+                sqlite3_reset(update); sqlite3_clear_bindings(update)
+                sqlite3_bind_text(update, 1, title, -1, transient)
+                bind(try encoder.encode(stops), to: update, at: 2)
+                sqlite3_bind_text(update, 3, story.id, -1, transient)
+                guard sqlite3_step(update) == SQLITE_DONE else { throw failure() }
+            }
+            try execute("COMMIT")
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+        try rebuildStories()
     }
 
     /// Parent Story for Photos publication folders. Nil when the Moment is ungrouped.
@@ -470,10 +761,45 @@ actor CatalogV2Store {
         }
     }
 
+    /// Unlocated pre-2010 assets, with Photos.sqlite names/filenames/timezones when readable.
+    func experimentalUnlocatedPhotos(
+        extendedAccess: Bool = ExperimentalUnlocatedJourneyBuilder.extendedAccessEnabled
+    ) throws -> [ExperimentalUnlocatedJourneyBuilder.Photo] {
+        guard extendedAccess else { return [] }
+        let cutoff = ExperimentalUnlocatedJourneyBuilder.defaultCutoff.timeIntervalSince1970
+        let statement = try prepare("""
+            SELECT a.id, a.created, a.latitude, a.longitude
+            FROM assets a
+            JOIN moment_assets ma ON ma.asset_id = a.id
+            WHERE a.created IS NOT NULL AND a.created < ?
+            GROUP BY a.id
+            """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_double(statement, 1, cutoff)
+        var photos: [ExperimentalUnlocatedJourneyBuilder.Photo] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let lat = sqlite3_column_type(statement, 2) == SQLITE_NULL ? nil : sqlite3_column_double(statement, 2)
+            let lon = sqlite3_column_type(statement, 3) == SQLITE_NULL ? nil : sqlite3_column_double(statement, 3)
+            let unlocated = lat == nil || lon == nil
+                || (abs(lat!) < 0.0001 && abs(lon!) < 0.0001)
+                || abs(lat!) > 90 || abs(lon!) > 180
+            guard unlocated else { continue }
+            photos.append(ExperimentalUnlocatedJourneyBuilder.Photo(
+                id: text(statement, 0),
+                created: Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
+                unlocated: true))
+        }
+        guard !photos.isEmpty else { return [] }
+        let overlay = ExperimentalUnlocatedSignalLoader.load()
+        return photos.map { overlay.applied(to: $0) }
+    }
+
     func storySummaries() throws -> [StorySummary] {
         let storyStatement = try prepare("""
-            SELECT id,title,start,end,photo_count,highlight_count,cover_asset_id,kind,evidence
-            FROM stories ORDER BY start DESC,id
+            SELECT s.id,COALESCE(e.title,s.title),s.start,s.end,s.photo_count,s.highlight_count,
+                   s.cover_asset_id,s.kind,s.evidence,e.synopsis,e.story_id IS NOT NULL
+            FROM stories s LEFT JOIN story_edits e ON e.story_id=s.id
+            ORDER BY s.start DESC,s.id
             """)
         defer { sqlite3_finalize(storyStatement) }
         let memberStatement = try prepare("SELECT moment_id FROM story_moments WHERE story_id=? ORDER BY sequence")
@@ -488,14 +814,57 @@ actor CatalogV2Store {
             let kind = StoryKind(rawValue: text(storyStatement, 7)) ?? .outing
             let stops = sqlite3_column_type(storyStatement, 8) == SQLITE_NULL ? []
                 : (try? JSONDecoder().decode([JourneyStopEvidence].self, from: blob(storyStatement, 8))) ?? []
-            result.append(StorySummary(id: id, title: text(storyStatement, 1),
+            let title = text(storyStatement, 1)
+            let customized = sqlite3_column_int(storyStatement, 10) != 0
+            let storedSynopsis = optionalText(storyStatement, 9)
+            let synopsis: String?
+            if let storedSynopsis, !storedSynopsis.isEmpty {
+                synopsis = storedSynopsis
+            } else if let candidate = try? LocalStoryNarrative.candidates(
+                LocalStoryNarrative.metadata(for: StorySummary(
+                    id: id, title: title, start: Date(timeIntervalSince1970: sqlite3_column_double(storyStatement, 2)),
+                    end: Date(timeIntervalSince1970: sqlite3_column_double(storyStatement, 3)),
+                    momentIDs: momentIDs, photoCount: Int(sqlite3_column_int64(storyStatement, 4)),
+                    highlightCount: Int(sqlite3_column_int64(storyStatement, 5)),
+                    coverAssetID: optionalText(storyStatement, 6), kind: kind, stops: stops,
+                    synopsis: nil, customized: customized))).first {
+                synopsis = candidate.synopsis
+            } else {
+                synopsis = nil
+            }
+            result.append(StorySummary(id: id, title: title,
                 start: Date(timeIntervalSince1970: sqlite3_column_double(storyStatement, 2)),
                 end: Date(timeIntervalSince1970: sqlite3_column_double(storyStatement, 3)),
                 momentIDs: momentIDs, photoCount: Int(sqlite3_column_int64(storyStatement, 4)),
                 highlightCount: Int(sqlite3_column_int64(storyStatement, 5)),
-                coverAssetID: optionalText(storyStatement, 6), kind: kind, stops: stops))
+                coverAssetID: optionalText(storyStatement, 6), kind: kind, stops: stops,
+                synopsis: synopsis, customized: customized))
         }
         return result
+    }
+
+    /// Persists user Story title/synopsis overrides. Rebuilds keep these rows.
+    func upsertStoryEdit(id: String, title: String?, synopsis: String?) throws {
+        let trimmedTitle = title?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSynopsis = synopsis?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let titleValue = (trimmedTitle?.isEmpty == false) ? String(trimmedTitle!.prefix(200)) : nil
+        let synopsisValue = (trimmedSynopsis?.isEmpty == false) ? String(trimmedSynopsis!.prefix(600)) : nil
+        if titleValue == nil && synopsisValue == nil {
+            let clear = try prepare("DELETE FROM story_edits WHERE story_id=?")
+            defer { sqlite3_finalize(clear) }
+            sqlite3_bind_text(clear, 1, id, -1, transient)
+            guard sqlite3_step(clear) == SQLITE_DONE else { throw failure() }
+            return
+        }
+        let statement = try prepare("""
+            INSERT INTO story_edits(story_id,title,synopsis) VALUES(?,?,?)
+            ON CONFLICT(story_id) DO UPDATE SET title=excluded.title,synopsis=excluded.synopsis
+            """)
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, id, -1, transient)
+        bind(titleValue, to: statement, at: 2)
+        bind(synopsisValue, to: statement, at: 3)
+        guard sqlite3_step(statement) == SQLITE_DONE else { throw failure() }
     }
 
     /// One leg and at most 24 cached photos per pass. No SQL transaction spans the await.
@@ -571,9 +940,10 @@ actor CatalogV2Store {
         var seen = Set<String>()
         // Street-level place IDs block city naming; treat them as unresolved for geocode.
         let unresolved = stories.flatMap(\.stops).filter { stop in
-            let needsCity = stop.place == nil
-                || PlaceNaming.looksStreetLevel(stop.place ?? "")
-            return needsCity && seen.insert(key(stop)).inserted
+            (PlaceNaming.shouldReplaceJourneyStopLabel(stop.place)
+                || PlaceNaming.labelConflictsWithCoordinates(stop.place, latitude: stop.latitude,
+                                                             longitude: stop.longitude))
+                && seen.insert(key(stop)).inserted
         }
         var candidates = unresolved.filter { !journeyAttemptedStopKeys.contains(key($0)) }
         if candidates.isEmpty, !unresolved.isEmpty {
@@ -584,9 +954,12 @@ actor CatalogV2Store {
         let selected = Array(candidates.prefix(maximumLookups))
         journeyAttemptedStopKeys.formUnion(selected.map(key))
         let hasMore = candidates.count > selected.count
-        let home = try meaningfulPlace(named: "Home")
+        let homes = try homeMeaningfulPlaces()
+        let primaryHome = homes.first(where: {
+            $0.label.compare("Home", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+        }) ?? homes.first
         let homeLocality: String?
-        if let home, let place = await geocoder.place(for: home.latitude, longitude: home.longitude) {
+        if let home = primaryHome, let place = await geocoder.place(for: home.latitude, longitude: home.longitude) {
             homeLocality = place.locality
         } else {
             homeLocality = nil
@@ -594,24 +967,27 @@ actor CatalogV2Store {
         var resolved: [String: String] = [:]
         for stop in selected {
             try Task.checkCancellation()
-            // Prefer Home geofence over city-name equality so Woerden streets stay Home.
-            if let home, home.contains(latitude: stop.latitude, longitude: stop.longitude) {
+            // Prefer any Home geofence over city-name equality so Woerden streets stay Home.
+            if let home = homes.first(where: { $0.contains(latitude: stop.latitude, longitude: stop.longitude) }) {
                 resolved[key(stop)] = home.label
                 continue
             }
             guard let place = await geocoder.place(for: stop.latitude, longitude: stop.longitude) else { continue }
             let label = place.journeyStopName.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !label.isEmpty, !PlaceNaming.looksStreetLevel(label) else { continue }
+            guard !label.isEmpty, !PlaceNaming.looksStreetLevel(label),
+                  !PlaceNaming.looksLandmarkOrTransit(label),
+                  !PlaceNaming.labelConflictsWithCoordinates(label, latitude: stop.latitude,
+                                                             longitude: stop.longitude) else { continue }
             if let homeLocality,
                homeLocality.compare(label, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame {
-                resolved[key(stop)] = home?.label ?? "Home"
+                resolved[key(stop)] = primaryHome?.label ?? "Home"
             } else {
                 resolved[key(stop)] = label
             }
         }
         guard !resolved.isEmpty else { return (selected.count, 0, hasMore) }
 
-        let homeLabel = home?.label ?? "Home"
+        let homeLabel = primaryHome?.label ?? "Home"
         let encoder = JSONEncoder()
         try execute("BEGIN IMMEDIATE")
         do {
@@ -621,9 +997,9 @@ actor CatalogV2Store {
             for story in stories {
                 let stops = story.stops.map { stop -> JourneyStopEvidence in
                     guard let place = resolved[key(stop)] else { return stop }
-                    let current = stop.place
-                    let replaceable = current == nil || PlaceNaming.looksStreetLevel(current ?? "")
-                    guard replaceable else { return stop }
+                    guard PlaceNaming.shouldReplaceJourneyStopLabel(stop.place)
+                        || PlaceNaming.labelConflictsWithCoordinates(stop.place, latitude: stop.latitude,
+                                                                     longitude: stop.longitude) else { return stop }
                     return JourneyStopEvidence(start: stop.start, end: stop.end,
                         latitude: stop.latitude, longitude: stop.longitude,
                         momentCount: stop.momentCount, photoCount: stop.photoCount,
@@ -1144,6 +1520,10 @@ actor CatalogV2Store {
               moment_id TEXT NOT NULL REFERENCES moments(id) ON DELETE CASCADE,
               sequence INTEGER NOT NULL,PRIMARY KEY(story_id,moment_id),UNIQUE(story_id,sequence),
               UNIQUE(moment_id));
+            CREATE TABLE IF NOT EXISTS story_edits(
+              story_id TEXT PRIMARY KEY,title TEXT,synopsis TEXT);
+            CREATE TABLE IF NOT EXISTS story_merges(
+              id TEXT PRIMARY KEY, moment_ids TEXT NOT NULL, title TEXT);
             CREATE TABLE IF NOT EXISTS moment_edits(
               moment_id TEXT PRIMARY KEY,
               title TEXT, description TEXT, protected_members BLOB);
@@ -1193,7 +1573,7 @@ actor CatalogV2Store {
               singleton INTEGER PRIMARY KEY CHECK(singleton=1),
               active_generation_id TEXT NOT NULL REFERENCES curation_generations(id),
               previous_generation_id TEXT REFERENCES curation_generations(id));
-            PRAGMA user_version=11;
+            PRAGMA user_version=12;
             """
 
     private func activeGenerationID() throws -> String? {

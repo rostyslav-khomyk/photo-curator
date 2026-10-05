@@ -81,3 +81,67 @@ struct MomentMergeView: View {
         }.padding(24).frame(width: 520)
     }
 }
+
+struct JourneyMergeDraft: Identifiable {
+    let id = UUID()
+    let stories: [StorySummary]
+}
+
+struct JourneyMergeSheet: View {
+    let stories: [StorySummary]
+    @ObservedObject var curator: CuratorController
+    let completed: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var title: String
+    @State private var error: String?
+    @State private var merging = false
+
+    init(stories: [StorySummary], curator: CuratorController, completed: @escaping () -> Void) {
+        self.stories = stories
+        self.curator = curator
+        self.completed = completed
+        let stops = stories.sorted { $0.start < $1.start }.flatMap(\.stops)
+        let suggested = JourneyStoryBuilder.title(homeLabel: "Home", stops: stops)
+        let fallback = stories.first?.title ?? ""
+        _title = State(initialValue: suggested.hasPrefix("Journey from ") ? fallback : suggested)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Merge \(stories.count) Journeys").font(.title2.bold())
+            Text("Combines these Journeys into one trip. The next library refresh keeps the merge while the same Moments still belong together. Photos are not deleted or moved in the Photos library.")
+                .foregroundStyle(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(stories) { story in
+                        Text(story.title).font(.headline).textSelection(.enabled)
+                        Text("\(story.momentIDs.count) Moments · \(story.photoCount) photos")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }.frame(maxWidth: .infinity, alignment: .leading)
+            }.frame(maxHeight: 180)
+            TextField("Name for the merged Journey", text: $title).textFieldStyle(.roundedBorder)
+            if let error { Text(error).foregroundStyle(.red) }
+            HStack {
+                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
+                Spacer()
+                Button(merging ? "Merging…" : "Merge") {
+                    merging = true
+                    Task {
+                        do {
+                            try await curator.mergeJourneys(stories,
+                                title: title.trimmingCharacters(in: .whitespacesAndNewlines))
+                            completed()
+                            dismiss()
+                        } catch {
+                            self.error = error.localizedDescription
+                        }
+                        merging = false
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(merging || title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || title.count > 200)
+            }
+        }.padding(24).frame(width: 520)
+    }
+}

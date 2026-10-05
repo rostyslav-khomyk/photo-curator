@@ -290,6 +290,87 @@ final class CuratorGeocodingTests: XCTestCase {
         XCTAssertTrue(story.isFinalizedJourney)
     }
 
+    func testRebuildStoriesPreservesGeocodedCityTitles() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let catalogURL = root.appendingPathComponent("catalog.sqlite3")
+        let store = try CatalogV2Store(url: catalogURL)
+
+        func gpsPhoto(_ id: String, _ time: TimeInterval, lat: Double, lon: Double) -> IndexedPhoto {
+            IndexedPhoto(id: id, created: Date(timeIntervalSince1970: time),
+                         modified: Date(timeIntervalSince1970: time),
+                         latitude: lat, longitude: lon, favorite: false, width: 100, height: 100)
+        }
+        let homeBefore = gpsPhoto("hb", 1_000, lat: 52.1, lon: 4.9)
+        let munichA = gpsPhoto("m1", 1_000 + 2 * 86_400, lat: 48.14, lon: 11.58)
+        let munichB = gpsPhoto("m2", 1_000 + 3 * 86_400, lat: 48.15, lon: 11.57)
+        let munichC = gpsPhoto("m3", 1_000 + 4 * 86_400, lat: 48.13, lon: 11.59)
+        let homeAfter = gpsPhoto("ha", 1_000 + 8 * 86_400, lat: 52.1, lon: 4.9)
+        let moments = [
+            PhotoMoment(id: "home-before", start: homeBefore.created!, end: homeBefore.created!, photos: [homeBefore]),
+            PhotoMoment(id: "munich-a", start: munichA.created!, end: munichA.created!, photos: [munichA]),
+            PhotoMoment(id: "munich-b", start: munichB.created!, end: munichB.created!, photos: [munichB]),
+            PhotoMoment(id: "munich-c", start: munichC.created!, end: munichC.created!, photos: [munichC]),
+            PhotoMoment(id: "home-after", start: homeAfter.created!, end: homeAfter.created!, photos: [homeAfter]),
+        ]
+        // Persist Home geofence used by JourneyStoryBuilder.
+        var database: OpaquePointer?
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        XCTAssertEqual(sqlite3_open(catalogURL.path, &database), SQLITE_OK)
+        let homeID = UUID().uuidString
+        let home = MeaningfulPlace(id: UUID(uuidString: homeID) ?? UUID(), label: "Home",
+            address: "Parklaan", latitude: 52.1, longitude: 4.9, radius: 2_000)
+        let homePayload = try JSONEncoder().encode(home)
+        var placeStatement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(database,
+            "INSERT INTO meaningful_places VALUES(?,?,?,?,?,?,?)", -1, &placeStatement, nil), SQLITE_OK)
+        sqlite3_bind_text(placeStatement, 1, homeID, -1, transient)
+        sqlite3_bind_text(placeStatement, 2, "Home", -1, transient)
+        sqlite3_bind_text(placeStatement, 3, "Parklaan", -1, transient)
+        sqlite3_bind_double(placeStatement, 4, 52.1)
+        sqlite3_bind_double(placeStatement, 5, 4.9)
+        sqlite3_bind_double(placeStatement, 6, 2_000)
+        _ = homePayload.withUnsafeBytes {
+            sqlite3_bind_blob(placeStatement, 7, $0.baseAddress, Int32(homePayload.count), transient)
+        }
+        XCTAssertEqual(sqlite3_step(placeStatement), SQLITE_DONE)
+        sqlite3_finalize(placeStatement)
+        sqlite3_close(database)
+
+        try await store.synchronize(moments: moments, activeMomentIDs: Set(moments.map(\.id)))
+        try await store.rebuildStories()
+        let initial = try await store.storySummaries().filter { $0.kind == .journey }
+        XCTAssertEqual(initial.count, 1)
+        let journeyID = try XCTUnwrap(initial.first?.id)
+
+        // Simulate completed geocode enrichment, then rebuild (as Moments refresh does).
+        let enrichedStops = [
+            JourneyStopEvidence(start: munichA.created!, end: munichC.created!,
+                latitude: 48.14, longitude: 11.58, momentCount: 3, photoCount: 3,
+                place: "Munich", confidence: 1)
+        ]
+        let evidence = try JSONEncoder().encode(enrichedStops)
+        XCTAssertEqual(sqlite3_open(catalogURL.path, &database), SQLITE_OK)
+        var update: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(database,
+            "UPDATE stories SET title=?, evidence=? WHERE id=?", -1, &update, nil), SQLITE_OK)
+        sqlite3_bind_text(update, 1, "Journey to Munich", -1, transient)
+        _ = evidence.withUnsafeBytes {
+            sqlite3_bind_blob(update, 2, $0.baseAddress, Int32(evidence.count), transient)
+        }
+        sqlite3_bind_text(update, 3, journeyID, -1, transient)
+        XCTAssertEqual(sqlite3_step(update), SQLITE_DONE)
+        sqlite3_finalize(update)
+        sqlite3_close(database)
+
+        try await store.rebuildStories()
+        let after = try await store.storySummaries().filter { $0.kind == .journey }
+        let story = try XCTUnwrap(after.first)
+        XCTAssertTrue(story.isFinalizedJourney, "Rebuild must not wipe geocoded Journey titles")
+        XCTAssertEqual(story.title, "Journey to Munich")
+        XCTAssertEqual(story.stops.first?.place, "Munich")
+    }
+
     func testInvalidCoordinateIsNotGeocoded() async {
         let mock = MockGeocodingProvider()
         let service = CuratorGeocodingService(provider: mock)

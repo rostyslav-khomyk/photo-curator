@@ -17,13 +17,22 @@ struct CuratorView: View {
     @State private var showingGoogleExport = false
     @State private var activeMomentID: String?
     @State private var selectedStoryID: String = CuratorView.allMomentsScopeID
+    @State private var editingStory: StorySummary?
+    @State private var selectingJourneys = false
+    @State private var journeySelection = Set<String>()
+    @State private var journeyMergeDraft: JourneyMergeDraft?
+    @State private var selectedJourneyStops = Set<Int>()
     @AppStorage("curator.hidePublishedMoments.v1") private var hidePublishedMoments = false
     @AppStorage("curator.hideGoogleUploadedMoments.v1") private var hideGoogleUploadedMoments = false
-    @AppStorage("curator.lastActiveMomentID.v1") private var savedActiveMomentID = ""
-    @AppStorage("curator.scrollAnchorMomentID.v1") private var savedScrollAnchorMomentID = ""
-    @AppStorage("curator.browseStoryID.v1") private var savedBrowseStoryID = ""
+    /// Persisted via UserDefaults writes — not @AppStorage — so soak/activity ticks and
+    /// focus changes do not invalidate the All Moments ScrollView through AppStorage.
+    @State private var savedActiveMomentID = UserDefaults.standard.string(forKey: "curator.lastActiveMomentID.v1") ?? ""
+    @State private var savedScrollAnchorMomentID = UserDefaults.standard.string(forKey: "curator.scrollAnchorMomentID.v1") ?? ""
+    @State private var savedBrowseStoryID = UserDefaults.standard.string(forKey: "curator.browseStoryID.v1") ?? ""
     @State private var restoredScrollPosition = false
     @State private var scrollRestoreID: String?
+    /// Scroll-to only for keyboard navigation — never while the user is free-scrolling.
+    @State private var keyboardScrollID: String?
     @ObservedObject private var meaningfulPlaces = MeaningfulPlacesStore.shared
 
     private var libraryMoments: [MomentSummary] {
@@ -39,7 +48,9 @@ struct CuratorView: View {
             return libraryMoments
         }
         let members = Set(story.momentIDs)
-        return libraryMoments.filter { members.contains($0.id) }
+        let inStory = libraryMoments.filter { members.contains($0.id) }
+        guard story.kind == .journey, !selectedJourneyStops.isEmpty else { return inStory }
+        return JourneyMomentFilter.applying(inStory, stops: story.stops, selected: selectedJourneyStops)
     }
 
     private var displayedIDs: [String] {
@@ -47,7 +58,7 @@ struct CuratorView: View {
     }
 
     private var journeyStories: [StorySummary] {
-        // Placeholder `Journey from Home` shells flicker while stops geocode; only show grounded titles.
+        // Placeholder `Journey from Home` shells flicker while stops geocode; seasonal and renamed titles stay.
         curator.storySummaries.filter(\.isFinalizedJourney)
     }
 
@@ -77,92 +88,70 @@ struct CuratorView: View {
         return "Your library, rediscovered. Curated privately on your Mac."
     }
 
-    private func cards(_ moments: [MomentSummary]) -> some View {
-        LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 380), spacing: 20)], spacing: 24) {
-            ForEach(moments) { moment in
-                Button {
-                    if selecting {
-                        selection.click(moment.id, ordered: displayedIDs, range: NSEvent.modifierFlags.contains(.shift))
-                    } else {
-                        activeMomentID = moment.id
-                        openMoment(moment.id)
-                    }
-                } label: {
-                    MomentSummaryCard(moment: moment, customTitle: decisions.titles[moment.id],
-                                      customDescription: decisions.descriptions[moment.id],
-                                      loadPreview: restoredScrollPosition)
-                        .overlay(alignment: .topTrailing) {
-                            if selecting {
-                                Image(systemName: selection.ids.contains(moment.id) ? "checkmark.circle.fill" : "circle")
-                                    .font(.title2).foregroundStyle(selection.ids.contains(moment.id) ? Color.accentColor : .secondary)
-                                    .padding(8).background(.regularMaterial, in: Circle()).padding(8)
-                            }
-                        }
-                        .overlay {
-                            if activeMomentID == moment.id {
-                                RoundedRectangle(cornerRadius: 12)
-                                    .stroke(Color.accentColor, lineWidth: 2)
-                            }
-                        }
-                }.buttonStyle(.plain)
-                    .id(moment.id)
-                    .task(id: moment.id) {
-                        guard let detail = await curator.momentDetail(moment.id) else { return }
-                        let applied = detail.selection.map {
-                            MomentReviewDecisions.apply(decisions.values, to: $0, photos: detail.photos)
-                        }
-                        let priority = MomentDisplayEligibility.viewportPriorityPhotos(
-                            detail, decisions: decisions.values, selected: applied?.selected ?? [])
-                        await curator.prioritizeVisibleMoment(detail, photos: priority)
-                    }
-                    .background(GeometryReader { geometry in
-                        Color.clear.preference(key: MomentViewportPreferenceKey.self,
-                                               value: [moment.id: geometry.frame(in: .named("moments-scroll")).minY])
-                    })
-                    .accessibilityValue(selecting ? (selection.ids.contains(moment.id) ? "Selected" : "Not selected") : "")
-                    .accessibilityLabel("Open Moment, \(summaryTitle(moment))")
-            }
-        }.padding(.horizontal, 24).padding(.bottom, 24)
-    }
-
     private var storiesSidebar: some View {
-        List(selection: $selectedStoryID) {
-            Section {
-                Label("All Moments", systemImage: "square.grid.2x2")
-                    .tag(Self.allMomentsScopeID)
-                    .accessibilityLabel("Show all Moments")
-            }
-            if !journeyStories.isEmpty {
-                Section("Journeys") {
-                    ForEach(journeyStories) { story in
-                        storySidebarRow(story, systemImage: "map")
-                            .tag(story.id)
+        Group {
+            if selectingJourneys {
+                // Native multi-select: clicking rows (and ⌘-click) toggles merge members.
+                List(selection: $journeySelection) {
+                    Section {
+                        Text("Click Journeys to include in the merge. Choose at least two, then Merge Journeys.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .listRowSeparator(.hidden)
+                    }
+                    Section("Journeys") {
+                        ForEach(journeyStories) { story in
+                            storySidebarRow(story, systemImage: "map",
+                                            checked: journeySelection.contains(story.id))
+                                .tag(story.id)
+                        }
                     }
                 }
-            }
-            if !outingStories.isEmpty {
-                Section("Outings") {
-                    ForEach(outingStories) { story in
-                        storySidebarRow(story, systemImage: "mappin.and.ellipse")
-                            .tag(story.id)
+            } else {
+                List(selection: $selectedStoryID) {
+                    Section {
+                        Label("All Moments", systemImage: "square.grid.2x2")
+                            .tag(Self.allMomentsScopeID)
+                            .accessibilityLabel("Show all Moments")
+                    }
+                    if !journeyStories.isEmpty {
+                        Section("Journeys") {
+                            ForEach(journeyStories) { story in
+                                storySidebarRow(story, systemImage: "map")
+                                    .tag(story.id)
+                            }
+                        }
+                    }
+                    if !outingStories.isEmpty {
+                        Section("Outings") {
+                            ForEach(outingStories) { story in
+                                storySidebarRow(story, systemImage: "mappin.and.ellipse")
+                                    .tag(story.id)
+                            }
+                        }
                     }
                 }
             }
         }
         .listStyle(.sidebar)
-        .navigationTitle("Stories")
         .navigationSplitViewColumnWidth(min: 200, ideal: 260, max: 420)
     }
 
-    private func storySidebarRow(_ story: StorySummary, systemImage: String) -> some View {
+    private func storySidebarRow(_ story: StorySummary, systemImage: String, checked: Bool? = nil) -> some View {
         HStack(spacing: 8) {
+            if let checked {
+                Image(systemName: checked ? "checkmark.circle.fill" : "circle")
+                    .foregroundStyle(checked ? Color.accentColor : .secondary)
+                    .frame(width: 18)
+                    .accessibilityHidden(true)
+            }
             Image(systemName: systemImage)
                 .foregroundStyle(.secondary)
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
                 Text(story.title)
                     .lineLimit(2)
-                Text("\(story.momentIDs.count) Moments · \(story.photoCount) photos")
+                Text("\(story.momentIDs.count) Moments · \(story.photoCount) photos · \(story.highlightCount) highlights")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -170,7 +159,12 @@ struct CuratorView: View {
             Spacer(minLength: 0)
         }
         .contentShape(Rectangle())
-        .accessibilityLabel("\(story.title), \(story.momentIDs.count) Moments")
+        .accessibilityLabel(checked == nil
+            ? "\(story.title), \(story.momentIDs.count) Moments, \(story.highlightCount) highlights"
+            : (checked == true
+               ? "\(story.title), selected for merge"
+               : "\(story.title), not selected for merge"))
+        .accessibilityAddTraits(checked == true ? .isSelected : [])
     }
 
     private var momentsDetail: some View {
@@ -181,6 +175,28 @@ struct CuratorView: View {
                     Text(detailSubtitle)
                         .foregroundStyle(.secondary)
                         .textSelection(.enabled)
+                    if let story = selectedStory {
+                        if let synopsis = story.synopsis, !synopsis.isEmpty {
+                            Text(synopsis)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        if let uncertainty = StoryNarrativeUncertainty.line(title: story.title, stops: story.stops) {
+                            Label(uncertainty, systemImage: "exclamationmark.triangle")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Button(story.kind == .journey
+                               ? "Rename Journey…"
+                               : (story.customized ? "Edit Story Title & Synopsis…" : "Suggest Story Title & Synopsis…")) {
+                            editingStory = story
+                        }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                    }
                     HStack(spacing: 6) {
                         Button {
                             showWorkspaceHelp = true
@@ -203,6 +219,12 @@ struct CuratorView: View {
                 }
                 Spacer()
             }.padding(24)
+            if let story = selectedStory, story.kind == .journey, story.stops.count >= 2 {
+                JourneyRoutePanel(stops: story.stops, selectedStopIDs: selectedJourneyStops,
+                                  onToggleStop: toggleJourneyStop, onClearStops: { selectedJourneyStops = [] })
+                    .padding(.horizontal, 24)
+                    .padding(.bottom, 12)
+            }
             if selecting {
                 Text("\(selection.ids.count) selected. Click to toggle; Shift-click selects a range.")
                     .font(.callout).foregroundStyle(.secondary)
@@ -221,61 +243,63 @@ struct CuratorView: View {
                 }
                 .padding(.horizontal, 24).padding(.bottom, 12)
             }
-            ScrollViewReader { proxy in
-                ScrollView {
-                    if visibleMoments.isEmpty {
-                        VStack(spacing: 12) {
-                            Image(systemName: selectedStory != nil
-                                  ? "map"
-                                  : (hidePublishedMoments ? "line.3.horizontal.decrease.circle" : "photo.stack"))
-                                .font(.system(size: 42)).foregroundStyle(.secondary)
-                            Text(emptyMomentsTitle)
-                                .font(.title2)
-                            Text(emptyMomentsMessage)
-                                .foregroundStyle(.secondary).multilineTextAlignment(.center)
-                                .frame(maxWidth: 480)
-                            if curator.overviewLoading { ProgressView().controlSize(.small) }
-                            if selectedStory != nil {
-                                Button("Show All Moments") { selectedStoryID = Self.allMomentsScopeID }
-                            }
-                        }.frame(maxWidth: .infinity).padding(60)
+            // Equatable timeline: curator.activity / story geocode publishes must not rebuild
+            // the LazyVGrid and kick All Moments back toward the start.
+            MomentsTimelineScroll(
+                scopeID: selectedStoryID,
+                moments: visibleMoments,
+                emptyTitle: emptyMomentsTitle,
+                emptyMessage: emptyMomentsMessage,
+                emptySystemImage: selectedStory != nil
+                    ? "map"
+                    : (hidePublishedMoments ? "line.3.horizontal.decrease.circle" : "photo.stack"),
+                overviewLoading: curator.overviewLoading,
+                showAllMomentsButton: selectedStory != nil,
+                activeMomentID: activeMomentID,
+                selecting: selecting,
+                selectionIDs: selection.ids,
+                customTitles: decisions.titles,
+                customDescriptions: decisions.descriptions,
+                restoredScrollPosition: restoredScrollPosition,
+                keyboardScrollID: $keyboardScrollID,
+                scrollRestoreID: $scrollRestoreID,
+                onSelect: { id in
+                    if selecting {
+                        selection.click(id, ordered: displayedIDs, range: NSEvent.modifierFlags.contains(.shift))
                     } else {
-                        cards(visibleMoments)
+                        activeMomentID = id
+                        openMoment(id)
                     }
+                },
+                onShowAllMoments: { selectedStoryID = Self.allMomentsScopeID },
+                onRestored: { restoredScrollPosition = true },
+                onPersistAnchor: { id in
+                    savedScrollAnchorMomentID = id
+                    UserDefaults.standard.set(id, forKey: "curator.scrollAnchorMomentID.v1")
+                },
+                onPrioritize: { id in
+                    Task { await prioritizeActiveMoment(id) }
                 }
-                .coordinateSpace(name: "moments-scroll")
-                .onPreferenceChange(MomentViewportPreferenceKey.self) { positions in
-                    guard restoredScrollPosition,
-                          let nearest = positions.filter({ $0.value >= 0 }).min(by: { $0.value < $1.value }) else { return }
-                    savedScrollAnchorMomentID = nearest.key
-                }
-                .onChange(of: activeMomentID) { id in
-                    guard let id else { return }
-                    withAnimation(.easeOut(duration: 0.16)) { proxy.scrollTo(id, anchor: .center) }
-                }
-                .onChange(of: scrollRestoreID) { id in
-                    guard let id else { return }
-                    proxy.scrollTo(id, anchor: .top)
-                    restoredScrollPosition = true
-                    scrollRestoreID = nil
-                }
-            }
+            )
+            .equatable()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             Divider()
-            HStack {
-                Text(curator.activity).font(.callout).foregroundStyle(.secondary).lineLimit(2)
-                Spacer()
-            }.padding(14).background(.bar)
+            CuratorActivityFooter(activity: curator.activity)
         }
     }
 
     private var emptyMomentsTitle: String {
         if curator.overviewLoading { return "Loading your collections…" }
+        if !selectedJourneyStops.isEmpty { return "No Moments at the selected stops" }
         if selectedStory != nil { return "No Moments in this Story" }
         if hidePublishedMoments { return "All loaded Moments are already in Photos" }
         return "Your Moments are taking shape"
     }
 
     private var emptyMomentsMessage: String {
+        if !selectedJourneyStops.isEmpty {
+            return "These flags do not overlap the Moments in this Journey. Clear the map filter to see the whole trip."
+        }
         if selectedStory != nil {
             return "This Story’s Moments may be hidden by filters, or its membership is still catching up."
         }
@@ -286,12 +310,64 @@ struct CuratorView: View {
     }
 
     var body: some View {
+        browsableWorkspace
+        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("PhotoCuratorGroupReviewChanged"))) { _ in
+            Task { await curator.refreshOverview() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .photoCuratorPhotosAccessChanged)) { _ in
+            Task { await curator.refreshOverview() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            if PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized {
+                reloadMomentSummaries()
+            }
+        }
+        .sheet(item: $mergeDraft) { draft in
+            MomentMergeView(draft: draft, decisions: decisions, curator: curator) {
+                selection = MomentMultiSelection(); selecting = false
+                Task { await curator.refreshOverview() }
+            }
+        }
+        .sheet(item: $journeyMergeDraft) { draft in
+            JourneyMergeSheet(stories: draft.stories, curator: curator) {
+                finishJourneyMerge(draft)
+            }
+        }
+        .sheet(item: $editingStory) { story in
+            StoryNarrativeSheet(story: story, curator: curator) {
+                editingStory = nil
+            }
+        }
+        .sheet(isPresented: $showingGoogleExport) { googleExportSheet }
+        .alert("Moments", isPresented: Binding(get: { curator.errorMessage != nil }, set: { if !$0 { curator.errorMessage = nil } })) {
+            Button("OK") { curator.errorMessage = nil }
+        } message: { Text(curator.errorMessage ?? "") }
+    }
+
+    private var googleExportSheet: some View {
+        MomentGoogleExportView(moments: googleExportMoments, decisions: decisions, model: model) {
+            showingGoogleExport = false
+            googleExportMoments = []
+        }
+    }
+
+    private var browsableWorkspace: some View {
         NavigationSplitView {
             storiesSidebar
         } detail: {
             momentsDetail
         }
         .navigationSplitViewStyle(.balanced)
+        .toolbar {
+            if selectingJourneys {
+                ToolbarItem(placement: .navigation) {
+                    Text("Select Journeys").font(.headline)
+                }
+            }
+            ToolbarItemGroup(placement: .primaryAction) {
+                workspaceToolbarItems
+            }
+        }
         .task {
             await curator.reloadMomentSummaries(googleUploadedAssetIDs: model.uploadedGoogleAssetIDs,
                                                  reviewDecisions: decisions.values)
@@ -314,7 +390,10 @@ struct CuratorView: View {
                                                         reviewDecisions: values) }
         }
         .onChange(of: selectedStoryID) { id in
-            savedBrowseStoryID = id == Self.allMomentsScopeID ? "" : id
+            selectedJourneyStops = []
+            let browse = id == Self.allMomentsScopeID ? "" : id
+            savedBrowseStoryID = browse
+            UserDefaults.standard.set(browse, forKey: "curator.browseStoryID.v1")
             selection = MomentMultiSelection()
             selecting = false
             activeMomentID = displayedIDs.first
@@ -324,95 +403,154 @@ struct CuratorView: View {
             restoreBrowseScope()
         }
         .onChange(of: displayedIDs) { ids in
-            if activeMomentID.flatMap({ ids.contains($0) }) != true { activeMomentID = ids.first }
+            // Keep focus if still present; never steal scroll by jumping to the first Moment on refresh.
+            if let active = activeMomentID, ids.contains(active) { return }
+            activeMomentID = ids.first
             if !restoredScrollPosition, !savedScrollAnchorMomentID.isEmpty,
                ids.contains(savedScrollAnchorMomentID) {
                 scrollRestoreID = savedScrollAnchorMomentID
             }
         }
         .onChange(of: activeMomentID) { id in
-            if let id { savedActiveMomentID = id }
+            guard let id else { return }
+            savedActiveMomentID = id
+            UserDefaults.standard.set(id, forKey: "curator.lastActiveMomentID.v1")
         }
         .background(MomentGridKeyHandler { event in handleGridKey(event) })
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    showLibraryOverview = true
-                } label: {
-                    Label("Library Overview", systemImage: "chart.bar.xaxis")
-                }
-                .help("See capture density across your library")
-                .popover(isPresented: $showLibraryOverview) {
-                    LibraryOverviewView(periods: curator.libraryOverview)
-                }
+    }
 
-                Menu {
-                    Toggle("Hide Moments Already in Photos", isOn: $hidePublishedMoments)
-                    Toggle("Hide Moments Uploaded to Google", isOn: $hideGoogleUploadedMoments)
-                } label: {
-                    Label("Filter Moments", systemImage: "line.3.horizontal.decrease.circle")
-                }
-                .help("Filter the Moments workspace")
+    private func reloadMomentSummaries() {
+        Task {
+            await curator.reloadMomentSummaries(googleUploadedAssetIDs: model.uploadedGoogleAssetIDs,
+                                                 reviewDecisions: decisions.values)
+        }
+    }
 
-                Button {
-                    selecting.toggle()
-                    selection = MomentMultiSelection()
-                } label: {
-                    Label(selecting ? "Finish Selecting" : "Select Moments",
-                          systemImage: selecting ? "checkmark.circle" : "checkmark.circle.badge.plus")
-                }
-                .help(selecting ? "Finish selecting Moments" : "Select Moments")
+    @ViewBuilder
+    private var workspaceToolbarItems: some View {
+        Button {
+            showLibraryOverview = true
+        } label: {
+            Label("Library Overview", systemImage: "chart.bar.xaxis")
+        }
+        .help("See capture density across your library")
+        .popover(isPresented: $showLibraryOverview) {
+            LibraryOverviewView(periods: curator.libraryOverview)
+        }
 
-                Button {
-                    Task {
-                        googleExportMoments = await curator.momentDetails(selection.ids)
-                        showingGoogleExport = true
-                    }
-                } label: {
-                    Label("Save to Google Photos", systemImage: "icloud.and.arrow.up")
-                }
-                .disabled(model.isWorking)
-                .help(selection.ids.isEmpty
-                      ? "Save Favorites from your Photos library to Google Photos"
-                      : "Review selected Moment highlights or Favorites for Google Photos")
+        Menu {
+            Toggle("Hide Moments Already in Photos", isOn: $hidePublishedMoments)
+            Toggle("Hide Moments Uploaded to Google", isOn: $hideGoogleUploadedMoments)
+        } label: {
+            Label("Filter Moments", systemImage: "line.3.horizontal.decrease.circle")
+        }
+        .help("Filter the Moments workspace")
 
-                Button {
-                    openMergeDraft()
-                } label: {
-                    Label("Merge Moments", systemImage: "rectangle.stack.badge.plus")
-                }
-                .disabled(selection.ids.count < 2)
-                .help("Merge the selected Moments")
+        Button {
+            selecting.toggle()
+            selection = MomentMultiSelection()
+        } label: {
+            Label(selecting ? "Finish Selecting" : "Select Moments",
+                  systemImage: selecting ? "checkmark.circle" : "checkmark.circle.badge.plus")
+        }
+        .help(selecting ? "Finish selecting Moments" : "Select Moments")
 
+        Button {
+            Task {
+                googleExportMoments = await curator.momentDetails(selection.ids)
+                showingGoogleExport = true
             }
+        } label: {
+            Label("Save to Google Photos", systemImage: "icloud.and.arrow.up")
         }
-        .onReceive(NotificationCenter.default.publisher(for: Notification.Name("PhotoCuratorGroupReviewChanged"))) { _ in
-            Task { await curator.refreshOverview() }
+        .disabled(model.isWorking)
+        .help(selection.ids.isEmpty
+              ? "Save Favorites from your Photos library to Google Photos"
+              : "Review selected Moment highlights or Favorites for Google Photos")
+
+        Button(action: openMergeDraft) {
+            Label("Merge Moments", systemImage: "rectangle.stack.badge.plus")
         }
-        .onReceive(NotificationCenter.default.publisher(for: .photoCuratorPhotosAccessChanged)) { _ in
-            Task { await curator.refreshOverview() }
+        .disabled(selection.ids.count < 2)
+        .help("Merge the selected Moments")
+
+        journeyToolbarButtons
+    }
+
+    @ViewBuilder
+    private var journeyToolbarButtons: some View {
+        Button {
+            guard let story = selectedStory, story.kind == .journey else { return }
+            editingStory = story
+        } label: {
+            Label("Rename Journey", systemImage: "pencil")
         }
-        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            if PHPhotoLibrary.authorizationStatus(for: .readWrite) == .authorized {
-                Task { await curator.reloadMomentSummaries(googleUploadedAssetIDs: model.uploadedGoogleAssetIDs,
-                                                            reviewDecisions: decisions.values) }
+        .disabled(selectedStory?.kind != .journey)
+        .help("Edit this Journey’s name and synopsis")
+
+        Button {
+            if selectingJourneys {
+                selectingJourneys = false
+                journeySelection = []
+            } else {
+                selectingJourneys = true
+                // Seed with the Journey currently open, if any.
+                if let story = selectedStory, story.kind == .journey {
+                    journeySelection = [story.id]
+                } else {
+                    journeySelection = []
+                }
             }
+        } label: {
+            Label(selectingJourneys ? "Cancel Journey Selection" : "Select Journeys",
+                  systemImage: selectingJourneys ? "xmark.circle" : "checkmark.circle")
         }
-        .sheet(item: $mergeDraft) { draft in
-            MomentMergeView(draft: draft, decisions: decisions, curator: curator) {
-                selection = MomentMultiSelection(); selecting = false
-                Task { await curator.refreshOverview() }
+        .help(selectingJourneys
+              ? "Leave merge selection"
+              : "Multi-select Journeys in the sidebar, then Merge Journeys")
+
+        Button(action: openJourneyMerge) {
+            Label(journeySelection.count >= 2
+                  ? "Merge Journeys (\(journeySelection.count))"
+                  : "Merge Journeys",
+                  systemImage: "arrow.triangle.merge")
+        }
+        .disabled(journeySelection.count < 2)
+        .help(journeySelection.count < 2
+              ? "Select at least two Journeys in the sidebar first"
+              : "Merge the selected Journeys into one")
+
+        Button {
+            Task {
+                do { try await curator.reprocessJourneys() }
+                catch { curator.errorMessage = error.localizedDescription }
             }
+        } label: {
+            Label("Refresh Journey Names", systemImage: "arrow.clockwise")
         }
-        .sheet(isPresented: $showingGoogleExport) {
-            MomentGoogleExportView(moments: googleExportMoments, decisions: decisions, model: model) {
-                showingGoogleExport = false
-                googleExportMoments = []
-            }
+        .disabled(curator.maintenanceBusy || journeyStories.isEmpty)
+        .help("Retitle Journeys from countries/seasons and rebuild home start/end circles")
+    }
+
+    private func finishJourneyMerge(_ draft: JourneyMergeDraft) {
+        let members = Set(draft.stories.flatMap(\.momentIDs))
+        journeySelection = []
+        selectingJourneys = false
+        journeyMergeDraft = nil
+        if let merged = curator.storySummaries.first(where: { Set($0.momentIDs) == members && $0.kind == .journey }) {
+            selectedStoryID = merged.id
         }
-        .alert("Moments", isPresented: Binding(get: { curator.errorMessage != nil }, set: { if !$0 { curator.errorMessage = nil } })) {
-            Button("OK") { curator.errorMessage = nil }
-        } message: { Text(curator.errorMessage ?? "") }
+    }
+
+    private func openJourneyMerge() {
+        let chosen = journeyStories.filter { journeySelection.contains($0.id) }
+        guard chosen.count >= 2 else { return }
+        journeyMergeDraft = JourneyMergeDraft(stories: chosen)
+    }
+
+    private func toggleJourneyStop(_ id: Int) {
+        if selectedJourneyStops.contains(id) { selectedJourneyStops.remove(id) }
+        else { selectedJourneyStops.insert(id) }
     }
 
     private func restoreBrowseScope() {
@@ -459,7 +597,12 @@ struct CuratorView: View {
             return true
         default: return false
         }
-        if let next { activeMomentID = displayedIDs[next]; return true }
+        if let next {
+            let id = displayedIDs[next]
+            activeMomentID = id
+            keyboardScrollID = id
+            return true
+        }
         return false
     }
 
@@ -497,9 +640,138 @@ struct CuratorView: View {
         }
     }
 
-    private func summaryTitle(_ moment: MomentSummary) -> String {
-        decisions.titles[moment.id] ?? moment.headline
-            ?? moment.start.formatted(.dateTime.month(.abbreviated).day().year())
+    /// Viewport analysis priority only for the focused Moment — not every cell that appears while scrolling.
+    private func prioritizeActiveMoment(_ id: String?) async {
+        guard let id, let detail = await curator.momentDetail(id) else { return }
+        let applied = detail.selection.map {
+            MomentReviewDecisions.apply(decisions.values, to: $0, photos: detail.photos)
+        }
+        let priority = MomentDisplayEligibility.viewportPriorityPhotos(
+            detail, decisions: decisions.values, selected: applied?.selected ?? [])
+        await curator.prioritizeVisibleMoment(detail, photos: priority)
+    }
+}
+
+/// Isolates the All Moments ScrollView from CuratorController activity publishes.
+/// Equality ignores closures; parent must pass stable moment/selection inputs.
+private struct MomentsTimelineScroll: View, Equatable {
+    let scopeID: String
+    let moments: [MomentSummary]
+    let emptyTitle: String
+    let emptyMessage: String
+    let emptySystemImage: String
+    let overviewLoading: Bool
+    let showAllMomentsButton: Bool
+    let activeMomentID: String?
+    let selecting: Bool
+    let selectionIDs: Set<String>
+    let customTitles: [String: String]
+    let customDescriptions: [String: String]
+    let restoredScrollPosition: Bool
+    @Binding var keyboardScrollID: String?
+    @Binding var scrollRestoreID: String?
+    let onSelect: (String) -> Void
+    let onShowAllMoments: () -> Void
+    let onRestored: () -> Void
+    let onPersistAnchor: (String) -> Void
+    let onPrioritize: (String?) -> Void
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.scopeID == rhs.scopeID
+            && lhs.moments == rhs.moments
+            && lhs.emptyTitle == rhs.emptyTitle
+            && lhs.emptyMessage == rhs.emptyMessage
+            && lhs.emptySystemImage == rhs.emptySystemImage
+            && lhs.overviewLoading == rhs.overviewLoading
+            && lhs.showAllMomentsButton == rhs.showAllMomentsButton
+            && lhs.activeMomentID == rhs.activeMomentID
+            && lhs.selecting == rhs.selecting
+            && lhs.selectionIDs == rhs.selectionIDs
+            && lhs.customTitles == rhs.customTitles
+            && lhs.customDescriptions == rhs.customDescriptions
+            && lhs.restoredScrollPosition == rhs.restoredScrollPosition
+            && lhs.keyboardScrollID == rhs.keyboardScrollID
+            && lhs.scrollRestoreID == rhs.scrollRestoreID
+    }
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                if moments.isEmpty {
+                    VStack(spacing: 12) {
+                        Image(systemName: emptySystemImage)
+                            .font(.system(size: 42)).foregroundStyle(.secondary)
+                        Text(emptyTitle).font(.title2)
+                        Text(emptyMessage)
+                            .foregroundStyle(.secondary).multilineTextAlignment(.center)
+                            .frame(maxWidth: 480)
+                        if overviewLoading { ProgressView().controlSize(.small) }
+                        if showAllMomentsButton {
+                            Button("Show All Moments", action: onShowAllMoments)
+                        }
+                    }.frame(maxWidth: .infinity).padding(60)
+                } else {
+                    LazyVGrid(columns: [GridItem(.adaptive(minimum: 250, maximum: 380), spacing: 20)], spacing: 24) {
+                        ForEach(moments) { moment in
+                            Button {
+                                onSelect(moment.id)
+                            } label: {
+                                MomentSummaryCard(moment: moment,
+                                                  customTitle: customTitles[moment.id],
+                                                  customDescription: customDescriptions[moment.id],
+                                                  loadPreview: restoredScrollPosition)
+                                    .overlay(alignment: .topTrailing) {
+                                        if selecting {
+                                            Image(systemName: selectionIDs.contains(moment.id) ? "checkmark.circle.fill" : "circle")
+                                                .font(.title2)
+                                                .foregroundStyle(selectionIDs.contains(moment.id) ? Color.accentColor : .secondary)
+                                                .padding(8).background(.regularMaterial, in: Circle()).padding(8)
+                                        }
+                                    }
+                                    .overlay {
+                                        if activeMomentID == moment.id {
+                                            RoundedRectangle(cornerRadius: 12)
+                                                .stroke(Color.accentColor, lineWidth: 2)
+                                        }
+                                    }
+                            }
+                            .buttonStyle(.plain)
+                            .id(moment.id)
+                            .accessibilityValue(selecting ? (selectionIDs.contains(moment.id) ? "Selected" : "Not selected") : "")
+                            .accessibilityLabel("Open Moment, \(customTitles[moment.id] ?? moment.headline ?? moment.start.formatted(.dateTime.month(.abbreviated).day().year()))")
+                        }
+                    }.padding(.horizontal, 24).padding(.bottom, 24)
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .id("moments-scroll-\(scopeID)")
+            .onChange(of: activeMomentID) { id in
+                if let id { onPersistAnchor(id) }
+                onPrioritize(id)
+            }
+            .onChange(of: keyboardScrollID) { id in
+                guard let id else { return }
+                withAnimation(.easeOut(duration: 0.16)) { proxy.scrollTo(id, anchor: .center) }
+                keyboardScrollID = nil
+            }
+            .onChange(of: scrollRestoreID) { id in
+                guard let id else { return }
+                proxy.scrollTo(id, anchor: .top)
+                onRestored()
+                scrollRestoreID = nil
+            }
+        }
+    }
+}
+
+private struct CuratorActivityFooter: View {
+    let activity: String
+
+    var body: some View {
+        HStack {
+            Text(activity).font(.callout).foregroundStyle(.secondary).lineLimit(2)
+            Spacer()
+        }.padding(14).background(.bar)
     }
 }
 
@@ -609,8 +881,9 @@ struct MomentSummaryCard: View {
                 }
             }.frame(height: 190).clipped()
             VStack(alignment: .leading, spacing: 6) {
+                // No textSelection here: it steals trackpad drag from ScrollView on macOS.
                 Text(title).font(.system(size: 16 * fontSizeScale, weight: .semibold))
-                    .lineLimit(2).help(title).textSelection(.enabled)
+                    .lineLimit(2).help(title)
                 Text("\(moment.highlightCount) \(moment.highlightCount == 1 ? "highlight" : "highlights") · \(moment.photoCount) \(moment.photoCount == 1 ? "photo" : "photos")")
                     .font(.system(size: 14 * fontSizeScale, weight: .medium)).foregroundStyle(.secondary)
                 if !status.isEmpty {
@@ -733,13 +1006,6 @@ struct MomentCoverCard: View {
     }
 }
 
-private struct MomentViewportPreferenceKey: PreferenceKey {
-    static let defaultValue: [String: CGFloat] = [:]
-    static func reduce(value: inout [String: CGFloat], nextValue: () -> [String: CGFloat]) {
-        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
-    }
-}
-
 struct MomentsWorkspaceHelpView: View {
     @AppStorage("curator.fontSizeScale") private var fontSizeScale: Double = 1.0
 
@@ -800,16 +1066,15 @@ struct MomentsWorkspaceHelpView: View {
 struct CuratorSettingsView: View {
     @ObservedObject var curator: CuratorController
     @ObservedObject var model: PhotoCuratorViewModel
-    @State private var diagnostics = false
     @State private var similaritySettings = false
     @AppStorage("curator.fontSizeScale") private var fontSizeScale: Double = 1.0
     @AppStorage("curatorJourneyPlaceNames") private var journeyPlaceNames = true
+    @AppStorage("curatorJourneyRoadRoutes") private var journeyRoadRoutes = false
+    @AppStorage(ExperimentalUnlocatedJourneyBuilder.extendedAccessKey) private var extendedPhotosMetadata = true
     @ObservedObject private var meaningfulPlaces = MeaningfulPlacesStore.shared
     @State private var addingPlace = false
     @State private var editingPlace: MeaningfulPlace?
-    @State private var storageSummary = "Calculating local storage…"
     @State private var resetPreview: CuratorResetPreview?
-    @State private var reanalysisPreview: CuratorReanalysisPreview?
     @State private var loadingResetPreview = false
 
     var body: some View {
@@ -893,39 +1158,24 @@ struct CuratorSettingsView: View {
                 Button("Add Meaningful Place…") { addingPlace = true }
                 Toggle("Name Journeys with Apple Maps", isOn: $journeyPlaceNames)
                     .onChange(of: journeyPlaceNames) { _ in curator.journeyPlaceNamingChanged() }
-                Text("Saved on this Mac. Address and venue lookups use Apple Maps; Photo Curator never sends photo pixels with a place lookup.")
+                Toggle("Road routes for Journey maps", isOn: $journeyRoadRoutes)
+                Text("Saved on this Mac. Address and venue lookups use Apple Maps; Photo Curator never sends photo pixels with a place lookup. Road routes optionally ask Apple Maps for paths between Journey stops only — never per photo.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("Google Photos") {
                 Toggle("Skip videos", isOn: $model.skipVideos)
                 Toggle("Skip Live Photos", isOn: $model.skipLivePhotos)
-                Text("These apply when selected Moment highlights or Favorites are staged temporarily for Google Photos.")
-                    .font(.caption).foregroundStyle(.secondary)
             }
 
-            Section("Local Storage") {
-                Text(storageSummary)
-                    .font(.caption).foregroundStyle(.secondary)
-                Button("Refresh Storage Summary") {
-                    Task { storageSummary = await Task.detached(priority: .utility) {
-                        StorageMaintenance.storageSummary()
-                    }.value }
-                }
-                Text("Rebuildable visual, text, grouping, and caption evidence is kept in the standard macOS Caches folder. Photo Curator pauses new cache writes when free space falls below 2 GB.")
+            Section("Experimental") {
+                Toggle("Use experimental extended access to Photos metadata", isOn: $extendedPhotosMetadata)
+                    .onChange(of: extendedPhotosMetadata) { _ in curator.experimentalPhotosMetadataChanged() }
+                Text("Reads People names, original filenames, and time zones from the Photos library database to build Journeys for pre-2010 photos without location. Read-only and private to this Mac. These fields are not public Apple API and may stop working after a macOS update.")
                     .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("Maintenance") {
-                Button("Reanalyze Entire Library…") {
-                    loadingResetPreview = true
-                    Task {
-                        do { reanalysisPreview = try await curator.entireLibraryReanalysisPreview() }
-                        catch { curator.errorMessage = error.localizedDescription }
-                        loadingResetPreview = false
-                    }
-                }
-                .disabled(loadingResetPreview || curator.maintenanceBusy || curator.syncBusy)
                 Button("Reset Photo Curator…", role: .destructive) {
                     loadingResetPreview = true
                     Task {
@@ -936,28 +1186,16 @@ struct CuratorSettingsView: View {
                 }
                 .disabled(loadingResetPreview || curator.maintenanceBusy || curator.syncBusy)
                 if loadingResetPreview { ProgressView().controlSize(.small) }
-                Text("Removes local curation and only Photos containers whose creation Photo Curator can prove. Original photos, videos, Favorites, Google Photos, Significant Places, and display preferences are preserved.")
-                    .font(.caption).foregroundStyle(.secondary)
                 if let message = curator.errorMessage {
                     Text(message).font(.caption).foregroundStyle(.red).textSelection(.enabled)
                 }
             }
-
-            Button("Open Diagnostics…") { diagnostics = true }
         }.padding(24).frame(width: 540)
-            .task {
-                storageSummary = await Task.detached(priority: .utility) {
-                    StorageMaintenance.storageSummary()
-                }.value
-            }
             .sheet(isPresented: $addingPlace) {
                 MeaningfulPlaceEditor(store: meaningfulPlaces)
             }
             .sheet(item: $editingPlace) { place in
                 MeaningfulPlaceEditor(store: meaningfulPlaces, place: place)
-            }
-            .sheet(isPresented: $diagnostics) {
-                CuratorDiagnosticsView(curator: curator)
             }
             .sheet(isPresented: $similaritySettings) {
                 SimilaritySettingsView(curator: curator)
@@ -967,66 +1205,6 @@ struct CuratorSettingsView: View {
                     resetPreview = nil
                 }
             }
-            .sheet(item: $reanalysisPreview) { preview in
-                ReanalysisConfirmationView(preview: preview, curator: curator) {
-                    reanalysisPreview = nil
-                }
-            }
-    }
-}
-
-private struct ReanalysisConfirmationView: View {
-    let preview: CuratorReanalysisPreview
-    @ObservedObject var curator: CuratorController
-    let close: () -> Void
-
-    private var cacheSize: String {
-        ByteCountFormatter.string(fromByteCount: preview.currentCacheBytes, countStyle: .file)
-    }
-
-    private var duration: String {
-        let formatter = DateComponentsFormatter()
-        formatter.allowedUnits = [.day, .hour]
-        formatter.unitsStyle = .full
-        formatter.maximumUnitCount = 2
-        return formatter.string(from: preview.estimatedSeconds) ?? "several hours"
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Reanalyze Entire Library").font(.title2.bold())
-            Text("Photo Curator will discard derived visual, text, grouping, and narrative evidence, then analyze (preview.photos.formatted()) indexed photos again at utility priority.")
-            GroupBox("Estimate") {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Rough processing time: (duration)")
-                    Text("Clear (cacheSize) now; the analysis cache will grow again as work completes")
-                }.frame(maxWidth: .infinity, alignment: .leading)
-            }
-            Text("Moment titles, manual choices, merges, Significant Places, Photos albums, Favorites, Google uploads, and indexed photo metadata are preserved. The estimate varies with photo availability, Mac load, and thermal conditions.")
-                .font(.callout).foregroundStyle(.secondary)
-            HStack {
-                Spacer()
-                Button("Cancel", role: .cancel, action: close)
-                    .keyboardShortcut(.cancelAction)
-                    .disabled(curator.maintenanceBusy)
-                Button("Reanalyze") {
-                    Task {
-                        do {
-                            try await curator.reanalyzeEntireLibrary(preview)
-                            close()
-                        } catch {
-                            curator.errorMessage = error.localizedDescription
-                            close()
-                        }
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(curator.maintenanceBusy)
-            }
-        }
-        .padding(24)
-        .frame(width: 560)
-        .interactiveDismissDisabled(curator.maintenanceBusy)
     }
 }
 

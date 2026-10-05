@@ -25,7 +25,7 @@ struct LibraryAccessBanner: View {
                              : "Moments needs all photos to discover your trips. Analysis does not change your Photos library.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
-                    Spacer()
+                    Spacer(minLength: 8)
                     if status != .restricted {
                         Button(status == .notDetermined ? "Allow Photos Access" : "Open Photos Privacy Settings") {
                             if status == .notDetermined {
@@ -42,8 +42,24 @@ struct LibraryAccessBanner: View {
                             }
                         }.disabled(requesting)
                     }
-                }.padding()
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+                .fixedSize(horizontal: false, vertical: true)
                 Divider()
+            }
+        }
+        .task {
+            // The system Photos dialog can grant access without this bar's button.
+            // Keep reading status until the grant shows up, then remove the bar.
+            while !Task.isCancelled {
+                let latest = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+                if latest != status {
+                    refreshStatus(announceGrant: true)
+                    accessChanged()
+                }
+                if latest == .authorized { return }
+                try? await Task.sleep(nanoseconds: 400_000_000)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in

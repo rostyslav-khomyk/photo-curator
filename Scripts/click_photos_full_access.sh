@@ -5,7 +5,7 @@ set -euo pipefail
 
 osascript <<'APPLESCRIPT'
 tell application "System Events"
-  set buttonTitles to {"Allow Full Access", "Allow Access to All Photos", "Allow access to all photos", "Allow", "OK"}
+  set buttonTitles to {"Allow Full Access", "Allow Access to All Photos", "Allow access to all photos", "Allow All Photos", "Allow", "OK"}
   set processNames to {"PhotoCurator", "Photo Curator", "tccd", "UserNotificationCenter", "SecurityAgent", "coreauthd", "UniversalAccessAuthWarn"}
   set clicked to false
   set detail to ""

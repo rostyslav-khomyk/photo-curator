@@ -62,9 +62,11 @@ The deterministic foundation of [Journey Stories](PHASE6_JOURNEY_STORIES.md) now
 home-to-home trips from the complete GPS timeline, preserves ordered child Moments, bridges bounded
 missing-location gaps, and supersedes treating a vacation base such as Fréjus as the whole Story.
 Distance/time transport candidates and bounded cached locality naming are now implemented.
-Bounded cached Vision/OCR transport support is connected; route validation and maps remain planned. See the
+Bounded cached Vision/OCR transport support is connected; Story route maps ship
+from stop evidence with optional Apple Maps road paths. See the
 [living algorithm map](CURATION_ALGORITHM.md) for the distinction between shipping
-paths, candidate-generation gates and the disconnected Story highlight allocator.
+paths, candidate-generation gates and the Story highlight allocator now wired on
+`rebuildStories`.
 
 ## Deliberate hold
 

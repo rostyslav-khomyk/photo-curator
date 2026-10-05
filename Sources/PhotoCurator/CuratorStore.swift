@@ -237,13 +237,16 @@ final class CuratorStore {
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_double(statement, 1, interval.start.timeIntervalSince1970)
         sqlite3_bind_double(statement, 2, interval.end.timeIntervalSince1970)
+        // One decoder for the whole scan. A fresh JSONDecoder per row turned a
+        // library overview into several minutes of CPU while the window sat open.
+        let decoder = JSONDecoder()
         var result: [IndexedPhoto] = []
         while true {
             let status = sqlite3_step(statement)
             if status == SQLITE_DONE { return result }
             guard status == SQLITE_ROW, let bytes = sqlite3_column_blob(statement, 0) else { throw failure() }
             let data = Data(bytes: bytes, count: Int(sqlite3_column_bytes(statement, 0)))
-            if let photo = try? JSONDecoder().decode(IndexedPhoto.self, from: data) {
+            if let photo = try? decoder.decode(IndexedPhoto.self, from: data) {
                 result.append(photo)
             }
         }
@@ -383,23 +386,32 @@ final class CuratorStore {
     /// While attribute-thin work is pending or actively leased, GPS-rich refinement stays
     /// unclaimed. Deferred retries (`running` + future lease + no token) must not stall the queue.
     func claimAnalysis(now: Date = Date(), leaseDuration: TimeInterval = 120, range: DateInterval? = nil) throws -> AnalysisJob? {
+        try claimAnalysis(limit: 1, now: now, leaseDuration: leaseDuration, range: range).first
+    }
+
+    /// Claim up to `limit` jobs in one writer transaction. Thin work still parks GPS-rich refinement.
+    func claimAnalysis(limit: Int, now: Date = Date(), leaseDuration: TimeInterval = 120,
+                       range: DateInterval? = nil) throws -> [AnalysisJob] {
         guard leaseDuration.isFinite, leaseDuration > 0, now.timeIntervalSince1970.isFinite else {
             throw NSError(domain: "PhotoCurator.CuratorStore", code: 3, userInfo: [NSLocalizedDescriptionKey: "Invalid analysis lease."])
         }
+        let bounded = min(max(limit, 0), AnalysisLaneBudget.maxLanes)
+        guard bounded > 0 else { return [] }
         try execute("BEGIN IMMEDIATE")
         do {
-            let ceiling = AdaptiveEvidenceScheduling.refinementMaxPriority
-            let thinOutstanding = try hasClaimableOrActiveAnalysis(abovePriority: ceiling, now: now)
-            let minimumExclusive: Int? = thinOutstanding ? ceiling : nil
-            if let job = try claimAnalysisCandidateLocked(
-                now: now, leaseDuration: leaseDuration, range: range,
-                minimumPriorityExclusive: minimumExclusive
-            ) {
-                try execute("COMMIT")
-                return job
+            var jobs: [AnalysisJob] = []
+            for _ in 0..<bounded {
+                let ceiling = AdaptiveEvidenceScheduling.refinementMaxPriority
+                let thinOutstanding = try hasClaimableOrActiveAnalysis(abovePriority: ceiling, now: now)
+                let minimumExclusive: Int? = thinOutstanding ? ceiling : nil
+                guard let job = try claimAnalysisCandidateLocked(
+                    now: now, leaseDuration: leaseDuration, range: range,
+                    minimumPriorityExclusive: minimumExclusive
+                ) else { break }
+                jobs.append(job)
             }
             try execute("COMMIT")
-            return nil
+            return jobs
         } catch {
             try? execute("ROLLBACK")
             throw error
@@ -544,7 +556,7 @@ final class CuratorStore {
     }
 }
 
-struct AnalysisJob: Equatable {
+struct AnalysisJob: Equatable, Sendable {
     let asset: String
     let revision: String
     let analyzer: String

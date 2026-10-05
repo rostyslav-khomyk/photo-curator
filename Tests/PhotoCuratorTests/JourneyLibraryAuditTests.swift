@@ -21,8 +21,8 @@ private actor JourneyAuditEvidence {
             let ocr = await text.cached(photo)
             if let clues {
                 let names = Set(clues.map { $0.lowercased() })
-                if !names.isDisjoint(with: ["airplane", "aircraft", "airport"]) { visualAir += 1 }
-                if !names.isDisjoint(with: ["car", "vehicle", "train", "railway", "highway"]) { visualLand += 1 }
+                if !names.isDisjoint(with: JourneyLocalTransportSupport.airLabels) { visualAir += 1 }
+                if !names.isDisjoint(with: JourneyLocalTransportSupport.overlandLabels) { visualLand += 1 }
             }
             if ocr?.lines.contains(where: { $0.confidence >= 0.8 }) == true { confidentText += 1 }
             if let clues, let ocr {

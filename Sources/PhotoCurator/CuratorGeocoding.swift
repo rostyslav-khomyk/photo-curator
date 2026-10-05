@@ -58,10 +58,154 @@ enum PlaceNaming {
         guard !trimmed.isEmpty else { return false }
         if trimmed.range(of: #"\d"#, options: .regularExpression) != nil { return true }
         let lower = trimmed.lowercased()
-        let hints = ["avenue", "av.", "street", "st.", "straat", "laan", "weg", "road", "rd.",
+        let hints = ["avenue", "avenida", "av.", "street", "st.", "straat", "laan", "weg", "road", "rd.",
                      "boulevard", "blvd", "rue ", "allee", "allée", "alley", "drive", "lane",
-                     "platz", "plein", "gasse", "camino", "calle ", "via "]
+                     "platz", "plein", "gasse", "camino", "calle ", "via ", "vía ", "ulitsa", "ul.",
+                     "вулиця", "вул.", "проспект", "aleja", "aleje", "al.", "al ",
+                     "cours ", "quai ", "chemin ", "place "]
         return hints.contains { lower.hasPrefix($0) || lower.contains(" \($0)") || lower.contains("\($0) ") }
+    }
+
+    /// POI / transit / retail labels should not name a Journey (no transatlantic mall trips).
+    static func looksLandmarkOrTransit(_ value: String) -> Bool {
+        let lower = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty else { return false }
+        let hints = ["airport", "aeropuerto", "aéroport", "aeroport", "schiphol", "mini-europe",
+                     "minieurope", "terminal", "station", "bahnhof", "hbf",
+                     "harbour", "harbor", "beach", "platja",
+                     "playa", "palace", "cathedral", "basilica", "basilique", "museum", "stadium", "arena",
+                     "ferry", "cruise", "caribbean sea", "mediterranean sea", "north sea",
+                     "park güell", "park guell", "mall", "shopping", "shopping center",
+                     "shopping centre", "outlet", "supermarket", "ikea",
+                     "school", "temple", "church", "disneyland",
+                     "kleingarten", "gartenanlage", "tiergarten",
+                     "rynok", "square", "muratpaşa", "muratpasa",
+                     "autoroute", "autobahn", "motorway"]
+        if hints.contains(where: { lower == $0 || lower.hasPrefix($0 + " ") || lower.contains(" " + $0) }) {
+            return true
+        }
+        if lower.hasSuffix(" sea") || lower.hasPrefix("park ") || lower.hasPrefix("plaza ")
+            || lower.hasPrefix("pont ") || lower.hasPrefix("kleingarten")
+            || lower.hasSuffix(" square") || lower.hasSuffix(" hbf")
+            || lower.contains("gartenanlage")
+            || lower.contains("national park") || lower.contains("natural park")
+            || looksForest(lower) {
+            return true
+        }
+        // "Woodland Mall", "Something Shopping Center"
+        if lower.hasSuffix(" mall") || lower.contains(" mall ") || lower.hasSuffix(" outlet") {
+            return true
+        }
+        return false
+    }
+
+    static func looksRetail(_ value: String?) -> Bool {
+        guard let value else { return false }
+        let lower = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty else { return false }
+        return ["mall", "shopping", "outlet", "supermarket", "ikea"].contains {
+            lower == $0 || lower.contains($0)
+        } || lower.hasSuffix(" mall") || lower.hasSuffix(" outlet")
+    }
+
+    /// Polish/German forest pins are not Journey destinations (Stanicki Las).
+    static func looksForest(_ value: String?) -> Bool {
+        guard let value else { return false }
+        let lower = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty else { return false }
+        return lower.hasSuffix(" las") || lower.hasSuffix(" las.")
+            || lower.hasPrefix("las ") || lower == "las"
+            || lower.contains(" forest") || lower.hasSuffix(" forest")
+            || lower.contains("forst") || lower.contains("puszcza")
+            || lower.hasSuffix(" woods")
+    }
+
+    /// Regular passenger airports the owner actually flies — not a grass strip in a forest.
+    enum CivilAirports {
+        struct Field {
+            let latitude: Double
+            let longitude: Double
+            let radius: CLLocationDistance
+        }
+
+        static let fields: [Field] = [
+            .init(latitude: 52.310, longitude: 4.768, radius: 30_000),   // Schiphol
+            .init(latitude: 52.366, longitude: 13.503, radius: 30_000),  // Berlin BER
+            .init(latitude: 52.560, longitude: 13.288, radius: 25_000),  // Berlin TXL
+            .init(latitude: 41.297, longitude: 2.078, radius: 30_000),   // Barcelona
+            .init(latitude: 53.426, longitude: -6.250, radius: 25_000),  // Dublin
+            .init(latitude: 44.571, longitude: 26.085, radius: 25_000),  // Bucharest
+            .init(latitude: 37.936, longitude: 23.944, radius: 25_000),  // Athens
+            .init(latitude: 38.774, longitude: -9.134, radius: 25_000),  // Lisbon
+            .init(latitude: 28.453, longitude: -13.864, radius: 25_000), // Fuerteventura
+            .init(latitude: 36.405, longitude: 28.086, radius: 25_000),  // Rhodes
+            .init(latitude: 35.340, longitude: 25.180, radius: 25_000),  // Heraklion
+            .init(latitude: 42.212, longitude: -83.353, radius: 25_000), // Detroit
+            .init(latitude: 33.641, longitude: -84.428, radius: 25_000), // Atlanta
+            .init(latitude: 9.071, longitude: -79.384, radius: 30_000),  // Panama City
+            .init(latitude: 49.813, longitude: 23.956, radius: 20_000),  // Lviv
+        ]
+
+        static func near(latitude: Double, longitude: Double) -> Bool {
+            let point = CLLocation(latitude: latitude, longitude: longitude)
+            return fields.contains {
+                point.distance(from: CLLocation(latitude: $0.latitude, longitude: $0.longitude)) < $0.radius
+            }
+        }
+    }
+
+    static func looksAirport(_ value: String?) -> Bool {
+        guard let value else { return false }
+        let lower = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty else { return false }
+        return ["airport", "aeropuerto", "aéroport", "aeroport", "schiphol"].contains {
+            lower == $0 || lower.contains($0)
+        }
+    }
+
+    /// City names that must not title a Journey in a different country
+    /// (Brisbane, California is not Australia).
+    private static let famousCityCountries: [String: String] = [
+        "brisbane": "Australia"
+    ]
+
+    /// True when the stop label is a famous city from another country than the GPS.
+    static func labelConflictsWithCoordinates(_ value: String?, latitude: Double, longitude: Double) -> Bool {
+        guard let value else { return false }
+        let token = value.split(separator: ",").first.map(String.init)?
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
+        guard !token.isEmpty, let expected = famousCityCountries[token] else { return false }
+        guard let actual = JourneyRegionNames.country(latitude: latitude, longitude: longitude) else {
+            return false
+        }
+        return actual != expected
+    }
+
+    /// Journey stop labels that should be replaced by a city/region geocode.
+    static func shouldReplaceJourneyStopLabel(_ value: String?) -> Bool {
+        guard let value else { return true }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return true }
+        let lower = trimmed.lowercased()
+        if lower == "home" || lower.hasPrefix("home ") || lower.hasPrefix("home\u{00a0}") {
+            return false
+        }
+        return looksStreetLevel(trimmed) || looksLandmarkOrTransit(trimmed)
+            || looksHighwayOrTransitPin(trimmed)
+    }
+
+    /// A7 / Autoroute du Soleil style pins are road transit, not Journey destinations.
+    static func looksHighwayOrTransitPin(_ value: String?) -> Bool {
+        guard let value else { return false }
+        let lower = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !lower.isEmpty else { return false }
+        if looksLandmarkOrTransit(lower) { return true }
+        if lower.hasPrefix("a ") || lower.hasPrefix("a7") || lower.hasPrefix("a 7")
+            || lower.contains(" autoroute") || lower.hasPrefix("autoroute")
+            || lower.contains("autobahn") || lower.contains("motorway") {
+            return true
+        }
+        return false
     }
 }
 

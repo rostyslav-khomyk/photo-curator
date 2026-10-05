@@ -443,6 +443,114 @@ final class CatalogV2Tests: XCTestCase {
         XCTAssertEqual(savedCandidate?.state, .candidate)
     }
 
+    func testRebuildStoriesAllocatesHierarchicalStoryHighlights() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let catalogURL = root.appendingPathComponent("catalog-v2.sqlite3")
+        let store = try CatalogV2Store(url: catalogURL)
+
+        func gps(_ id: String, _ time: TimeInterval, lat: Double, lon: Double, favorite: Bool = false) -> IndexedPhoto {
+            IndexedPhoto(id: id, created: Date(timeIntervalSince1970: time),
+                         modified: Date(timeIntervalSince1970: time),
+                         latitude: lat, longitude: lon, favorite: favorite, width: 100, height: 100)
+        }
+        // Many Moment highlights so a naive sum exceeds the Story budget.
+        let homeBefore = gps("hb", 1_000, lat: 52.1, lon: 4.9)
+        let munichA = (0..<4).map { index in
+            gps("a\(index)", 1_000 + Double(2 + index) * 86_400, lat: 48.14, lon: 11.58,
+                favorite: index == 0)
+        }
+        let munichB = (0..<4).map { index in
+            gps("b\(index)", 1_000 + Double(6 + index) * 86_400, lat: 48.15, lon: 11.57)
+        }
+        let homeAfter = gps("ha", 1_000 + 12 * 86_400, lat: 52.1, lon: 4.9)
+        let moments = [
+            PhotoMoment(id: "home-before", start: homeBefore.created!, end: homeBefore.created!,
+                        photos: [homeBefore],
+                        selection: MomentSelection(selected: [homeBefore.id], pending: [], similar: [])),
+            PhotoMoment(id: "munich-a", start: munichA.first!.created!, end: munichA.last!.created!,
+                        photos: munichA,
+                        selection: MomentSelection(selected: munichA.map(\.id), pending: [], similar: [])),
+            PhotoMoment(id: "munich-b", start: munichB.first!.created!, end: munichB.last!.created!,
+                        photos: munichB,
+                        selection: MomentSelection(selected: munichB.map(\.id), pending: [], similar: [])),
+            PhotoMoment(id: "home-after", start: homeAfter.created!, end: homeAfter.created!,
+                        photos: [homeAfter],
+                        selection: MomentSelection(selected: [homeAfter.id], pending: [], similar: [])),
+        ]
+
+        var database: OpaquePointer?
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        XCTAssertEqual(sqlite3_open(catalogURL.path, &database), SQLITE_OK)
+        let homeID = UUID().uuidString
+        let home = MeaningfulPlace(id: UUID(uuidString: homeID) ?? UUID(), label: "Home",
+            address: "Parklaan", latitude: 52.1, longitude: 4.9, radius: 2_000)
+        let homePayload = try JSONEncoder().encode(home)
+        var placeStatement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(database,
+            "INSERT INTO meaningful_places VALUES(?,?,?,?,?,?,?)", -1, &placeStatement, nil), SQLITE_OK)
+        sqlite3_bind_text(placeStatement, 1, homeID, -1, transient)
+        sqlite3_bind_text(placeStatement, 2, "Home", -1, transient)
+        sqlite3_bind_text(placeStatement, 3, "Parklaan", -1, transient)
+        sqlite3_bind_double(placeStatement, 4, 52.1)
+        sqlite3_bind_double(placeStatement, 5, 4.9)
+        sqlite3_bind_double(placeStatement, 6, 2_000)
+        _ = homePayload.withUnsafeBytes {
+            sqlite3_bind_blob(placeStatement, 7, $0.baseAddress, Int32(homePayload.count), transient)
+        }
+        XCTAssertEqual(sqlite3_step(placeStatement), SQLITE_DONE)
+        sqlite3_finalize(placeStatement)
+        sqlite3_close(database)
+
+        try await store.synchronize(moments: moments, activeMomentIDs: Set(moments.map(\.id)))
+        try await store.rebuildStories()
+        let journeys = try await store.storySummaries().filter { $0.kind == .journey }
+        let story = try XCTUnwrap(journeys.first)
+        let momentHighlightSum = moments.reduce(0) { $0 + ($1.selection?.selected.count ?? 0) }
+        XCTAssertGreaterThan(momentHighlightSum, story.highlightCount,
+                             "Story highlights must be curated, not a sum of Moment highlights")
+        XCTAssertGreaterThanOrEqual(story.highlightCount, story.momentIDs.count,
+                                    "Story set should still cover each child Moment when possible")
+        XCTAssertEqual(story.coverAssetID, "a0",
+                       "Favorite Moment highlight should win Story cover when present")
+    }
+
+    func testRebuildStoriesCreatesExperimentalUnlocatedJourney() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("catalog.sqlite3")
+        let store = try CatalogV2Store(url: url)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .current
+        var photos: [IndexedPhoto] = []
+        for day in 0..<4 {
+            for shot in 0..<8 {
+                var components = DateComponents()
+                components.year = 2009
+                components.month = 7
+                components.day = 10 + day
+                components.hour = 9 + shot
+                let created = calendar.date(from: components)!
+                photos.append(IndexedPhoto(
+                    id: "u-\(day)-\(shot)", created: created, modified: nil,
+                    latitude: nil, longitude: nil, favorite: false, width: 100, height: 100))
+            }
+        }
+        let moment = PhotoMoment(
+            id: "unlocated-summer", start: photos.first!.created!, end: photos.last!.created!,
+            photos: photos)
+        try await store.synchronize(moments: [moment], activeMomentIDs: ["unlocated-summer"])
+        try await store.rebuildStories()
+        let journeys = try await store.storySummaries().filter { $0.kind == .journey }
+        XCTAssertEqual(journeys.map(\.title), ["Summer 2009"])
+        XCTAssertEqual(journeys.first?.momentIDs, ["unlocated-summer"])
+        XCTAssertTrue(journeys.first?.stops.isEmpty == true)
+        XCTAssertTrue(journeys.first?.isFinalizedJourney == true)
+        XCTAssertEqual(CatalogV2Store.storyProjectionEpoch, "story-projection-v55-unlocated-full-names")
+        let gated = try await store.experimentalUnlocatedPhotos(extendedAccess: false)
+        XCTAssertTrue(gated.isEmpty)
+    }
+
     private func photo(_ id: String, _ time: TimeInterval, favorite: Bool = false) -> IndexedPhoto {
         IndexedPhoto(id: id, created: Date(timeIntervalSince1970: time), modified: nil,
             latitude: 52, longitude: 4, favorite: favorite, width: 100, height: 100)

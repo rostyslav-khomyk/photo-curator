@@ -16,6 +16,8 @@ cannot read Mac telemetry or click Photos permission dialogs.
    `Photo Curator`). Cursor/Terminal need Accessibility permission.
    After ad-hoc rebuild/resign, expect this dialog again — a missed click stalls
    Moment preparation even when telemetry still looks “healthy”.
+   On recent macOS the button title is often **Allow All Photos** (not only
+   “Allow Full Access” / “Allow Access to All Photos”).
 2. Run `Scripts/soak_watch_telemetry.py` against
    `~/Library/Logs/Photo Curator/curator.jsonl` (counts-only; never log photo IDs,
    OCR, titles, or coordinates).
@@ -23,6 +25,17 @@ cannot read Mac telemetry or click Photos permission dialogs.
    - **ok** — one-line healthy note; do not thrash.
    - **warn** (`app_not_running`) — relaunch
      `dist/Photo Curator.app` if a soak is intended; leave Curate While Idle on.
+   - **warn** (`journey_titles_wiped`) — catalog still has Journey shells but almost
+     no finalized `Journey to` / `Journey via` titles (sidebar looks empty). Do not
+     ignore; confirm geocode is running (`journeyLookups` in catalog events) and
+     rebuild is not wiping stop places. Recovery cadence should geocode every step.
+   - **error** (`journey_geocode_stalled`) — wipe condition plus analysis events but
+     zero `journeyLookups` in the recent window. Treat as stuck recovery: fix
+     cadence / preserve path, rebuild, relaunch.
+   - **error** (`telemetry_stalled`) — no jsonl events for ≥12 minutes while the app
+     binary is running (or was expected to). Treat as stuck: Photos access dialog,
+     dead scheduler, or hung analysis. Quit dist binary, diagnose, fix, rebuild,
+     relaunch.
    - **error** (failure burst / trailing failures) —
      1. Quit Photo Curator (`pkill` the dist binary only).
      2. Diagnose from telemetry + recent code paths (OCR pause, catalog lock,

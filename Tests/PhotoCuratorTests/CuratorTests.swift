@@ -149,6 +149,18 @@ final class CuratorTests: XCTestCase {
         XCTAssertEqual(MomentGrouping.group(input.reversed(), calendar: calendar).map(\.id), moments.map(\.id))
     }
 
+    func testShippingGroupingUsesAdaptiveDayCadence() {
+        // Burst of 5-minute gaps on one day, then a long pause still same day.
+        let burst = [0, 300, 600, 900].map { photo("b\($0)", Double($0)) }
+        let late = photo("late", 8 * 3600) // 8h later — above adaptive ceiling for a tight median
+        let moments = MomentGrouping.group(burst + [late], calendar: calendar)
+        XCTAssertEqual(moments.count, 2)
+        XCTAssertEqual(moments.flatMap(\.photos).count, 5)
+        // Dense day with only short gaps stays one Moment.
+        let steady = [0, 600, 1_200, 1_800].map { photo("s\($0)", Double($0)) }
+        XCTAssertEqual(MomentGrouping.group(steady, calendar: calendar).count, 1)
+    }
+
     func testAutomaticPublicationWaitsForIdle() {
         XCTAssertFalse(CuratorPolicy.mayRunAutomaticPublication(idleSeconds: 119))
         XCTAssertTrue(CuratorPolicy.mayRunAutomaticPublication(idleSeconds: 120))

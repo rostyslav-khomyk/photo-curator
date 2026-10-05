@@ -8,7 +8,10 @@ struct DashboardView: View {
         VStack(spacing: 0) {
             LibraryAccessBanner(accessChanged: model.refreshPhotosAccess)
             CuratorView(curator: curator, model: model)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(WindowContentInsetRepair())
         .navigationTitle("Photo Curator")
         .onAppear { CuratorLaunchPerformance.shared.finish() }
         .alert("Photo Curator", isPresented: Binding(

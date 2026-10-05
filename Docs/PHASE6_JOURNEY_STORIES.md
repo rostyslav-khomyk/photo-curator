@@ -47,8 +47,10 @@ changing membership or mode. See the [living map](CURATION_ALGORITHM.md) for sam
 phrase coverage and confidence rules. It is connected to the scheduler and persists
 support counts with stale-result rejection; no new image analysis is requested.
 
-MapKit route validation, maps, manual Story editing, country-level
-naming, and Apple Intelligence narratives remain later slices.
+Story route maps now render stop pins and geometric/transport legs in the
+workspace; optional Apple Maps road paths are Settings-gated. Manual Story
+editing, country-level naming, and Apple Intelligence narratives remain later
+slices.
 
 ## Goal
 
@@ -115,11 +117,10 @@ asset membership. User-reviewed Story membership becomes a protected anchor duri
    captions and keywords on pre-2007 photos before expanding unlocated Story work.
 2. Qualify the newly connected cached Vision/OCR confidence support on an isolated
    owner-catalog/cache copy before expanding phrases or specializing transport modes.
-3. Add optional, cached MapKit road validation behind an explicit privacy setting. Never issue one
-   network request per photo; route only between deduplicated stops.
-4. Show a Story timeline/map and the evidence behind uncertain boundaries. Allow split, merge, and
+3. ~~Optional MapKit road paths~~ — Settings toggle `curatorJourneyRoadRoutes`; cached per stop pair.
+4. Show evidence behind uncertain boundaries. Allow split, merge, and
    title corrections without changing child Moment membership.
-5. Complete clean-room qualification before enabling route validation or model enrichment.
+5. Complete clean-room qualification before expanding transport specialization or model enrichment.
 
 ## macOS 27 Apple Intelligence
 

@@ -794,6 +794,10 @@ actor CuratorWorker {
 
     func claim(range: DateInterval?) throws -> AnalysisJob? { try database().claimAnalysis(range: range) }
 
+    func claim(limit: Int, range: DateInterval?) throws -> [AnalysisJob] {
+        try database().claimAnalysis(limit: limit, range: range)
+    }
+
     @discardableResult
     func refreshAdaptiveAnalysisPriorities() throws -> Int {
         try database().refreshAdaptiveAnalysisPriorities()
@@ -902,8 +906,15 @@ final class CuratorController: ObservableObject {
     private var viewportPrioritySignatures = Set<String>()
     private(set) var analyzedThisSession = 0
     private(set) var deferredThisSession = 0
-    private lazy var analysisLoader = CuratorThumbnailLoader(provider: PhotoKitThumbnailProvider())
+    private var analysisLoaders: [CuratorThumbnailLoader] = []
     private let analyzer = CuratorVisionAnalyzer()
+
+    private func analysisLoaderLane(_ index: Int) -> CuratorThumbnailLoader {
+        while analysisLoaders.count <= index {
+            analysisLoaders.append(CuratorThumbnailLoader(provider: PhotoKitThumbnailProvider()))
+        }
+        return analysisLoaders[index]
+    }
     private var contextStep = 0
     private var lastWaitLog = Date.distantPast
     private var systemSleeping = false
@@ -985,8 +996,10 @@ final class CuratorController: ObservableObject {
                     CuratorTelemetry.shared.record(.catalog, counts: ["adaptiveRescored": rescored])
                     let storiesEmpty = try await catalog.storySummaries().isEmpty
                     let membershipMissing = try await catalog.needsStoryProjection()
-                    if storiesEmpty || membershipMissing {
+                    if storiesEmpty {
                         try await catalog.rebuildStories()
+                    } else if membershipMissing {
+                        try await catalog.reprocessJourneyPresentation()
                     }
                     if let publicationCoordinator {
                         let recoveries = await publicationCoordinator.recoverPending()
@@ -1045,6 +1058,14 @@ final class CuratorController: ObservableObject {
 
     func journeyPlaceNamingChanged() {
         wakeScheduler(.policyChanged)
+    }
+
+    /// Re-projects Stories so pre-2010 experimental Journeys appear or leave.
+    func experimentalPhotosMetadataChanged() {
+        Task {
+            do { try await reprocessJourneys() }
+            catch { errorMessage = error.localizedDescription }
+        }
     }
 
     func nuclearResetPreview() async throws -> CuratorResetPreview {
@@ -1107,6 +1128,103 @@ final class CuratorController: ObservableObject {
             return CurationRebuildPreview(generationID: generation.id, comparison: comparison)
         } catch {
             if let candidateID { try? await catalog.failGeneration(id: candidateID, reason: error.localizedDescription) }
+            maintenancePaused = false
+            maintenanceBusy = false
+            wakeScheduler(.policyChanged)
+            throw error
+        }
+    }
+
+    func saveStoryEdit(id: String, title: String?, synopsis: String?) async throws {
+        guard let catalog else { throw PublicationFailure.catalogUnavailable }
+        try await catalog.upsertStoryEdit(id: id, title: title, synopsis: synopsis)
+        storySummaries = try await catalog.storySummaries()
+        revision += 1
+    }
+
+    /// Retitles Journeys from coordinates, drops stuck landmark stop labels, and rebuilds
+    /// home start/end anchors from mapped Homes.
+    func reprocessJourneys() async throws {
+        guard let catalog else { throw PublicationFailure.catalogUnavailable }
+        activity = "Refreshing Journey names and routes…"
+        try await catalog.reprocessJourneyPresentation()
+        storySummaries = try await catalog.storySummaries()
+        revision += 1
+        activity = "Journey names refreshed. City labels continue in the background."
+        wakeScheduler(.userRequested)
+    }
+
+    /// Combines Journeys the owner selected. Rebuild keeps the merge when those Moments still form the same set.
+    func mergeJourneys(_ stories: [StorySummary], title: String) async throws {
+        guard let catalog else { throw PublicationFailure.catalogUnavailable }
+        let journeys = stories.filter { $0.kind == .journey }
+        guard journeys.count >= 2 else {
+            throw NSError(domain: "PhotoCurator.Curation", code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Select at least two Journeys to merge."])
+        }
+        try await catalog.saveJourneyMerge(momentIDs: journeys.flatMap(\.momentIDs), title: title)
+        try await catalog.rebuildStories()
+        storySummaries = try await catalog.storySummaries()
+        revision += 1
+    }
+
+    func activateCurationCandidate(_ preview: CurationRebuildPreview) async throws {
+        guard !maintenanceBusy, !syncBusy, let catalog else {
+            throw PublicationFailure.conflictingOperation
+        }
+        guard preview.comparison.canRecommendActivation else {
+            throw NSError(domain: "PhotoCurator.Curation", code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Activation needs an owner false-join/false-split benchmark that prefers this candidate. Structural comparison alone is not enough."])
+        }
+        maintenanceBusy = true
+        maintenancePaused = true
+        activity = "Activating shadow curation…"
+        analysisTask?.cancel()
+        metadataTask?.cancel()
+        let analysis = analysisTask
+        let metadata = metadataTask
+        await analysis?.value
+        await metadata?.value
+        do {
+            try await catalog.activateCandidateGeneration(id: preview.generationID, comparison: preview.comparison)
+            try await catalog.rebuildStories()
+            revision += 1
+            storySummaries = try await catalog.storySummaries()
+            maintenancePaused = false
+            maintenanceBusy = false
+            activity = "Activated candidate curation. Previous generation is available for rollback."
+            wakeScheduler(.userRequested)
+        } catch {
+            maintenancePaused = false
+            maintenanceBusy = false
+            wakeScheduler(.policyChanged)
+            throw error
+        }
+    }
+
+    func rollbackCurationGeneration() async throws {
+        guard !maintenanceBusy, !syncBusy, let catalog else {
+            throw PublicationFailure.conflictingOperation
+        }
+        maintenanceBusy = true
+        maintenancePaused = true
+        activity = "Rolling back to the previous curation generation…"
+        analysisTask?.cancel()
+        metadataTask?.cancel()
+        let analysis = analysisTask
+        let metadata = metadataTask
+        await analysis?.value
+        await metadata?.value
+        do {
+            try await catalog.rollbackGeneration()
+            try await catalog.rebuildStories()
+            revision += 1
+            storySummaries = try await catalog.storySummaries()
+            maintenancePaused = false
+            maintenanceBusy = false
+            activity = "Rolled back to the previous curation generation."
+            wakeScheduler(.userRequested)
+        } catch {
             maintenancePaused = false
             maintenanceBusy = false
             wakeScheduler(.policyChanged)
@@ -1444,11 +1562,24 @@ final class CuratorController: ObservableObject {
         let interval = CuratorPerformance.begin("Moment summary query")
         defer { CuratorPerformance.end("Moment summary query", interval) }
         do {
-            let previousStories = storySummaries
             momentSummaries = try await catalog.summaries(googleUploadedAssetIDs: googleUploadedAssetIDs,
                                                           reviewDecisions: reviewDecisions)
+            libraryOverview = HolisticLibraryOverview.periods(momentSummaries)
+            availableMoments = momentSummaries.count
+        } catch is CancellationError {
+            return
+        } catch let error as DecodingError {
+            CuratorTelemetry.shared.record(.failure, counts: ["code": (error as NSError).code])
+            return
+        } catch {
+            // Story rebuild / catalog lock must not block the Moments grid with a modal.
+            CuratorTelemetry.shared.record(.failure, counts: ["code": (error as NSError).code])
+            return
+        }
+        do {
+            let previousStories = storySummaries
             if try await catalog.needsStoryProjection() {
-                try await catalog.rebuildStories()
+                try await catalog.reprocessJourneyPresentation()
             }
             let nextStories = try await catalog.storySummaries()
             // Keep prior Journey membership if a mid-rebuild read returns empty shells.
@@ -1456,14 +1587,10 @@ final class CuratorController: ObservableObject {
                 || previousStories.allSatisfy({ $0.momentIDs.isEmpty }) {
                 storySummaries = nextStories
             }
-            libraryOverview = HolisticLibraryOverview.periods(momentSummaries)
-            availableMoments = momentSummaries.count
         } catch is CancellationError {
             return
-        } catch let error as DecodingError {
-            CuratorTelemetry.shared.record(.failure, counts: ["code": (error as NSError).code])
         } catch {
-            errorMessage = error.localizedDescription
+            CuratorTelemetry.shared.record(.failure, counts: ["code": (error as NSError).code])
         }
     }
 
@@ -1696,6 +1823,9 @@ final class CuratorController: ObservableObject {
         if activity != analysisActivity {
             activity = analysisActivity
         }
+        let lanes = AnalysisLaneBudget.lanes()
+        let loaders = (0..<lanes).map { analysisLoaderLane($0) }
+        let analyzers = (0..<lanes).map { _ in CuratorVisionAnalyzer() }
         batchRunning = true
         analysisTask = Task(priority: .utility) {
             let interval = CuratorPerformance.begin("Analysis step")
@@ -1709,7 +1839,7 @@ final class CuratorController: ObservableObject {
                     if token == revision { wakeScheduler(.workCompleted) }
                 }
             }
-            var claimed: AnalysisJob?
+            var claimedJobs: [AnalysisJob] = []
             do {
                 contextStep += 1
                 if contextStep % 8 == 0 {
@@ -1732,11 +1862,20 @@ final class CuratorController: ObservableObject {
                 }
                 // Cheap Journey naming before OCR: every 15th step is also a multiple of 5,
                 // so geocode must run first or OCR starved it for the whole soak.
-                if contextStep % 15 == 0 {
+                // After a title wipe (shells dominate), recover every step with a larger batch
+                // so the finalized sidebar is not empty for hours while Vision still advances.
+                let journeys = storySummaries.filter { $0.kind == .journey }
+                let finalizedJourneys = journeys.filter(\.isFinalizedJourney).count
+                let journeyCadence = JourneyEnrichmentScheduling.cadence(
+                    journeyCount: journeys.count, finalizedCount: finalizedJourneys)
+                let journeyLookups = JourneyEnrichmentScheduling.maximumLookups(
+                    journeyCount: journeys.count, finalizedCount: finalizedJourneys)
+                if contextStep % journeyCadence == 0 {
                     let journeyNames = UserDefaults.standard.object(forKey: "curatorJourneyPlaceNames") == nil
                         || UserDefaults.standard.bool(forKey: "curatorJourneyPlaceNames")
                     if journeyNames, let catalog {
-                        let enrichment = try await catalog.enrichJourneyStops()
+                        let enrichment = try await catalog.enrichJourneyStops(
+                            maximumLookups: journeyLookups)
                         CuratorTelemetry.shared.record(.catalog, counts: [
                             "journeyLookups": enrichment.attempted,
                             "journeyUpdates": enrichment.updated
@@ -1750,20 +1889,12 @@ final class CuratorController: ObservableObject {
                         }
                     }
                 }
-                // Interleave OCR/label capture while Vision jobs remain, otherwise Moments wait
-                // hours for an empty analysis queue before any text evidence arrives.
-                // Candidates are thin-attributes-first and skip GPS-rich refinement.
-                if contextStep % 5 == 0, let photo = try await worker.nextTextCandidate(range: nil) {
-                    let image = try await analysisLoader.load(assetID: photo.id, timeout: 8)
-                    try Task.checkCancellation()
-                    guard token == revision else { return }
-                    try await worker.prepareText(photo, image: image)
-                    return
-                }
-                guard let job = try await worker.claim(range: nil) else {
+                // Vision/thumbnail lanes run together. OCR no longer skips a Vision batch.
+                let jobs = try await worker.claim(limit: lanes, range: nil)
+                if jobs.isEmpty {
                     guard token == revision else { return }
                     if let photo = try await worker.nextTextCandidate(range: nil) {
-                        let image = try await analysisLoader.load(assetID: photo.id, timeout: 8)
+                        let image = try await loaders[0].load(assetID: photo.id, timeout: 8)
                         try Task.checkCancellation()
                         guard token == revision else { return }
                         try await worker.prepareText(photo, image: image)
@@ -1831,26 +1962,34 @@ final class CuratorController: ObservableObject {
                     }
                     return
                 }
-                claimed = job
-                try Task.checkCancellation()
-                guard try await worker.currentAnalysisPhoto(job) != nil else { return }
-                let image = try await analysisLoader.load(assetID: job.asset, timeout: 8)
-                let result = try await analyzer.analyze(image)
-                try Task.checkCancellation()
-                guard token == revision else { try await worker.release(job); return }
-                // An edit since enqueue must never be saved under an old fingerprint.
-                guard let photo = try await worker.currentAnalysisPhoto(job) else { return }
-                try await worker.prepareText(photo, image: image)
-                try Task.checkCancellation()
-                guard token == revision else { try await worker.release(job); return }
-                guard try await worker.currentAnalysisPhoto(job) != nil else { return }
-                if case .failed = result.aesthetics { try await worker.retryLater(job); deferredThisSession += 1 }
-                else if case .failed = result.faces { try await worker.retryLater(job); deferredThisSession += 1 }
-                else if case .failed = result.featurePrint { try await worker.retryLater(job); deferredThisSession += 1 }
-                else { try await worker.finish(job, result: result); analyzedThisSession += 1 }
-                CuratorTelemetry.shared.record(.analysis, counts: ["saved": analyzedThisSession, "deferred": deferredThisSession])
+                claimedJobs = jobs
+                let analysisWorker = worker
+                await withTaskGroup(of: AnalysisLaneCount.self) { group in
+                    for (index, job) in jobs.enumerated() {
+                        let loader = loaders[index]
+                        let laneAnalyzer = analyzers[index]
+                        group.addTask { [self] in
+                            await AnalysisLaneRunner.run(
+                                job: job, worker: analysisWorker, loader: loader, analyzer: laneAnalyzer,
+                                stillCurrent: { @MainActor in token == self.revision })
+                        }
+                    }
+                    for await count in group {
+                        analyzedThisSession += count.saved
+                        deferredThisSession += count.deferred
+                    }
+                }
+                if contextStep % 5 == 0, let photo = try await worker.nextTextCandidate(range: nil) {
+                    let image = try await loaders[0].load(assetID: photo.id, timeout: 8)
+                    try Task.checkCancellation()
+                    guard token == revision else { return }
+                    try await worker.prepareText(photo, image: image)
+                }
+                CuratorTelemetry.shared.record(.analysis, counts: [
+                    "saved": analyzedThisSession, "deferred": deferredThisSession, "lanes": jobs.count
+                ])
             } catch {
-                if claimed == nil && !Task.isCancelled {
+                if claimedJobs.isEmpty && !Task.isCancelled {
                     if let thumbnailFailure = error as? ThumbnailFailure,
                        thumbnailFailure == .unavailable || thumbnailFailure == .cloudOnly || thumbnailFailure == .timedOut {
                         deferredThisSession += 1
@@ -1866,11 +2005,11 @@ final class CuratorController: ObservableObject {
                         await scheduler.wake(.retryDue, at: Date().addingTimeInterval(60))
                     }
                 }
-                if let job = claimed {
-                    do {
-                        if Task.isCancelled { try await worker.release(job) }
-                        else { try await worker.retryLater(job); deferredThisSession += 1 }
-                    } catch { errorMessage = "Could not save analysis progress. Retry after reopening Photo Curator." }
+                if Task.isCancelled {
+                    for job in claimedJobs {
+                        do { try await worker.release(job) }
+                        catch { errorMessage = "Could not save analysis progress. Retry after reopening Photo Curator." }
+                    }
                 }
             }
         }
@@ -1956,5 +2095,66 @@ final class CuratorController: ObservableObject {
             moments[idx].publishedDate = publishedDate
         }
         return receipt
+    }
+}
+
+private struct AnalysisLaneCount: Sendable {
+    var saved = 0
+    var deferred = 0
+}
+
+/// Off-main Vision work for one claimed job. Thumbnail load hops to MainActor; SQLite stays on the worker.
+private enum AnalysisLaneRunner {
+    static func run(
+        job: AnalysisJob,
+        worker: CuratorWorker,
+        loader: CuratorThumbnailLoader,
+        analyzer: CuratorVisionAnalyzer,
+        stillCurrent: @MainActor @Sendable () -> Bool
+    ) async -> AnalysisLaneCount {
+        do {
+            try Task.checkCancellation()
+            guard try await worker.currentAnalysisPhoto(job) != nil else { return AnalysisLaneCount() }
+            let image = try await loader.load(assetID: job.asset, timeout: 8)
+            let result = try await analyzer.analyze(image)
+            try Task.checkCancellation()
+            guard await stillCurrent() else {
+                try await worker.release(job)
+                return AnalysisLaneCount()
+            }
+            guard let photo = try await worker.currentAnalysisPhoto(job) else { return AnalysisLaneCount() }
+            try await worker.prepareText(photo, image: image)
+            try Task.checkCancellation()
+            guard await stillCurrent() else {
+                try await worker.release(job)
+                return AnalysisLaneCount()
+            }
+            guard try await worker.currentAnalysisPhoto(job) != nil else { return AnalysisLaneCount() }
+            if case .failed = result.aesthetics {
+                try await worker.retryLater(job)
+                return AnalysisLaneCount(deferred: 1)
+            }
+            if case .failed = result.faces {
+                try await worker.retryLater(job)
+                return AnalysisLaneCount(deferred: 1)
+            }
+            if case .failed = result.featurePrint {
+                try await worker.retryLater(job)
+                return AnalysisLaneCount(deferred: 1)
+            }
+            try await worker.finish(job, result: result)
+            return AnalysisLaneCount(saved: 1)
+        } catch {
+            do {
+                if Task.isCancelled {
+                    try await worker.release(job)
+                    return AnalysisLaneCount()
+                }
+                try await worker.retryLater(job)
+                return AnalysisLaneCount(deferred: 1)
+            } catch {
+                return AnalysisLaneCount(deferred: 1)
+            }
+        }
     }
 }
