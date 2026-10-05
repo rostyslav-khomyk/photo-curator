@@ -429,9 +429,14 @@ flowchart LR
 | Improve journey names | Grounded names and cached geocoding ship | Story summaries + grounded synopsis candidates; user title/synopsis edits preserved |
 
 Publication to Photos or Google is a separate side-effect workflow after selection.
-Photos albums are written under `Photo Curator / Year / Story / Moment`, where
-Story is the Journey or Outing title prefixed with `yyyy-MM` for timeline order
-within the year. Moments without a parent Story use a `Moments` folder. Publication
+Photos albums are written under `Photo Curator / Year / Story / Moment`. Story
+folders use the owner-visible Journey or Outing title (renames included); two
+Stories with one title in the same year add the start month (`· Jul`). Moment
+albums are `Title · 16 Jul` — no year below the year folder. Order comes from
+inserting each folder and album by its earliest capture date, not from name
+prefixes. Moments without a parent Story use a `Moments` folder. The first save
+after upgrading renames legacy `yyyy-MM` / `yyyy-MM-dd` containers the app
+created and re-sorts its managed folders. Publication
 must not be mistaken for successful curation or used as a prerequisite for browsing.
 Pagination and thumbnail requests may prioritize work, but must not define the
 scope of library grouping. A full-library overview runs off the main thread; the
@@ -439,8 +444,11 @@ Moments grid and Story list stay scrollable while it runs. Workspace commands
 sit in the window toolbar. Keep SwiftUI's native full-size title bar: its
 safe-area top inset places All Moments and Journey titles below the toolbar.
 Removing `fullSizeContentView` zeroes that inset while the host stays full
-height, so content slides under the toolbar. Split views clamp to their parent without rewriting NSScrollView
-frames (that clipped All Moments and Journey titles from the top). Inset repair
+height, so content slides under the toolbar. The sidebar List, the detail column
+and the split declare `idealHeight: 0`; otherwise the List's full row height
+becomes the split's height and All Moments hangs above the window once it has
+more Journeys than fit. No `setFrame:` swizzles: a cached split clamp froze the
+split at a stale height after window resizes. Inset repair
 does not take pointer events. The Photos access bar leaves by itself once the
 system dialog grants full access.
 

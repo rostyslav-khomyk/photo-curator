@@ -551,6 +551,42 @@ final class CatalogV2Tests: XCTestCase {
         XCTAssertTrue(gated.isEmpty)
     }
 
+    func testStoryContainingUsesRenamedTitleAndFlagsSameYearDuplicates() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try CatalogV2Store(url: root.appendingPathComponent("catalog.sqlite3"))
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .current
+        func stretch(_ prefix: String, month: Int, day: Int) -> PhotoMoment {
+            var photos: [IndexedPhoto] = []
+            for offset in 0..<4 {
+                for shot in 0..<8 {
+                    let created = calendar.date(from: DateComponents(
+                        year: 2009, month: month, day: day + offset, hour: 9 + shot))!
+                    photos.append(IndexedPhoto(id: "\(prefix)-\(offset)-\(shot)", created: created,
+                        modified: nil, latitude: nil, longitude: nil, favorite: false, width: 100, height: 100))
+                }
+            }
+            return PhotoMoment(id: prefix, start: photos.first!.created!, end: photos.last!.created!,
+                               photos: photos)
+        }
+        let july = stretch("july", month: 7, day: 1)
+        let august = stretch("august", month: 8, day: 10)
+        try await store.synchronize(moments: [july, august], activeMomentIDs: ["july", "august"])
+        try await store.rebuildStories()
+
+        let first = try await store.storyContaining(momentID: "july")
+        XCTAssertEqual(first?.title, "Summer 2009")
+        XCTAssertEqual(first?.sharesTitleInYear, true)
+
+        let journeys = try await store.storySummaries().filter { $0.kind == .journey }
+        let julyStory = try XCTUnwrap(journeys.first { $0.momentIDs == ["july"] })
+        try await store.upsertStoryEdit(id: julyStory.id, title: "Grandparents in July", synopsis: nil)
+        let renamed = try await store.storyContaining(momentID: "july")
+        XCTAssertEqual(renamed?.title, "Grandparents in July")
+        XCTAssertEqual(renamed?.sharesTitleInYear, false)
+    }
+
     private func photo(_ id: String, _ time: TimeInterval, favorite: Bool = false) -> IndexedPhoto {
         IndexedPhoto(id: id, created: Date(timeIntervalSince1970: time), modified: nil,
             latitude: 52, longitude: 4, favorite: favorite, width: 100, height: 100)

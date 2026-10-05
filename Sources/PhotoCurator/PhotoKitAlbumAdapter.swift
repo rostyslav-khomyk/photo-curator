@@ -22,12 +22,16 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
 
         var createdAlbumID: String?
 
-        // Photo Curator / Year / Story (timeline-sorted) / Moment album
+        // Photo Curator / Year / Story / Moment album, each placed by date rather than by name.
         let (rootFolder, createdRoot) = try await findOrCreateRootFolder()
-        let (yearFolder, createdYear) = try await findOrCreateFolder(named: yearString, in: rootFolder)
-        let (storyFolder, createdStory) = try await findOrCreateFolder(named: storyFolderTitle, in: yearFolder)
+        let (yearFolder, createdYear) = try await findOrCreateFolder(
+            named: yearString, in: rootFolder, date: PhotosAlbumNaming.yearStart(yearString))
+        let (storyFolder, createdStory) = try await findOrCreateFolder(
+            named: storyFolderTitle, in: yearFolder, date: request.storyStart ?? request.date)
 
         let existingAlbum = findAlbum(named: albumTitle, in: storyFolder)
+        let storySnapshot = children(of: storyFolder)
+        let albumIndex = existingAlbum == nil ? insertionIndex(for: request.date, in: storyFolder) : 0
 
         try await PHPhotoLibrary.shared().performChanges {
             let assets = PHAsset.fetchAssets(withLocalIdentifiers: request.assetIDs, options: nil)
@@ -41,10 +45,7 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
                 let createAlbumReq = PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: albumTitle)
                 let albumPlaceholder = createAlbumReq.placeholderForCreatedAssetCollection
                 createdAlbumID = albumPlaceholder.localIdentifier
-
-                if let storyReq = PHCollectionListChangeRequest(for: storyFolder) {
-                    storyReq.addChildCollections([albumPlaceholder] as NSArray)
-                }
+                self.insert(albumPlaceholder, into: storyFolder, snapshot: storySnapshot, at: albumIndex)
                 albumRequest = createAlbumReq
             }
 
@@ -169,16 +170,17 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
         return match
     }
 
-    private func findOrCreateFolder(named title: String, in parent: PHCollectionList) async throws -> (PHCollectionList, Bool) {
+    private func findOrCreateFolder(named title: String, in parent: PHCollectionList,
+                                    date: Date?) async throws -> (PHCollectionList, Bool) {
         if let existing = findFolder(named: title, in: parent) { return (existing, false) }
+        let snapshot = children(of: parent)
+        let index = insertionIndex(for: date, in: parent)
         var placeholderID: String?
         try await PHPhotoLibrary.shared().performChanges {
             let req = PHCollectionListChangeRequest.creationRequestForCollectionList(withTitle: title)
             let holder = req.placeholderForCreatedCollectionList
             placeholderID = holder.localIdentifier
-            if let parentReq = PHCollectionListChangeRequest(for: parent) {
-                parentReq.addChildCollections([holder] as NSArray)
-            }
+            self.insert(holder, into: parent, snapshot: snapshot, at: index)
         }
         if let placeholderID {
             let fetched = PHCollectionList.fetchCollectionLists(withLocalIdentifiers: [placeholderID], options: nil)
@@ -203,35 +205,119 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
     // MARK: - Date & Title Formatting
 
     private func resolveYear(for request: CuratedPublicationRequest) -> String {
-        let date = request.storyStart ?? request.date ?? Date()
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy"
-        return formatter.string(from: date)
+        PhotosAlbumNaming.yearTitle(request.storyStart ?? request.date ?? Date())
     }
 
-    /// `yyyy-MM Story name` so folders sort by timeline occurrence within the year.
     private func resolveStoryFolderTitle(for request: CuratedPublicationRequest) -> String {
-        let raw = (request.storyTitle ?? Self.ungroupedStoryFolderName)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let name = raw.isEmpty ? Self.ungroupedStoryFolderName : String(raw.prefix(200))
-        let date = request.storyStart ?? request.date
-        guard let date else { return name }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM"
-        let prefix = formatter.string(from: date)
-        if name.hasPrefix(prefix) { return name }
-        return "\(prefix) \(name)"
+        PhotosAlbumNaming.storyFolderTitle(request.storyTitle)
     }
 
     private func resolveAlbumTitle(for request: CuratedPublicationRequest) -> String {
-        guard let date = request.date else { return request.title }
-        let formatter = DateFormatter()
-        formatter.dateFormat = "yyyy-MM-dd"
-        let datePrefix = formatter.string(from: date)
-        if request.title.hasPrefix(datePrefix) {
-            return request.title
+        PhotosAlbumNaming.albumTitle(request.title, date: request.date)
+    }
+
+    // MARK: - Chronological placement
+
+    /// Earliest capture date under a container. Year folders sort by their title year.
+    private func sortDate(of collection: PHCollection) -> Date? {
+        if let album = collection as? PHAssetCollection {
+            let options = PHFetchOptions()
+            options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: true)]
+            options.fetchLimit = 1
+            return PHAsset.fetchAssets(in: album, options: options).firstObject?.creationDate
         }
-        return "\(datePrefix) \(request.title)"
+        guard let list = collection as? PHCollectionList else { return nil }
+        if let year = PhotosAlbumNaming.yearStart(list.localizedTitle) { return year }
+        var earliest: Date?
+        PHCollection.fetchCollections(in: list, options: nil).enumerateObjects { child, _, _ in
+            guard let date = self.sortDate(of: child) else { return }
+            earliest = earliest.map { min($0, date) } ?? date
+        }
+        return earliest
+    }
+
+    private func children(of parent: PHCollectionList) -> PHFetchResult<PHCollection> {
+        PHCollection.fetchCollections(in: parent, options: nil)
+    }
+
+    private func insertionIndex(for date: Date?, in parent: PHCollectionList) -> Int {
+        var dates: [Date?] = []
+        children(of: parent).enumerateObjects { child, _, _ in dates.append(self.sortDate(of: child)) }
+        return PhotosAlbumNaming.chronologicalIndex(for: date, among: dates)
+    }
+
+    /// Must run inside `performChanges`. Falls back to append when Photos refuses the ordered request.
+    private func insert(_ placeholder: PHObjectPlaceholder, into parent: PHCollectionList,
+                        snapshot: PHFetchResult<PHCollection>, at index: Int) {
+        if let ordered = PHCollectionListChangeRequest(for: parent, childCollections: snapshot) {
+            ordered.insertChildCollections([placeholder] as NSArray,
+                                           at: IndexSet(integer: min(index, snapshot.count)))
+        } else if let request = PHCollectionListChangeRequest(for: parent) {
+            request.addChildCollections([placeholder] as NSArray)
+        }
+    }
+
+    // MARK: - Legacy naming migration
+
+    /// Renames `yyyy-MM Story` / `yyyy-MM-dd Moment` containers Photo Curator created and
+    /// re-sorts managed folders by date. Containers the app cannot prove it created stay as they are.
+    func migrateLegacyNames(managedIDs: Set<String>) async throws {
+        let auth = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        guard auth == .authorized || auth == .limited, let root = findRootFolder() else { return }
+        var albumRenames: [(PHAssetCollection, String)] = []
+        var folderRenames: [(PHCollectionList, String)] = []
+        var managedParents: [PHCollectionList] = managedIDs.contains(root.localIdentifier) ? [root] : []
+        children(of: root).enumerateObjects { yearChild, _, _ in
+            guard let year = yearChild as? PHCollectionList else { return }
+            if managedIDs.contains(year.localIdentifier) { managedParents.append(year) }
+            var siblingNames: [String] = []
+            self.children(of: year).enumerateObjects { child, _, _ in
+                siblingNames.append(child.localizedTitle ?? "")
+            }
+            var taken = Set(siblingNames.map { $0.lowercased() })
+            self.children(of: year).enumerateObjects { storyChild, _, _ in
+                guard let story = storyChild as? PHCollectionList else { return }
+                let managedStory = managedIDs.contains(story.localIdentifier)
+                if managedStory { managedParents.append(story) }
+                if managedStory, let legacy = PhotosAlbumNaming.legacyStoryFolder(story.localizedTitle) {
+                    var name = PhotosAlbumNaming.storyFolderTitle(legacy.title)
+                    if taken.contains(name.lowercased()) {
+                        name = PhotosAlbumNaming.disambiguatedStoryTitle(name, start: legacy.month)
+                    }
+                    taken.insert(name.lowercased())
+                    folderRenames.append((story, name))
+                }
+                self.children(of: story).enumerateObjects { albumChild, _, _ in
+                    guard let album = albumChild as? PHAssetCollection,
+                          managedIDs.contains(album.localIdentifier),
+                          let legacy = PhotosAlbumNaming.legacyAlbum(album.localizedTitle) else { return }
+                    albumRenames.append((album, PhotosAlbumNaming.albumTitle(legacy.title, date: legacy.date)))
+                }
+            }
+        }
+        if !albumRenames.isEmpty || !folderRenames.isEmpty {
+            try await PHPhotoLibrary.shared().performChanges {
+                for (album, title) in albumRenames {
+                    PHAssetCollectionChangeRequest(for: album)?.title = title
+                }
+                for (folder, title) in folderRenames {
+                    PHCollectionListChangeRequest(for: folder)?.title = title
+                }
+            }
+        }
+        for parent in managedParents {
+            let snapshot = children(of: parent)
+            var dates: [Date?] = []
+            snapshot.enumerateObjects { child, _, _ in dates.append(self.sortDate(of: child)) }
+            let moves = PhotosAlbumNaming.chronologicalMoves(dates)
+            guard !moves.isEmpty else { continue }
+            try await PHPhotoLibrary.shared().performChanges {
+                guard let request = PHCollectionListChangeRequest(for: parent, childCollections: snapshot) else { return }
+                for move in moves {
+                    request.moveChildCollections(at: IndexSet(integer: move.from), to: move.to)
+                }
+            }
+        }
     }
 
     private func requestAuthorization() async -> PHAuthorizationStatus {
@@ -327,5 +413,94 @@ extension PhotoKitAlbumAdapter: CuratorResetPhotos {
             }
             return found
         }
+    }
+}
+
+/// Names for `Photo Curator / Year / Story / Moment`. Order comes from placement, not names.
+/// Album lookup is by title, so every name here must be deterministic (fixed locale).
+enum PhotosAlbumNaming {
+    static let ungroupedStoryFolderName = PhotoKitAlbumAdapter.ungroupedStoryFolderName
+    static let separator = " · "
+
+    private static func formatter(_ format: String) -> DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = format
+        return formatter
+    }
+
+    static func yearTitle(_ date: Date) -> String {
+        formatter("yyyy").string(from: date)
+    }
+
+    /// January 1 of a four-digit year folder title.
+    static func yearStart(_ title: String?) -> Date? {
+        guard let title, title.count == 4, let year = Int(title), (1800...3000).contains(year) else { return nil }
+        return Calendar.current.date(from: DateComponents(year: year, month: 1, day: 1))
+    }
+
+    static func storyFolderTitle(_ storyTitle: String?) -> String {
+        let raw = (storyTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? ungroupedStoryFolderName : String(raw.prefix(200))
+    }
+
+    /// Two Stories with one title in the same year get their start month: `Journey to Bucharest · Jul`.
+    static func disambiguatedStoryTitle(_ title: String, start: Date) -> String {
+        title + separator + formatter("MMM").string(from: start)
+    }
+
+    /// `Lake Garda evening · 16 Jul`. The year lives in the folder above.
+    static func albumTitle(_ title: String, date: Date?) -> String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let date else { return trimmed }
+        let suffix = separator + formatter("d MMM").string(from: date)
+        return trimmed.hasSuffix(suffix) ? trimmed : trimmed + suffix
+    }
+
+    /// `2022-07-16 Lake Garda evening` → title and day.
+    static func legacyAlbum(_ name: String?) -> (title: String, date: Date)? {
+        legacy(name, format: "yyyy-MM-dd", length: 10).map { ($0.rest, $0.date) }
+    }
+
+    /// `2022-07 Journey through Italy` → title and month.
+    static func legacyStoryFolder(_ name: String?) -> (title: String, month: Date)? {
+        legacy(name, format: "yyyy-MM", length: 7).map { ($0.rest, $0.date) }
+    }
+
+    private static func legacy(_ name: String?, format: String, length: Int) -> (rest: String, date: Date)? {
+        guard let name, name.count > length + 1 else { return nil }
+        let prefix = String(name.prefix(length))
+        let remainder = name.dropFirst(length)
+        guard remainder.first == " ", let date = formatter(format).date(from: prefix) else { return nil }
+        let rest = remainder.dropFirst().trimmingCharacters(in: .whitespacesAndNewlines)
+        return rest.isEmpty ? nil : (rest, date)
+    }
+
+    /// Insert before the first sibling that starts later. Undated siblings sort last.
+    static func chronologicalIndex(for date: Date?, among siblings: [Date?]) -> Int {
+        guard let date else { return siblings.count }
+        return siblings.firstIndex { sibling in sibling.map { $0 > date } ?? true } ?? siblings.count
+    }
+
+    /// Sequential moves that stable-sort siblings by date, undated last.
+    /// Each `to` is valid both before and after removing the moved item because `to <= from`.
+    static func chronologicalMoves(_ dates: [Date?]) -> [(from: Int, to: Int)] {
+        let target = dates.indices.sorted { lhs, rhs in
+            switch (dates[lhs], dates[rhs]) {
+            case let (l?, r?): return l != r ? l < r : lhs < rhs
+            case (.some, .none): return true
+            case (.none, .some): return false
+            case (.none, .none): return lhs < rhs
+            }
+        }
+        var current = Array(dates.indices)
+        var moves: [(from: Int, to: Int)] = []
+        for (position, item) in target.enumerated() {
+            guard let from = current.firstIndex(of: item), from != position else { continue }
+            moves.append((from, position))
+            current.remove(at: from)
+            current.insert(item, at: position)
+        }
+        return moves
     }
 }

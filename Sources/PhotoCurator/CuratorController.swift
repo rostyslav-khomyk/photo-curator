@@ -2055,6 +2055,22 @@ final class CuratorController: ObservableObject {
         }
     }
 
+    /// One-time rename of `yyyy-MM` / `yyyy-MM-dd` containers to the dated-suffix scheme.
+    /// Retries on the next save if Photos refuses; never touches containers the app did not create.
+    private func migrateLegacyPhotosNamesIfNeeded() async {
+        let key = "curatorPhotosNamingV2Migrated"
+        guard !UserDefaults.standard.bool(forKey: key), let catalog else { return }
+        do {
+            let managed = Set(try await catalog.managedPhotoContainers().map(\.id))
+            if !managed.isEmpty {
+                try await PhotoKitAlbumAdapter.shared.migrateLegacyNames(managedIDs: managed)
+            }
+            UserDefaults.standard.set(true, forKey: key)
+        } catch {
+            CuratorTelemetry.shared.record(.failure, counts: ["code": (error as NSError).code])
+        }
+    }
+
     func publishToPhotos(moment: PhotoMoment, decisions: MomentReviewDecisions) async throws -> CuratedAlbumReceipt {
         guard !maintenancePaused else { throw PublicationFailure.conflictingOperation }
         let interval = CuratorPerformance.begin("Photos publication")
@@ -2073,7 +2089,14 @@ final class CuratorController: ObservableObject {
         let keyAssetID = cover?.id ?? assetIDs.first
 
         guard let publicationCoordinator else { throw PublicationFailure.catalogUnavailable }
+        await migrateLegacyPhotosNamesIfNeeded()
         let storyFolder = try await catalog?.storyContaining(momentID: moment.id)
+        let storyTitle = storyFolder.map { folder in
+            folder.sharesTitleInYear
+                ? PhotosAlbumNaming.disambiguatedStoryTitle(PhotosAlbumNaming.storyFolderTitle(folder.title),
+                                                            start: folder.start)
+                : folder.title
+        }
         let request = CuratedPublicationRequest(
             operationID: UUID(),
             momentID: moment.id,
@@ -2081,7 +2104,7 @@ final class CuratorController: ObservableObject {
             description: story,
             keyAssetID: keyAssetID,
             date: moment.start,
-            storyTitle: storyFolder?.title,
+            storyTitle: storyTitle,
             storyStart: storyFolder?.start,
             assetIDs: assetIDs
         )

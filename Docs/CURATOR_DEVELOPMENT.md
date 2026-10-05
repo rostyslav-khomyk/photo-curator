@@ -6,7 +6,7 @@ Diagnostics is status + Export Diagnostics only. Removed Rebuild curation,
 Test 12 recent photos, Historical metadata audit, and owner-album Story inject
 (preview / Apply / Keep-in-rebuilds). `rebuildStories` persists GPS Journeys and
 place outings only. Photos publication writes
-`Photo Curator / Year / yyyy-MM Story / Moment` (ungrouped → `Moments`). Catalog
+`Photo Curator / Year / Story / Moment · d MMM`, placed by date (ungrouped → `Moments`). Catalog
 schema v11 tracks managed `story` folders.
 
 ## Owner album Stories Apply-ready (historical 2026-09-27 evening)

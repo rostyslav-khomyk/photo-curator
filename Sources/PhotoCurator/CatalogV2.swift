@@ -718,16 +718,26 @@ actor CatalogV2Store {
     }
 
     /// Parent Story for Photos publication folders. Nil when the Moment is ungrouped.
-    func storyContaining(momentID: String) throws -> (title: String, start: Date)? {
+    /// Effective (owner-renamed) title. `sharesTitleInYear` is true when another Story
+    /// starting in the same local year has the same title, so its Photos folder needs the month.
+    func storyContaining(momentID: String) throws -> (title: String, start: Date, sharesTitleInYear: Bool)? {
         let statement = try prepare("""
-            SELECT s.title,s.start FROM stories s
-            JOIN story_moments sm ON sm.story_id=s.id
+            WITH effective AS (
+                SELECT s.id, COALESCE(e.title,s.title) AS title, s.start,
+                       strftime('%Y', s.start, 'unixepoch', 'localtime') AS year
+                FROM stories s LEFT JOIN story_edits e ON e.story_id=s.id
+            )
+            SELECT x.title, x.start,
+                   EXISTS(SELECT 1 FROM effective o WHERE o.id != x.id AND o.year = x.year
+                          AND LOWER(TRIM(o.title)) = LOWER(TRIM(x.title)))
+            FROM effective x JOIN story_moments sm ON sm.story_id=x.id
             WHERE sm.moment_id=? LIMIT 1
             """)
         defer { sqlite3_finalize(statement) }
         sqlite3_bind_text(statement, 1, momentID, -1, transient)
         guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
-        return (text(statement, 0), Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)))
+        return (text(statement, 0), Date(timeIntervalSince1970: sqlite3_column_double(statement, 1)),
+                sqlite3_column_int(statement, 2) != 0)
     }
 
     /// Moment → asset membership for gated album Story previews. Does not mutate Stories.
