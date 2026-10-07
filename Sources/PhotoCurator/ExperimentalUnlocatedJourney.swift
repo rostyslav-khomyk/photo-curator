@@ -447,9 +447,53 @@ enum ExperimentalUnlocatedSignalLoader {
         }
     }
 
+    private final class Cache: @unchecked Sendable {
+        let lock = NSLock()
+        var key: String?
+        var loaded = Date.distantPast
+        var overlay = Overlay()
+    }
+    private static let cache = Cache()
+    /// Photos' own background work touches the WAL constantly; pre-2010 names, filenames and
+    /// timezones rarely change, so a snapshot this recent is reused even when the key moved.
+    static let maximumOverlayAge: TimeInterval = 15 * 60
+
+    /// Photos rewrites its database and WAL on every change; size and modification date of both
+    /// identify a snapshot cheaply.
+    static func snapshotKey(_ source: URL, fileManager: FileManager = .default) -> String? {
+        let parts = [source.path, source.path + "-wal"].map { path -> String in
+            let attributes = try? fileManager.attributesOfItem(atPath: path)
+            let size = (attributes?[.size] as? NSNumber)?.int64Value ?? -1
+            let modified = (attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? -1
+            return "\(size)@\(modified)"
+        }
+        guard parts[0] != "-1@-1.0" else { return nil }
+        return "\(source.path)|" + parts.joined(separator: "|")
+    }
+
+    /// Story rebuilds run after every Moment change; re-reading Photos.sqlite each time dominated
+    /// refinement, so the overlay is reused until the Photos database changes.
     static func load(library: URL = PhotosInternalsProbe.defaultLibrary,
                      fileManager: FileManager = .default) -> Overlay {
         let source = library.appendingPathComponent("database/Photos.sqlite")
+        let key = snapshotKey(source, fileManager: fileManager)
+        cache.lock.lock()
+        let sameSource = cache.key?.hasPrefix(source.path + "|") == true
+        if let key, sameSource, cache.key == key || Date().timeIntervalSince(cache.loaded) < maximumOverlayAge {
+            defer { cache.lock.unlock() }
+            return cache.overlay
+        }
+        cache.lock.unlock()
+        let overlay = loadUncached(source: source, fileManager: fileManager)
+        cache.lock.lock()
+        cache.key = key
+        cache.loaded = Date()
+        cache.overlay = overlay
+        cache.lock.unlock()
+        return overlay
+    }
+
+    private static func loadUncached(source: URL, fileManager: FileManager) -> Overlay {
         do {
             let url = try PhotosInternalsProbe.readableDatabase(source, fileManager: fileManager)
             defer { if url != source {

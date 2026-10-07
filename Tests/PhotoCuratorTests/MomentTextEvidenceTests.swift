@@ -8,6 +8,15 @@ final class MomentTextEvidenceTests: XCTestCase {
                      latitude: nil, longitude: nil, favorite: false, width: 100, height: 100)
     }
 
+    func testOriginalDownloadOnlyForFailedOrLowConfidenceText() {
+        XCTAssertTrue(MomentTextEvidenceStore.needsOriginal(nil))
+        XCTAssertFalse(MomentTextEvidenceStore.needsOriginal([]))
+        XCTAssertFalse(MomentTextEvidenceStore.needsOriginal([PhotoTextLine(text: "Madurodam", confidence: 0.9)]))
+        XCTAssertTrue(MomentTextEvidenceStore.needsOriginal([
+            PhotoTextLine(text: "M4dur", confidence: 0.3), PhotoTextLine(text: "dam", confidence: 0.5)
+        ]))
+    }
+
     func testCacheSurvivesReopeningAndRejectsContentEdits() async throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }

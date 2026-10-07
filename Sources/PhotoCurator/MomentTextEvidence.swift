@@ -133,10 +133,22 @@ actor MomentTextEvidenceStore {
         return value
     }
 
+    static let maximumEdge = 2048
+    static let minimumMeanConfidence: Float = 0.5
+
+    /// Medium-size OCR that errored or found only low-confidence text is retried on the original.
+    /// No text at all is a normal result and must not trigger a full-size download.
+    static func needsOriginal(_ lines: [PhotoTextLine]?) -> Bool {
+        guard let lines else { return true }
+        guard !lines.isEmpty else { return false }
+        let mean = lines.reduce(Float(0)) { $0 + $1.confidence } / Float(lines.count)
+        return mean < minimumMeanConfidence
+    }
+
     func recognize(_ image: CGImage) async throws -> [PhotoTextLine] {
         try Task.checkCancellation()
         // Oversized decode is treated like an unavailable reader: empty OCR, keep going.
-        guard image.width <= 2048, image.height <= 2048 else {
+        guard image.width <= Self.maximumEdge, image.height <= Self.maximumEdge else {
             throw TextRecognitionFailure.unavailable
         }
         let operation = TextRecognitionOperation()

@@ -29,9 +29,22 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
         let (storyFolder, createdStory) = try await findOrCreateFolder(
             named: storyFolderTitle, in: yearFolder, date: request.storyStart ?? request.date)
 
-        let existingAlbum = findAlbum(named: albumTitle, in: storyFolder)
+        let previous = request.targetAlbumID.flatMap { managedAlbum(withID: $0, under: rootFolder) }
+        let existingAlbum = previous?.album ?? findAlbum(named: albumTitle, in: storyFolder)
+        let previousParent = previous?.parent ?? (existingAlbum == nil ? nil : storyFolder)
+        let moves = previousParent.map { $0.localIdentifier != storyFolder.localIdentifier } ?? false
+        let leavesEmptyStory = moves && previousParent.map {
+            PhotosAlbumNaming.yearStart($0.localizedTitle) == nil && children(of: $0).count == 1
+        } == true
         let storySnapshot = children(of: storyFolder)
-        let albumIndex = existingAlbum == nil ? insertionIndex(for: request.date, in: storyFolder) : 0
+        let albumIndex = existingAlbum == nil || moves ? insertionIndex(for: request.date, in: storyFolder) : 0
+        var memberIDs = Set<String>()
+        if let existingAlbum {
+            PHAsset.fetchAssets(in: existingAlbum, options: nil).enumerateObjects { asset, _, _ in
+                memberIDs.insert(asset.localIdentifier)
+            }
+        }
+        let wanted = Set(request.assetIDs)
 
         try await PHPhotoLibrary.shared().performChanges {
             let assets = PHAsset.fetchAssets(withLocalIdentifiers: request.assetIDs, options: nil)
@@ -41,6 +54,15 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
                 albumRequest = PHAssetCollectionChangeRequest(for: existing)
                     ?? PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: albumTitle)
                 createdAlbumID = existing.localIdentifier
+                if existing.localizedTitle != albumTitle { albumRequest.title = albumTitle }
+                let stale = memberIDs.subtracting(wanted)
+                if !stale.isEmpty {
+                    albumRequest.removeAssets(PHAsset.fetchAssets(withLocalIdentifiers: Array(stale), options: nil))
+                }
+                if moves, let previousParent {
+                    PHCollectionListChangeRequest(for: previousParent)?.removeChildCollections([existing] as NSArray)
+                    self.insert(existing, into: storyFolder, snapshot: storySnapshot, at: albumIndex)
+                }
             } else {
                 let createAlbumReq = PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: albumTitle)
                 let albumPlaceholder = createAlbumReq.placeholderForCreatedAssetCollection
@@ -49,7 +71,17 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
                 albumRequest = createAlbumReq
             }
 
-            albumRequest.addAssets(assets)
+            let missing = wanted.subtracting(memberIDs)
+            if existingAlbum == nil { albumRequest.addAssets(assets) }
+            else if !missing.isEmpty {
+                albumRequest.addAssets(PHAsset.fetchAssets(withLocalIdentifiers: Array(missing), options: nil))
+            }
+        }
+        if leavesEmptyStory, let previousParent {
+            // The album was the Story folder's only child; an empty managed folder is clutter.
+            try? await PHPhotoLibrary.shared().performChanges {
+                PHCollectionListChangeRequest.deleteCollectionLists([previousParent] as NSArray)
+            }
         }
 
         guard let finalAlbumID = createdAlbumID ?? existingAlbum?.localIdentifier, !finalAlbumID.isEmpty else {
@@ -77,8 +109,13 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
 
         guard let rootFolder = findRootFolder(),
               let yearFolder = findFolder(named: yearString, in: rootFolder),
-              let storyFolder = findFolder(named: storyFolderTitle, in: yearFolder),
-              let album = findAlbum(named: albumTitle, in: storyFolder) else { return .absent }
+              let storyFolder = findFolder(named: storyFolderTitle, in: yearFolder) else { return .absent }
+        let target = request.targetAlbumID.flatMap { managedAlbum(withID: $0, under: rootFolder) }
+        let updated = target.flatMap { target in
+            target.parent.localIdentifier == storyFolder.localIdentifier
+                && target.album.localizedTitle == albumTitle ? target.album : nil
+        }
+        guard let album = updated ?? findAlbum(named: albumTitle, in: storyFolder) else { return .absent }
 
         let assets = PHAsset.fetchAssets(in: album, options: nil)
         var memberIDs: [String] = []
@@ -246,15 +283,42 @@ struct PhotoKitAlbumAdapter: CuratedAlbumAdapter, Sendable {
         return PhotosAlbumNaming.chronologicalIndex(for: date, among: dates)
     }
 
-    /// Must run inside `performChanges`. Falls back to append when Photos refuses the ordered request.
-    private func insert(_ placeholder: PHObjectPlaceholder, into parent: PHCollectionList,
+    /// Must run inside `performChanges`. `child` is a placeholder or an existing collection.
+    /// Falls back to append when Photos refuses the ordered request.
+    private func insert(_ child: NSObject, into parent: PHCollectionList,
                         snapshot: PHFetchResult<PHCollection>, at index: Int) {
         if let ordered = PHCollectionListChangeRequest(for: parent, childCollections: snapshot) {
-            ordered.insertChildCollections([placeholder] as NSArray,
+            ordered.insertChildCollections([child] as NSArray,
                                            at: IndexSet(integer: min(index, snapshot.count)))
         } else if let request = PHCollectionListChangeRequest(for: parent) {
-            request.addChildCollections([placeholder] as NSArray)
+            request.addChildCollections([child] as NSArray)
         }
+    }
+
+    /// An album with this identifier under Photo Curator / Year (/ Story), with its folder.
+    private func managedAlbum(withID id: String, under root: PHCollectionList)
+        -> (album: PHAssetCollection, parent: PHCollectionList)? {
+        guard PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [id], options: nil).firstObject != nil
+        else { return nil }
+        var found: (PHAssetCollection, PHCollectionList)?
+        children(of: root).enumerateObjects { yearChild, _, stopYears in
+            guard let year = yearChild as? PHCollectionList else { return }
+            self.children(of: year).enumerateObjects { child, _, stopStories in
+                if let album = child as? PHAssetCollection, album.localIdentifier == id {
+                    found = (album, year)
+                } else if let story = child as? PHCollectionList {
+                    self.children(of: story).enumerateObjects { item, _, stop in
+                        if let album = item as? PHAssetCollection, album.localIdentifier == id {
+                            found = (album, story)
+                            stop.pointee = true
+                        }
+                    }
+                }
+                if found != nil { stopStories.pointee = true }
+            }
+            if found != nil { stopYears.pointee = true }
+        }
+        return found
     }
 
     // MARK: - Legacy naming migration

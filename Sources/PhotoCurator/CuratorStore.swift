@@ -503,6 +503,13 @@ final class CuratorStore {
         return sqlite3_changes(db) == 1
     }
 
+    func pendingAnalysisCount() throws -> Int {
+        let statement = try prepare("SELECT COUNT(*) FROM analysis_jobs WHERE state='pending'")
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else { throw failure() }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
     func analysisResult(asset: String, revision: String, analyzer: String) throws -> Data? {
         let statement = try prepare("SELECT result FROM analysis_jobs WHERE asset=? AND revision=? AND analyzer=? AND state='done'")
         defer { sqlite3_finalize(statement) }

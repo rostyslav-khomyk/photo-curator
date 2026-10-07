@@ -71,6 +71,14 @@ Panama must be one Journey; mid-route Home zigzags removed).
 - Adaptive evidence **defers** GPS-rich Vision/OCR while claimable thin work
   remains; soft-deferred thin retries must not stall the claim gate.
 - Journey stop geocode runs **before** the OCR interleave on the shared scheduler.
+- Photos albums update in place after the first save, using the stored album ID:
+  rename, move to the current Story folder, and exact membership. Automatic saving
+  re-syncs changed published Moments. This is unit-tested with a fake adapter;
+  the live PhotoKit path is unverified until the first real save.
+- iCloud-only photos (optimized storage) download a ~1024 px derivative for
+  Vision/OCR. OCR escalates to the original only on failure or low confidence.
+  Downloads pause below 10 GB of free disk. Before this, every such photo was
+  deferred hourly forever, which showed up as `deferred` ≫ `saved` in telemetry.
 - Photos full-access clicker must target process name `PhotoCurator` (ad-hoc
   resign re-prompts; a missed click stalls prep while telemetry can still look ok).
 - The Moments grid and Story list stay scrollable during a library overview.

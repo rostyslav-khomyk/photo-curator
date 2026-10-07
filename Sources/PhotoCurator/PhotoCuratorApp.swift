@@ -65,7 +65,7 @@ private struct MenuContent: View {
     @ObservedObject var curator: CuratorController
 
     var body: some View {
-        Text(model.activity)
+        if model.isWorking { Text(model.activity) }
         Text(curator.activity)
         Toggle("Curate While Idle", isOn: Binding(get: { curator.enabled }, set: { curator.setEnabled($0) }))
         if let progress = model.transferProgress, progress.isTransferring, model.isWorking {

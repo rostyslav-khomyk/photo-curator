@@ -11,10 +11,12 @@ struct CuratedPublicationRequest: Codable, Equatable, Sendable {
     var storyTitle: String? = nil
     var storyStart: Date? = nil
     let assetIDs: [String]
+    /// Album saved by the previous successful publication; updated in place instead of found by title.
+    var targetAlbumID: String? = nil
 
     init(operationID: UUID, momentID: String, title: String, description: String? = nil,
          keyAssetID: String? = nil, date: Date? = nil, storyTitle: String? = nil,
-         storyStart: Date? = nil, assetIDs: [String]) {
+         storyStart: Date? = nil, assetIDs: [String], targetAlbumID: String? = nil) {
         self.operationID = operationID
         self.momentID = momentID
         self.title = title
@@ -24,6 +26,21 @@ struct CuratedPublicationRequest: Codable, Equatable, Sendable {
         self.storyTitle = storyTitle
         self.storyStart = storyStart
         self.assetIDs = assetIDs
+        self.targetAlbumID = targetAlbumID
+    }
+
+    /// Same Photos result; operation identity and update target are bookkeeping.
+    func hasSameContent(as other: CuratedPublicationRequest) -> Bool {
+        momentID == other.momentID && title == other.title && description == other.description
+            && keyAssetID == other.keyAssetID && date == other.date
+            && storyTitle == other.storyTitle && storyStart == other.storyStart
+            && Set(assetIDs) == Set(other.assetIDs)
+    }
+
+    func updating(albumID: String?) -> CuratedPublicationRequest {
+        var copy = self
+        copy.targetAlbumID = albumID
+        return copy
     }
 
     func validate() throws {

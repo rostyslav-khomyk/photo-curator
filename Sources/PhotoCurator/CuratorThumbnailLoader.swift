@@ -101,14 +101,35 @@ final class PhotoKitThumbnailProvider: CuratorThumbnailProvider {
     }
 
     private static let gridManager = PHCachingImageManager()
+    /// Photos owns its download cache and macOS purges it on demand, so the floor uses
+    /// important-usage capacity (which counts purgeable space) rather than raw free space.
+    static let minimumFreeBytesForDownload: Int64 = 10 * 1024 * 1024 * 1024
     private let manager: PHImageManager
     private let allowsNetworkAccess: Bool
+    private let downloadsDerivative: Bool
     private var reviewRequests: [Int32: ReviewRequest] = [:]
     private var nextReviewRequestID: Int32 = -1000
 
     init(allowsNetworkAccess: Bool = false) {
         self.allowsNetworkAccess = allowsNetworkAccess
+        downloadsDerivative = false
         manager = allowsNetworkAccess ? PHImageManager() : Self.gridManager
+    }
+
+    /// Downloads a size-matched derivative from iCloud instead of the full original.
+    private init(derivative: Void) {
+        allowsNetworkAccess = true
+        downloadsDerivative = true
+        manager = PHImageManager()
+    }
+
+    static func iCloudDerivative() -> PhotoKitThumbnailProvider { PhotoKitThumbnailProvider(derivative: ()) }
+
+    static func hasDownloadCapacity() -> Bool {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let values = try? home.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+        guard let available = values?.volumeAvailableCapacityForImportantUsage else { return true }
+        return available >= minimumFreeBytesForDownload
     }
 
     static func setCaching(_ enabled: Bool, assetIDs: [String], edge: Int) {
@@ -158,18 +179,20 @@ final class PhotoKitThumbnailProvider: CuratorThumbnailProvider {
         options.deliveryMode = .highQualityFormat
         options.resizeMode = .exact
         options.version = .current
-        if allowsNetworkAccess {
+        if allowsNetworkAccess && !downloadsDerivative {
             return requestReviewImage(for: asset, assetID: assetID, edge: edge, completion: completion)
         }
         return manager.requestImage(for: asset, targetSize: CGSize(width: edge, height: edge),
                                     contentMode: .aspectFit, options: options) { image, info in
+            let inCloud = (info?[PHImageResultIsInCloudKey] as? Bool) == true
+                || (info?[PHImageErrorKey] as? NSError)?.code == PHPhotosError.networkAccessRequired.rawValue
             let event: ThumbnailEvent
             if (info?[PHImageCancelledKey] as? Bool) == true { event = .failure(.cancelled) }
+            else if inCloud, info?[PHImageErrorKey] != nil || image == nil { event = .failure(.cloudOnly) }
             else if info?[PHImageErrorKey] != nil { event = .failure(.unavailable) }
             else if let image, let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) {
                 event = .image(cgImage, degraded: (info?[PHImageResultIsDegradedKey] as? Bool) == true)
-            } else if (info?[PHImageResultIsInCloudKey] as? Bool) == true { event = .failure(.cloudOnly) }
-            else { event = .failure(.unavailable) }
+            } else { event = .failure(.unavailable) }
             Task { @MainActor in completion(event) }
         }
     }

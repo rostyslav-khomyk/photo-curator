@@ -389,21 +389,23 @@ actor CuratorWorker {
         return support
     }
 
-    func prepareText(_ photo: IndexedPhoto, image: CGImage) async throws {
+    func prepareText(_ photo: IndexedPhoto, image: CGImage,
+                     original: (@MainActor @Sendable () async throws -> CGImage)? = nil) async throws {
         let store = textStore
         if await store.cached(photo) == nil {
-            let lines: [PhotoTextLine]
-            do {
-                lines = try await store.recognize(image)
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch TextRecognitionFailure.timedOut, TextRecognitionFailure.unavailable {
-                // Cache empty OCR so pathological frames do not re-pause the overnight queue.
-                lines = []
-            } catch {
-                lines = []
+            var lines = try await recognizeText(image, store: store)
+            if MomentTextEvidenceStore.needsOriginal(lines), let original {
+                do {
+                    let full = try await original()
+                    if let better = try await recognizeText(full, store: store) { lines = better }
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    // A failed original download keeps the medium-size result.
+                }
             }
-            _ = try await store.save(lines, for: photo)
+            // Cache empty OCR so pathological frames do not re-pause the overnight queue.
+            _ = try await store.save(lines ?? [], for: photo)
         }
         do {
             try await context.capture(photo, image: image)
@@ -412,6 +414,28 @@ actor CuratorWorker {
         } catch {
             // Label capture is optional evidence; failures must not pause Moment preparation.
         }
+    }
+
+    /// `nil` means recognition failed, as opposed to an image without text.
+    private func recognizeText(_ image: CGImage, store: MomentTextEvidenceStore) async throws -> [PhotoTextLine]? {
+        do {
+            return try await store.recognize(image)
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            return nil
+        }
+    }
+
+    /// Position within the current refinement pass; a continuity change restarts the pass.
+    func momentRefinementProgress() -> (done: Int, total: Int)? {
+        guard let total = captionGroups?.count, total > 0 else { return nil }
+        return (max(0, total - captionRemaining), total)
+    }
+
+    func textRecognitionProgress() -> (done: Int, total: Int)? {
+        guard textScanStarted, !textCandidates.isEmpty else { return nil }
+        return (min(textCursor, textCandidates.count), textCandidates.count)
     }
 
     func prepareMoments(range: DateInterval?, protection: MomentGroupingProtection,
@@ -798,6 +822,8 @@ actor CuratorWorker {
         try database().claimAnalysis(limit: limit, range: range)
     }
 
+    func pendingAnalysisCount() throws -> Int { try database().pendingAnalysisCount() }
+
     @discardableResult
     func refreshAdaptiveAnalysisPriorities() throws -> Int {
         try database().refreshAdaptiveAnalysisPriorities()
@@ -906,14 +932,24 @@ final class CuratorController: ObservableObject {
     private var viewportPrioritySignatures = Set<String>()
     private(set) var analyzedThisSession = 0
     private(set) var deferredThisSession = 0
+    private var deferReasonsThisSession: [String: Int] = [:]
     private var analysisLoaders: [CuratorThumbnailLoader] = []
     private let analyzer = CuratorVisionAnalyzer()
 
-    private func analysisLoaderLane(_ index: Int) -> CuratorThumbnailLoader {
+    private var publicationSyncCursor = 0
+    private var lastRefinementOverview = Date.distantPast
+    private static let refinementOverviewInterval: TimeInterval = 60
+    private var cloudLoaders: [CuratorThumbnailLoader] = []
+    private var originalLoaders: [CuratorThumbnailLoader] = []
+
+    private func analysisLoaderLane(_ index: Int) -> AnalysisImageSource {
         while analysisLoaders.count <= index {
             analysisLoaders.append(CuratorThumbnailLoader(provider: PhotoKitThumbnailProvider()))
+            cloudLoaders.append(CuratorThumbnailLoader(provider: PhotoKitThumbnailProvider.iCloudDerivative()))
+            originalLoaders.append(CuratorThumbnailLoader(provider: PhotoKitThumbnailProvider(allowsNetworkAccess: true)))
         }
-        return analysisLoaders[index]
+        return AnalysisImageSource(local: analysisLoaders[index], cloud: cloudLoaders[index],
+                                   original: originalLoaders[index])
     }
     private var contextStep = 0
     private var lastWaitLog = Date.distantPast
@@ -1817,11 +1853,18 @@ final class CuratorController: ObservableObject {
             || ns.localizedDescription.localizedCaseInsensitiveContains("CRImageReader")
     }
 
+    /// A full overview rebuilds every Story; refinement changes one Moment per step, so rebuilds
+    /// are coalesced. The caught-up path always runs a final full refresh.
+    private func refreshOverviewAfterRefinement() async {
+        guard Date().timeIntervalSince(lastRefinementOverview) >= Self.refinementOverviewInterval else { return }
+        lastRefinementOverview = Date()
+        await refreshOverview(projectCompleteCatalog: true)
+    }
+
     private func runAnalysisStep(allowAutomaticPublication: Bool) {
         let token = revision
-        let analysisActivity = "Analyzing photos and refining Moments…"
-        if activity != analysisActivity {
-            activity = analysisActivity
+        if !AnalysisPhaseText.isPhase(activity) {
+            activity = AnalysisPhaseText.starting
         }
         let lanes = AnalysisLaneBudget.lanes()
         let loaders = (0..<lanes).map { analysisLoaderLane($0) }
@@ -1846,12 +1889,18 @@ final class CuratorController: ObservableObject {
                     let step = try await worker.prepareMoments(range: nil, protection: MomentGroupingProtection.load(.standard))
                     try Task.checkCancellation()
                     guard token == revision else { return }
+                    let textProgress = await worker.textRecognitionProgress()
+                    if try await worker.pendingAnalysisCount() == 0,
+                       textProgress.map({ $0.done >= $0.total }) ?? true,
+                       let progress = await worker.momentRefinementProgress() {
+                        activity = AnalysisPhaseText.moments(progress)
+                    }
                     if case .presentationChanged(let id) = step {
                         await refreshVisibleMoment(id)
                         return
                     }
                     if step == .changed {
-                        await refreshOverview(projectCompleteCatalog: true)
+                        await refreshOverviewAfterRefinement()
                         return
                     }
                 }
@@ -1894,18 +1943,27 @@ final class CuratorController: ObservableObject {
                 if jobs.isEmpty {
                     guard token == revision else { return }
                     if let photo = try await worker.nextTextCandidate(range: nil) {
-                        let image = try await loaders[0].load(assetID: photo.id, timeout: 8)
+                        if let progress = await worker.textRecognitionProgress() {
+                            activity = AnalysisPhaseText.text(progress)
+                        }
+                        let source = loaders[0]
+                        let image = try await source.load(assetID: photo.id).image
                         try Task.checkCancellation()
                         guard token == revision else { return }
-                        try await worker.prepareText(photo, image: image)
+                        try await worker.prepareText(photo, image: image) {
+                            try await source.originalForText(assetID: photo.id)
+                        }
                         return
                     }
                     let step = try await worker.prepareMoments(range: nil, protection: MomentGroupingProtection.load(.standard))
                     try Task.checkCancellation()
                     guard token == revision else { return }
+                    if let progress = await worker.momentRefinementProgress() {
+                        activity = AnalysisPhaseText.moments(progress)
+                    }
                     if step != .caughtUp {
                         if case .presentationChanged(let id) = step { await refreshVisibleMoment(id) }
-                        else if step == .changed { await refreshOverview(projectCompleteCatalog: true) }
+                        else if step == .changed { await refreshOverviewAfterRefinement() }
                         return
                     }
                     if allowAutomaticPublication && autoPublishEnabled {
@@ -1963,31 +2021,36 @@ final class CuratorController: ObservableObject {
                     return
                 }
                 claimedJobs = jobs
+                activity = AnalysisPhaseText.visual(remaining: try await worker.pendingAnalysisCount() + jobs.count)
                 let analysisWorker = worker
                 await withTaskGroup(of: AnalysisLaneCount.self) { group in
                     for (index, job) in jobs.enumerated() {
-                        let loader = loaders[index]
+                        let source = loaders[index]
                         let laneAnalyzer = analyzers[index]
                         group.addTask { [self] in
                             await AnalysisLaneRunner.run(
-                                job: job, worker: analysisWorker, loader: loader, analyzer: laneAnalyzer,
+                                job: job, worker: analysisWorker, source: source, analyzer: laneAnalyzer,
                                 stillCurrent: { @MainActor in token == self.revision })
                         }
                     }
                     for await count in group {
                         analyzedThisSession += count.saved
                         deferredThisSession += count.deferred
+                        if let reason = count.reason { deferReasonsThisSession[reason, default: 0] += 1 }
                     }
                 }
                 if contextStep % 5 == 0, let photo = try await worker.nextTextCandidate(range: nil) {
-                    let image = try await loaders[0].load(assetID: photo.id, timeout: 8)
+                    let source = loaders[0]
+                    let image = try await source.load(assetID: photo.id).image
                     try Task.checkCancellation()
                     guard token == revision else { return }
-                    try await worker.prepareText(photo, image: image)
+                    try await worker.prepareText(photo, image: image) {
+                        try await source.originalForText(assetID: photo.id)
+                    }
                 }
                 CuratorTelemetry.shared.record(.analysis, counts: [
                     "saved": analyzedThisSession, "deferred": deferredThisSession, "lanes": jobs.count
-                ])
+                ].merging(deferReasonsThisSession) { current, _ in current })
             } catch {
                 if claimedJobs.isEmpty && !Task.isCancelled {
                     if let thumbnailFailure = error as? ThumbnailFailure,
@@ -2024,8 +2087,12 @@ final class CuratorController: ObservableObject {
                 userAuthored: decisions.titles[$0.id] != nil || decisions.descriptions[$0.id] != nil) &&
             !publishingMomentIDs.contains($0.id) &&
             !failedAutoPublishMomentIDs.contains($0.id)
-        }) else { return false }
+        }) else { return await syncNextChangedPublication(decisions: decisions) }
+        return await autoPublish(candidate, decisions: decisions, verb: "Saving")
+    }
 
+    @discardableResult
+    private func autoPublish(_ candidate: PhotoMoment, decisions: MomentReviewDecisions, verb: String) async -> Bool {
         isPublishingInBackground = true
         publishingMomentIDs.insert(candidate.id)
         defer {
@@ -2037,7 +2104,7 @@ final class CuratorController: ObservableObject {
         let narrative = MomentPresentation.narrative(candidate, customTitle: decisions.titles[candidate.id],
             customDescription: decisions.descriptions[candidate.id], place: place)
         let title = narrative.headline
-        activity = "Saving album in Photos for \(title)…"
+        activity = "\(verb) album in Photos for \(title)…"
         do {
             let receipt = try await publishToPhotos(moment: candidate, decisions: decisions)
             activity = "Saved album to Photos: \(title) (\(receipt.assetIDs.count) photos)"
@@ -2075,6 +2142,22 @@ final class CuratorController: ObservableObject {
         guard !maintenancePaused else { throw PublicationFailure.conflictingOperation }
         let interval = CuratorPerformance.begin("Photos publication")
         defer { CuratorPerformance.end("Photos publication", interval) }
+        guard let publicationCoordinator else { throw PublicationFailure.catalogUnavailable }
+        await migrateLegacyPhotosNamesIfNeeded()
+        let request = try await publicationRequest(for: moment, decisions: decisions)
+        let receipt = try await publicationCoordinator.publish(request)
+
+        let publishedDate = Date()
+        await reloadMomentSummaries()
+        if let idx = moments.firstIndex(where: { $0.id == moment.id }) {
+            moments[idx].publishedAlbumID = receipt.albumID
+            moments[idx].publishedDate = publishedDate
+        }
+        return receipt
+    }
+
+    private func publicationRequest(for moment: PhotoMoment,
+                                    decisions: MomentReviewDecisions) async throws -> CuratedPublicationRequest {
         let place = await CuratorGeocodingService.shared.place(for: moment)
         let narrative = MomentPresentation.narrative(moment, customTitle: decisions.titles[moment.id],
             customDescription: decisions.descriptions[moment.id], place: place)
@@ -2088,8 +2171,6 @@ final class CuratorController: ObservableObject {
         let cover = MomentDisplayEligibility.cover(moment, decisions: decisions.values, selected: assetIDs)
         let keyAssetID = cover?.id ?? assetIDs.first
 
-        guard let publicationCoordinator else { throw PublicationFailure.catalogUnavailable }
-        await migrateLegacyPhotosNamesIfNeeded()
         let storyFolder = try await catalog?.storyContaining(momentID: moment.id)
         let storyTitle = storyFolder.map { folder in
             folder.sharesTitleInYear
@@ -2097,7 +2178,7 @@ final class CuratorController: ObservableObject {
                                                             start: folder.start)
                 : folder.title
         }
-        let request = CuratedPublicationRequest(
+        return CuratedPublicationRequest(
             operationID: UUID(),
             momentID: moment.id,
             title: title,
@@ -2108,22 +2189,98 @@ final class CuratorController: ObservableObject {
             storyStart: storyFolder?.start,
             assetIDs: assetIDs
         )
+    }
 
-        let receipt = try await publicationCoordinator.publish(request)
-
-        let publishedDate = Date()
-        await reloadMomentSummaries()
-        if let idx = moments.firstIndex(where: { $0.id == moment.id }) {
-            moments[idx].publishedAlbumID = receipt.albumID
-            moments[idx].publishedDate = publishedDate
+    /// Re-saves one already-published Moment whose title, Story folder or Highlights changed.
+    /// Checks a bounded slice per pass so a large library never stalls the scheduler.
+    private func syncNextChangedPublication(decisions: MomentReviewDecisions) async -> Bool {
+        guard let catalog else { return false }
+        let published = moments.filter { $0.publishedAlbumID != nil && !publishingMomentIDs.contains($0.id)
+            && !failedAutoPublishMomentIDs.contains($0.id) }
+        guard !published.isEmpty else { return false }
+        let start = publicationSyncCursor % published.count
+        for offset in 0..<min(25, published.count) {
+            let moment = published[(start + offset) % published.count]
+            publicationSyncCursor = start + offset + 1
+            guard let saved = try? await catalog.publishedRequest(momentID: moment.id),
+                  let current = try? await publicationRequest(for: moment, decisions: decisions),
+                  !current.hasSameContent(as: saved) else { continue }
+            await autoPublish(moment, decisions: decisions, verb: "Updating")
+            return true
         }
-        return receipt
+        return false
+    }
+}
+
+/// Status line for the analysis loop: names the phase and its position instead of one generic message.
+enum AnalysisPhaseText {
+    static let starting = "Analyzing photos and refining Moments…"
+    private static let prefixes = [starting, "Analyzing photos:", "Reading text in photos:", "Refining Moments:"]
+
+    static func isPhase(_ text: String) -> Bool { prefixes.contains { text.hasPrefix($0) } }
+
+    static func visual(remaining: Int) -> String {
+        "Analyzing photos: \(remaining.formatted()) left…"
+    }
+
+    static func text(_ progress: (done: Int, total: Int)) -> String {
+        "Reading text in photos: \(progress.done.formatted()) of \(progress.total.formatted())…"
+    }
+
+    /// A continuity merge restarts the pass, so the count can go back down.
+    static func moments(_ progress: (done: Int, total: Int)) -> String {
+        "Refining Moments: \(progress.done.formatted()) of \(progress.total.formatted())…"
     }
 }
 
 private struct AnalysisLaneCount: Sendable {
     var saved = 0
     var deferred = 0
+    /// Telemetry key: why the job was deferred (`deferCloudOnly`) or how it was loaded (`iCloudMedium`).
+    var reason: String?
+
+    static func deferred(_ reason: String) -> AnalysisLaneCount {
+        AnalysisLaneCount(deferred: 1, reason: reason)
+    }
+
+    static func reason(for error: Error) -> String {
+        if let failure = error as? ThumbnailFailure {
+            switch failure {
+            case .busy: return "deferBusy"
+            case .cancelled: return "deferCancelled"
+            case .timedOut: return "deferTimedOut"
+            case .cloudOnly: return "deferCloudOnly"
+            case .missing: return "deferMissing"
+            case .permissionDenied: return "deferPermission"
+            case .unavailable: return "deferUnavailable"
+            }
+        }
+        return "deferError"
+    }
+}
+
+/// Local image first; iCloud-only photos download a ~1024 px derivative, and OCR may escalate to
+/// the original. Images live only in memory; Photos owns and evicts its download cache.
+@MainActor
+struct AnalysisImageSource {
+    static let mediumTimeout: TimeInterval = 60
+    let local: CuratorThumbnailLoader
+    let cloud: CuratorThumbnailLoader
+    let original: CuratorThumbnailLoader
+
+    func load(assetID: String) async throws -> (image: CGImage, downloaded: Bool) {
+        do {
+            return (try await local.load(assetID: assetID, timeout: 8), false)
+        } catch ThumbnailFailure.cloudOnly {
+            guard PhotoKitThumbnailProvider.hasDownloadCapacity() else { throw ThumbnailFailure.cloudOnly }
+            return (try await cloud.load(assetID: assetID, timeout: Self.mediumTimeout), true)
+        }
+    }
+
+    func originalForText(assetID: String) async throws -> CGImage {
+        guard PhotoKitThumbnailProvider.hasDownloadCapacity() else { throw ThumbnailFailure.cloudOnly }
+        return try await original.load(assetID: assetID, timeout: 120, edge: MomentTextEvidenceStore.maximumEdge)
+    }
 }
 
 /// Off-main Vision work for one claimed job. Thumbnail load hops to MainActor; SQLite stays on the worker.
@@ -2131,14 +2288,15 @@ private enum AnalysisLaneRunner {
     static func run(
         job: AnalysisJob,
         worker: CuratorWorker,
-        loader: CuratorThumbnailLoader,
+        source: AnalysisImageSource,
         analyzer: CuratorVisionAnalyzer,
         stillCurrent: @MainActor @Sendable () -> Bool
     ) async -> AnalysisLaneCount {
         do {
             try Task.checkCancellation()
             guard try await worker.currentAnalysisPhoto(job) != nil else { return AnalysisLaneCount() }
-            let image = try await loader.load(assetID: job.asset, timeout: 8)
+            let loaded = try await source.load(assetID: job.asset)
+            let image = loaded.image
             let result = try await analyzer.analyze(image)
             try Task.checkCancellation()
             guard await stillCurrent() else {
@@ -2146,7 +2304,7 @@ private enum AnalysisLaneRunner {
                 return AnalysisLaneCount()
             }
             guard let photo = try await worker.currentAnalysisPhoto(job) else { return AnalysisLaneCount() }
-            try await worker.prepareText(photo, image: image)
+            try await worker.prepareText(photo, image: image) { try await source.originalForText(assetID: photo.id) }
             try Task.checkCancellation()
             guard await stillCurrent() else {
                 try await worker.release(job)
@@ -2155,28 +2313,29 @@ private enum AnalysisLaneRunner {
             guard try await worker.currentAnalysisPhoto(job) != nil else { return AnalysisLaneCount() }
             if case .failed = result.aesthetics {
                 try await worker.retryLater(job)
-                return AnalysisLaneCount(deferred: 1)
+                return .deferred("deferVisionAesthetics")
             }
             if case .failed = result.faces {
                 try await worker.retryLater(job)
-                return AnalysisLaneCount(deferred: 1)
+                return .deferred("deferVisionFaces")
             }
             if case .failed = result.featurePrint {
                 try await worker.retryLater(job)
-                return AnalysisLaneCount(deferred: 1)
+                return .deferred("deferVisionPrint")
             }
             try await worker.finish(job, result: result)
-            return AnalysisLaneCount(saved: 1)
+            return AnalysisLaneCount(saved: 1, reason: loaded.downloaded ? "iCloudMedium" : nil)
         } catch {
+            let reason = AnalysisLaneCount.reason(for: error)
             do {
                 if Task.isCancelled {
                     try await worker.release(job)
                     return AnalysisLaneCount()
                 }
                 try await worker.retryLater(job)
-                return AnalysisLaneCount(deferred: 1)
+                return .deferred(reason)
             } catch {
-                return AnalysisLaneCount(deferred: 1)
+                return .deferred(reason)
             }
         }
     }

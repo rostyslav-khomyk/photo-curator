@@ -1124,20 +1124,23 @@ actor CatalogV2Store {
                             now: Date = Date()) throws -> PublicationSagaRecord {
         try request.validate()
         let existing = try publicationRecord(momentID: request.momentID)
+        var request = request
         if let existing {
-            guard existing.request.title == request.title,
-                  existing.request.description == request.description,
-                  existing.request.keyAssetID == request.keyAssetID,
-                  existing.request.date == request.date,
-                  existing.request.assetIDs == request.assetIDs else {
-                throw PublicationFailure.conflictingOperation
-            }
-            return existing
+            if existing.request.hasSameContent(as: request) { return existing }
+            // An in-flight save keeps its durable intent; a finished one is updated in place.
+            guard existing.phase == .succeeded else { throw PublicationFailure.conflictingOperation }
+            request = request.updating(albumID: existing.receipt?.albumID ?? existing.request.targetAlbumID)
         }
         let record = PublicationSagaRecord(request: request, phase: .requested, receipt: nil,
             verificationAttempts: 0, nextVerificationAt: nil, lastError: nil, updatedAt: now)
         try writePublicationRecord(record)
         return record
+    }
+
+    /// The request behind a Moment's finished save, or `nil` while none has succeeded.
+    func publishedRequest(momentID: String) throws -> CuratedPublicationRequest? {
+        guard let record = try publicationRecord(momentID: momentID), record.phase == .succeeded else { return nil }
+        return record.request
     }
 
     func pendingPublications() throws -> [PublicationSagaRecord] {
@@ -1226,6 +1229,14 @@ actor CatalogV2Store {
     func publicationCount() throws -> Int { try scalar("SELECT COUNT(*) FROM publications") }
 
     private func recordManagedContainers(_ receipt: CuratedAlbumReceipt) throws {
+        if let parent = receipt.storyFolderID ?? receipt.yearFolderID {
+            // An updated album may have moved to another Story folder.
+            let move = try prepare("UPDATE managed_photo_containers SET parent_id=? WHERE id=? AND kind='album'")
+            defer { sqlite3_finalize(move) }
+            sqlite3_bind_text(move, 1, parent, -1, transient)
+            sqlite3_bind_text(move, 2, receipt.albumID, -1, transient)
+            guard sqlite3_step(move) == SQLITE_DONE else { throw failure() }
+        }
         let created = Set(receipt.createdContainerIDs)
         guard !created.isEmpty else { return }
         let insert = try prepare("INSERT OR IGNORE INTO managed_photo_containers(id,kind,parent_id) VALUES(?,?,?)")

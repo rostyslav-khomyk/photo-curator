@@ -17,9 +17,15 @@ private actor FakeAlbums: CuratedAlbumAdapter {
         self.recoverWithoutOwnership = recoverWithoutOwnership
     }
 
+    var requests: [CuratedPublicationRequest] = []
+
     func publish(_ request: CuratedPublicationRequest) async throws -> CuratedAlbumReceipt {
         calls += 1
-        let value = receipt ?? CuratedAlbumReceipt(albumID: "managed", assetIDs: request.assetIDs)
+        requests.append(request)
+        let value = receipt.map { CuratedAlbumReceipt(albumID: $0.albumID, assetIDs: request.assetIDs,
+            rootFolderID: $0.rootFolderID, yearFolderID: $0.yearFolderID, storyFolderID: $0.storyFolderID,
+            createdContainerIDs: $0.createdContainerIDs) }
+            ?? CuratedAlbumReceipt(albumID: "managed", assetIDs: request.assetIDs)
         receipt = value
         if failAfterEffect { throw PublicationFailure.verificationPending }
         return value
@@ -40,6 +46,7 @@ private actor FakeAlbums: CuratedAlbumAdapter {
     }
 
     func callCount() -> Int { calls }
+    func recordedRequests() -> [CuratedPublicationRequest] { requests }
 }
 
 @MainActor
@@ -200,6 +207,47 @@ final class CuratedPublicationTests: XCTestCase {
         catch { XCTAssertEqual(error as? PublicationFailure, .conflictingOperation) }
         let calls = await albums.callCount()
         XCTAssertEqual(calls, 0)
+    }
+
+    func testChangedMomentAfterSuccessUpdatesTheSavedAlbumInPlace() async throws {
+        let fixture = try await makeFixture()
+        let albums = FakeAlbums()
+        await albums.configure(receipt: CuratedAlbumReceipt(albumID: "album", assetIDs: ["a", "b"],
+            rootFolderID: "root", yearFolderID: "year", storyFolderID: "story",
+            createdContainerIDs: ["root", "year", "story", "album"]))
+        _ = try await coordinator(fixture.store, albums).publish(request())
+
+        let changed = CuratedPublicationRequest(operationID: UUID(), momentID: "stable-test-moment",
+            title: "Renamed trip", storyTitle: "Summer Journey", assetIDs: ["a"])
+        await albums.configure(receipt: CuratedAlbumReceipt(albumID: "album", assetIDs: ["a"],
+            rootFolderID: "root", yearFolderID: "year", storyFolderID: "story-2",
+            createdContainerIDs: ["story-2"]))
+        let receipt = try await coordinator(fixture.store, albums).publish(changed)
+
+        let requests = await albums.recordedRequests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertNil(requests[0].targetAlbumID)
+        XCTAssertEqual(requests[1].targetAlbumID, "album")
+        XCTAssertEqual(receipt.albumID, "album")
+        let saved = try await fixture.store.publishedRequest(momentID: "stable-test-moment")
+        XCTAssertEqual(saved?.title, "Renamed trip")
+        XCTAssertEqual(saved?.assetIDs, ["a"])
+        let containers = try await fixture.store.managedPhotoContainers()
+        XCTAssertTrue(containers.contains(ManagedPhotoContainer(id: "album", kind: .album, parentID: "story-2")))
+
+        _ = try await coordinator(fixture.store, albums).publish(changed.updating(albumID: nil))
+        let callsAfterNoOp = await albums.callCount()
+        XCTAssertEqual(callsAfterNoOp, 2, "An unchanged Moment must not touch Photos again")
+    }
+
+    func testSameContentIgnoresOperationAndAssetOrder() {
+        let first = CuratedPublicationRequest(operationID: UUID(), momentID: "m", title: "Trip", assetIDs: ["a", "b"])
+        let reordered = CuratedPublicationRequest(operationID: UUID(), momentID: "m", title: "Trip",
+            assetIDs: ["b", "a"], targetAlbumID: "album")
+        let moved = CuratedPublicationRequest(operationID: UUID(), momentID: "m", title: "Trip",
+            storyTitle: "Other Journey", assetIDs: ["a", "b"])
+        XCTAssertTrue(first.hasSameContent(as: reordered))
+        XCTAssertFalse(first.hasSameContent(as: moved))
     }
 
     func testRequestValidationAndAutoPublishEligibility() throws {

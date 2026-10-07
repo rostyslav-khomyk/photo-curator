@@ -131,6 +131,21 @@ OCR timeouts and framework reader failures (`CRImageReaderError`, oversized
 frames) cache empty text evidence and continue; they must not pause Moment
 preparation overnight.
 
+Analysis pixels come from the local library first. Optimized-storage Macs keep
+only 32–64 px previews of iCloud-only photos, and PhotoKit returns
+`networkAccessRequired` (3164) without network access. `AnalysisImageSource`
+then downloads a size-matched ~1024 px derivative (60 s timeout) for Vision and
+OCR. When medium OCR fails or its mean line confidence is below 0.5, OCR retries
+once on the original, downsampled to 2048 px. Empty text never escalates.
+Pixels stay in memory and only results persist: the Vision row, plus OCR in the
+2 GB-capped derived cache. Photos owns its download cache, which macOS treats as
+purgeable. Measured cost is about 2–4 MB of raw free space per photo, and about
+1 in 60 photos needs an OCR original. Downloads stop below 10 GB of
+important-usage capacity, and those jobs defer as `cloudOnly`. A 512 px request
+returns 384 px images and `fastFormat` returns the local preview of under
+128 px; both are too small for faces and OCR.
+Telemetry reports `iCloudMedium` loads and `defer*` reasons per session.
+
 ## Journey derivation and enrichment
 
 ```mermaid
@@ -436,7 +451,24 @@ albums are `Title · 16 Jul` — no year below the year folder. Order comes from
 inserting each folder and album by its earliest capture date, not from name
 prefixes. Moments without a parent Story use a `Moments` folder. The first save
 after upgrading renames legacy `yyyy-MM` / `yyyy-MM-dd` containers the app
-created and re-sorts its managed folders. Publication
+created and re-sorts its managed folders.
+
+Re-saving updates the album in place. Once a save succeeds, the next request
+with different content (title, description, date, Story folder or selected
+photos) becomes a new saga carrying `targetAlbumID`. A save still in flight
+keeps rejecting changed content. The adapter finds that album under the managed
+tree and makes these changes:
+- renames it;
+- moves it to the current Story folder at its chronological slot, deleting the
+  old Story folder if it is left empty;
+- removes deselected photos and adds new ones, so verification sees exact
+  membership.
+
+If the stored album is gone, the title path recreates it. With automatic saving
+on, each pass first saves new eligible Moments. When none are left, it compares
+up to 25 published Moments (rotating cursor) against their stored request and
+re-saves the first that differs. A changed request is not re-saved while
+automatic saving is off; that still needs a manual save. Publication
 must not be mistaken for successful curation or used as a prerequisite for browsing.
 Pagination and thumbnail requests may prioritize work, but must not define the
 scope of library grouping. A full-library overview runs off the main thread; the
