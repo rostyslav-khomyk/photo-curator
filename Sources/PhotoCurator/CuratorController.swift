@@ -39,6 +39,11 @@ actor CuratorWorker {
     private var captionProtection = MomentGroupingProtection()
     private var captionRemaining = 0
     private var captionSweepChanged = false
+    /// Last full walk found nothing to do. Progress stays at total/total across quiet re-checks.
+    private var captionPassClean = false
+    /// Monotonic refinement progress within the current caption scope. Sweep restarts must not
+    /// flash 0/N after the UI already advanced.
+    private var captionProgressHighWater = 0
     /// Fingerprints already projected into Catalog v2 this process. Used to repair Moments whose
     /// automatic grouping finished but a caption-only refresh left `grouping_state` as preparing.
     private var projectedGroupingFingerprints = Set<String>()
@@ -202,6 +207,8 @@ actor CuratorWorker {
         captionCursor = 0
         captionRemaining = 0
         captionSweepChanged = false
+        captionPassClean = false
+        captionProgressHighWater = 0
         projectedGroupingFingerprints.removeAll()
         continuityPairs.removeAll()
         largeWindowCursor.removeAll()
@@ -266,8 +273,10 @@ actor CuratorWorker {
         try Task.checkCancellation()
         guard generation == metadataGeneration,
               try GroupReviewStore(url: url.deletingLastPathComponent().appendingPathComponent("group-review.json")).load().revision == reviewRevision else { return false }
+        let joinsFlipped = (previous?.joins ?? false) != record.joins
         try continuityStore.save(record, pair: pair)
-        return (previous?.joins ?? false) != record.joins || (record.joins && previous?.evidenceFingerprint != signature)
+        // Evidence fingerprint refresh alone must not rebuild the 7k Moment walk.
+        return joinsFlipped
     }
 
     private func baseMoments(protection: MomentGroupingProtection, reviews: GroupReviewArchive) throws -> [PhotoMoment] {
@@ -289,13 +298,60 @@ actor CuratorWorker {
     private func prepareLargeMoment(_ moment: PhotoMoment, reviewRevision: Int) async throws -> Bool {
         let windows = try LargeMomentWindows.make(moment)
         let key = windows[0].moment.id
+        let checkpoints = LargeMomentWindowStore(root: automaticStore.root, cache: derivedCache)
+        var remaining = largeWindowRemaining[key, default: windows.count]
+        if remaining == 0 {
+            // Finished one pass over every window. Restart only when evidence drifted;
+            // the old reset-to-count cycle wrapped the whole library forever.
+            var drifted = false
+            for window in windows {
+                try Task.checkCancellation()
+                if try await largeWindowEvidenceDrifted(window, checkpoints: checkpoints) {
+                    drifted = true
+                    break
+                }
+            }
+            guard drifted else {
+                largeWindowScanPending = false
+                return false
+            }
+            remaining = windows.count
+            largeWindowRemaining[key] = remaining
+        }
         let index = (largeWindowCursor[key] ?? 0) % windows.count
         let window = windows[index]
         largeWindowCursor[key] = (index + 1) % windows.count
-        let remaining = largeWindowRemaining[key, default: windows.count]
-        largeWindowRemaining[key] = (remaining == 0 ? windows.count : remaining) - 1
+        largeWindowRemaining[key] = remaining - 1
         largeWindowScanPending = largeWindowRemaining[key, default: 0] > 0
-        let checkpoints = LargeMomentWindowStore(root: automaticStore.root, cache: derivedCache)
+        return try await writeLargeWindowIfNeeded(window, reviewRevision: reviewRevision, checkpoints: checkpoints)
+    }
+
+    private func largeWindowEvidenceDrifted(
+        _ window: LargeMomentWindows.Window, checkpoints: LargeMomentWindowStore
+    ) async throws -> Bool {
+        let encoder = JSONEncoder(); encoder.outputFormatting = .sortedKeys
+        var digest = SHA256()
+        for photo in window.moment.photos {
+            guard let data = try database().analysisResult(asset: photo.id, revision: photo.analysisRevision,
+                                                          analyzer: CuratorVisionAnalyzer.version),
+                  let result = try? JSONDecoder().decode(CuratorVisionResult.self, from: data),
+                  result.version == CuratorVisionAnalyzer.version else {
+                return try checkpoints.completed(window)
+            }
+            let clues = await context.cachedLabels(photo) ?? []
+            let ocr = await textStore.cached(photo)
+            digest.update(data: try encoder.encode(photo.id))
+            digest.update(data: try encoder.encode(result))
+            digest.update(data: try encoder.encode(clues.sorted()))
+            digest.update(data: try encoder.encode(ocr?.lines ?? []))
+        }
+        let signature = digest.finalize().map { String(format: "%02x", $0) }.joined()
+        return try checkpoints.load(window)?.evidenceFingerprint != signature
+    }
+
+    private func writeLargeWindowIfNeeded(
+        _ window: LargeMomentWindows.Window, reviewRevision: Int, checkpoints: LargeMomentWindowStore
+    ) async throws -> Bool {
         let generation = metadataGeneration
         var labels: [String: [String]] = [:], text: [String: [PhotoTextLine]] = [:]
         var results: [String: CuratorVisionResult] = [:]
@@ -427,10 +483,15 @@ actor CuratorWorker {
         }
     }
 
-    /// Position within the current refinement pass; a continuity change restarts the pass.
+    /// Position within the current refinement pass; a continuity join flip rebuilds the list.
+    /// After a clean pass, quiet re-checks report total/total so the UI does not wrap to 0.
+    /// Sweep restarts never decrease the advertised done count within the same scope.
     func momentRefinementProgress() -> (done: Int, total: Int)? {
         guard let total = captionGroups?.count, total > 0 else { return nil }
-        return (max(0, total - captionRemaining), total)
+        if captionPassClean { return (total, total) }
+        let done = max(0, total - captionRemaining)
+        captionProgressHighWater = max(captionProgressHighWater, done)
+        return (min(total, captionProgressHighWater), total)
     }
 
     func textRecognitionProgress() -> (done: Int, total: Int)? {
@@ -458,60 +519,143 @@ actor CuratorWorker {
             captionCursor = 0
             captionRemaining = captionGroups?.count ?? 0
             captionSweepChanged = false
+            captionPassClean = false
+            captionProgressHighWater = 0
             captionProtection = protection
         }
         guard let groups = captionGroups, !groups.isEmpty else { return .caughtUp }
-        if captionRemaining == 0 { captionRemaining = groups.count; captionSweepChanged = false }
+        if captionRemaining == 0 {
+            if captionPassClean {
+                // After a clean pass, probe for late evidence in this call only. Reopening a
+                // multi-step 0→N walk made the status flip to "Analyzing…" for ~90s between
+                // brief "Available local evidence processed" flashes.
+                return try await probeSettledRefinement(
+                    groups: groups, reviewRevision: reviews.revision,
+                    protection: protection, model: model)
+            }
+            captionRemaining = groups.count
+            captionSweepChanged = false
+        }
         // Bounded sweep across the entire index, independent of the displayed page.
         for _ in 0..<min(4, captionRemaining) {
             try Task.checkCancellation()
-            let moment = groups[captionCursor % groups.count]
-            for pair in continuityPairs[moment.id] ?? [] {
-                if try await prepareContinuity(pair, reviewRevision: reviews.revision) {
-                    captionGroups = nil
-                    return .changed
-                }
+            if let step = try await refineOneMoment(
+                groups[captionCursor % groups.count], groupsCount: groups.count,
+                reviewRevision: reviews.revision, protection: protection, model: model
+            ) {
+                return step
             }
-            let grouped = try await prepareGrouping(moment, protection: protection, reviewRevision: reviews.revision)
-            if largeWindowScanPending { captionSweepChanged = true }
-            let children = try automaticStore.apply(moment, protected: protection.ids)
-            // Reconcile adjacent scene sections within the same parent visit, using the
-            // same evidence gates as cross-gap continuity, never similarity alone.
-            for pair in MomentContinuity.pairs(children, protected: protection.ids) {
-                if try await prepareContinuity(pair, reviewRevision: reviews.revision) {
-                    captionSweepChanged = true
-                    return .changed
-                }
+        }
+        if captionRemaining == 0 {
+            if captionSweepChanged {
+                captionPassClean = false
+                captionSweepChanged = false
+                captionRemaining = groups.count
+                // Keep captionProgressHighWater so the UI does not wrap to 0/N.
+                return .scanning
             }
-            let preparedChildren = try continuityStore.apply(children, protected: protection.ids)
-            // Project grouping into the catalog before captions. Caption-only refresh loads the
-            // prior catalog row and can leave Moments stuck on "Preparing grouping…".
-            let groupingSettled = preparedChildren.contains {
-                $0.groupingState == .ready || $0.groupingState == .conservative || $0.groupingState == .reviewed
+            captionPassClean = true
+            captionProgressHighWater = groups.count
+            return .caughtUp
+        }
+        return .scanning
+    }
+
+    /// Rotating maintenance probe while settled. Returns `.caughtUp` unless real work appears.
+    private func probeSettledRefinement(
+        groups: [PhotoMoment], reviewRevision: Int, protection: MomentGroupingProtection,
+        model: LocalNarrativeModel
+    ) async throws -> MomentPreparationStep {
+        let budget = min(64, groups.count)
+        for _ in 0..<budget {
+            try Task.checkCancellation()
+            if let step = try await refineOneMoment(
+                groups[captionCursor % groups.count], groupsCount: groups.count,
+                reviewRevision: reviewRevision, protection: protection, model: model,
+                settledProbe: true
+            ) {
+                return step
             }
-            let fingerprint = (try? AutomaticMomentSegmentation.fingerprint(moment)) ?? moment.id
-            if groupingSettled {
-                let needsProjection = projectedGroupingFingerprints.insert(fingerprint).inserted
-                if grouped || needsProjection {
-                    captionSweepChanged = true
-                    return .changed
-                }
-            } else if grouped {
+        }
+        return .caughtUp
+    }
+
+    /// Advances `captionCursor` / `captionRemaining` on a quiet visit. Returns a step when the
+    /// caller must stop this `prepareMoments` invocation; `nil` means keep sweeping.
+    private func refineOneMoment(
+        _ moment: PhotoMoment, groupsCount: Int, reviewRevision: Int,
+        protection: MomentGroupingProtection, model: LocalNarrativeModel,
+        settledProbe: Bool = false
+    ) async throws -> MomentPreparationStep? {
+        for pair in continuityPairs[moment.id] ?? [] {
+            if try await prepareContinuity(pair, reviewRevision: reviewRevision) {
+                captionPassClean = false
+                captionGroups = nil
+                return .changed
+            }
+        }
+        let grouped = try await prepareGrouping(moment, protection: protection, reviewRevision: reviewRevision)
+        // Finish every internal window before advancing to the next Moment. Otherwise a
+        // drifted later window is skipped when an earlier no-op window returns false and
+        // captionRemaining hits zero.
+        if largeWindowScanPending {
+            captionPassClean = false
+            if settledProbe {
+                captionRemaining = max(1, groupsCount)
+                captionSweepChanged = grouped
+            }
+            if grouped {
                 captionSweepChanged = true
                 return .changed
             }
-            for prepared in preparedChildren {
-                if prepared.groupingKind == .unresolved { continue }
-                if try await context.prepare(prepared, model: model) {
-                    captionSweepChanged = true
-                    // Finish this collection's children before moving back through history.
-                    return .presentationChanged(prepared.id)
-                }
-            }
-            captionCursor += 1
-            captionRemaining -= 1
+            return .scanning
         }
-        return captionRemaining == 0 && !captionSweepChanged ? .caughtUp : .scanning
+        let children = try automaticStore.apply(moment, protected: protection.ids)
+        // Reconcile adjacent scene sections within the same parent visit, using the
+        // same evidence gates as cross-gap continuity, never similarity alone.
+        for pair in MomentContinuity.pairs(children, protected: protection.ids) {
+            if try await prepareContinuity(pair, reviewRevision: reviewRevision) {
+                captionPassClean = false
+                captionSweepChanged = true
+                return .changed
+            }
+        }
+        let preparedChildren = try continuityStore.apply(children, protected: protection.ids)
+        // Project grouping into the catalog before captions. Caption-only refresh loads the
+        // prior catalog row and can leave Moments stuck on "Preparing grouping…".
+        let groupingSettled = preparedChildren.contains {
+            $0.groupingState == .ready || $0.groupingState == .conservative || $0.groupingState == .reviewed
+        }
+        let fingerprint = (try? AutomaticMomentSegmentation.fingerprint(moment)) ?? moment.id
+        if groupingSettled {
+            let needsProjection = projectedGroupingFingerprints.insert(fingerprint).inserted
+            if grouped {
+                captionPassClean = false
+                captionSweepChanged = true
+                return .changed
+            }
+            if needsProjection {
+                captionPassClean = false
+                return .changed
+            }
+        } else if grouped {
+            captionPassClean = false
+            captionSweepChanged = true
+            return .changed
+        }
+        for prepared in preparedChildren {
+            if prepared.groupingKind == .unresolved { continue }
+            if try await context.prepare(prepared, model: model) {
+                captionPassClean = false
+                return .presentationChanged(prepared.id)
+            }
+        }
+        captionCursor += 1
+        if !settledProbe {
+            captionRemaining -= 1
+            captionProgressHighWater = max(captionProgressHighWater, groupsCount - captionRemaining)
+        }
+        return nil
     }
 
     func nextTextCandidate(range: DateInterval?) async throws -> IndexedPhoto? {
@@ -1863,7 +2007,9 @@ final class CuratorController: ObservableObject {
 
     private func runAnalysisStep(allowAutomaticPublication: Bool) {
         let token = revision
-        if !AnalysisPhaseText.isPhase(activity) {
+        // Keep the settled status across idle wakes (deferred leases, journey probes).
+        // Only replace it once Vision, OCR, or Moment work actually starts.
+        if !AnalysisPhaseText.isPhase(activity), !AnalysisPhaseText.isSettled(activity) {
             activity = AnalysisPhaseText.starting
         }
         let lanes = AnalysisLaneBudget.lanes()
@@ -1892,14 +2038,21 @@ final class CuratorController: ObservableObject {
                     let textProgress = await worker.textRecognitionProgress()
                     if try await worker.pendingAnalysisCount() == 0,
                        textProgress.map({ $0.done >= $0.total }) ?? true,
-                       let progress = await worker.momentRefinementProgress() {
+                       let progress = await worker.momentRefinementProgress(),
+                       progress.done < progress.total {
                         activity = AnalysisPhaseText.moments(progress)
                     }
                     if case .presentationChanged(let id) = step {
+                        if AnalysisPhaseText.isSettled(activity) {
+                            activity = AnalysisPhaseText.starting
+                        }
                         await refreshVisibleMoment(id)
                         return
                     }
                     if step == .changed {
+                        if AnalysisPhaseText.isSettled(activity) {
+                            activity = AnalysisPhaseText.starting
+                        }
                         await refreshOverviewAfterRefinement()
                         return
                     }
@@ -1925,10 +2078,12 @@ final class CuratorController: ObservableObject {
                     if journeyNames, let catalog {
                         let enrichment = try await catalog.enrichJourneyStops(
                             maximumLookups: journeyLookups)
-                        CuratorTelemetry.shared.record(.catalog, counts: [
-                            "journeyLookups": enrichment.attempted,
-                            "journeyUpdates": enrichment.updated
-                        ])
+                        if enrichment.attempted > 0 || enrichment.updated > 0 {
+                            CuratorTelemetry.shared.record(.catalog, counts: [
+                                "journeyLookups": enrichment.attempted,
+                                "journeyUpdates": enrichment.updated
+                            ])
+                        }
                         if enrichment.updated > 0 {
                             storySummaries = try await catalog.storySummaries()
                             return
@@ -1945,6 +2100,8 @@ final class CuratorController: ObservableObject {
                     if let photo = try await worker.nextTextCandidate(range: nil) {
                         if let progress = await worker.textRecognitionProgress() {
                             activity = AnalysisPhaseText.text(progress)
+                        } else if AnalysisPhaseText.isSettled(activity) {
+                            activity = AnalysisPhaseText.starting
                         }
                         let source = loaders[0]
                         let image = try await source.load(assetID: photo.id).image
@@ -1958,10 +2115,14 @@ final class CuratorController: ObservableObject {
                     let step = try await worker.prepareMoments(range: nil, protection: MomentGroupingProtection.load(.standard))
                     try Task.checkCancellation()
                     guard token == revision else { return }
-                    if let progress = await worker.momentRefinementProgress() {
+                    if let progress = await worker.momentRefinementProgress(),
+                       progress.done < progress.total {
                         activity = AnalysisPhaseText.moments(progress)
                     }
                     if step != .caughtUp {
+                        if AnalysisPhaseText.isSettled(activity) {
+                            activity = AnalysisPhaseText.starting
+                        }
                         if case .presentationChanged(let id) = step { await refreshVisibleMoment(id) }
                         else if step == .changed { await refreshOverviewAfterRefinement() }
                         return
@@ -1971,7 +2132,7 @@ final class CuratorController: ObservableObject {
                             return
                         }
                     }
-                    activity = "Available local evidence processed. Incomplete collections keep conservative grouping."
+                    activity = AnalysisPhaseText.settled
                     caughtUp = true
                     CuratorTelemetry.shared.record(.caughtUp, counts: ["saved": analyzedThisSession, "deferred": deferredThisSession])
                     await refreshOverview(reusingVisibleMoments: true, projectCompleteCatalog: true)
@@ -1993,10 +2154,12 @@ final class CuratorController: ObservableObject {
                         if enrichment.updated > 0 {
                             storySummaries = try await catalog.storySummaries()
                         }
-                        CuratorTelemetry.shared.record(.catalog, counts: [
-                            "journeyLookups": enrichment.attempted,
-                            "journeyUpdates": enrichment.updated
-                        ])
+                        if enrichment.attempted > 0 || enrichment.updated > 0 {
+                            CuratorTelemetry.shared.record(.catalog, counts: [
+                                "journeyLookups": enrichment.attempted,
+                                "journeyUpdates": enrichment.updated
+                            ])
+                        }
                         if enrichment.hasMore {
                             await scheduler.wake(.retryDue, at: Date().addingTimeInterval(5))
                         } else if enrichment.attempted > 0 {
@@ -2215,9 +2378,11 @@ final class CuratorController: ObservableObject {
 /// Status line for the analysis loop: names the phase and its position instead of one generic message.
 enum AnalysisPhaseText {
     static let starting = "Analyzing photos and refining Moments…"
+    static let settled = "Available local evidence processed. Incomplete collections keep conservative grouping."
     private static let prefixes = [starting, "Analyzing photos:", "Reading text in photos:", "Refining Moments:"]
 
     static func isPhase(_ text: String) -> Bool { prefixes.contains { text.hasPrefix($0) } }
+    static func isSettled(_ text: String) -> Bool { text.hasPrefix("Available local evidence processed") }
 
     static func visual(remaining: Int) -> String {
         "Analyzing photos: \(remaining.formatted()) left…"
@@ -2227,7 +2392,7 @@ enum AnalysisPhaseText {
         "Reading text in photos: \(progress.done.formatted()) of \(progress.total.formatted())…"
     }
 
-    /// A continuity merge restarts the pass, so the count can go back down.
+    /// Progress is high-water monotonic within a scope; continuity rebuilds reset the scope.
     static func moments(_ progress: (done: Int, total: Int)) -> String {
         "Refining Moments: \(progress.done.formatted()) of \(progress.total.formatted())…"
     }

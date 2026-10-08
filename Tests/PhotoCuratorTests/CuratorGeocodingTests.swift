@@ -183,6 +183,46 @@ final class CuratorGeocodingTests: XCTestCase {
         XCTAssertEqual(story.stops.first?.place, "Paris")
     }
 
+    func testUnresolvableJourneyStopsAreNotRetriedThisProcess() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let url = root.appendingPathComponent("catalog-v2.sqlite3")
+        let store = try CatalogV2Store(url: url)
+        let stops = [
+            JourneyStopEvidence(start: Date(timeIntervalSince1970: 1), end: Date(timeIntervalSince1970: 2),
+                latitude: 1.111, longitude: 2.222, momentCount: 1, photoCount: 1, place: nil, confidence: 1),
+            JourneyStopEvidence(start: Date(timeIntervalSince1970: 3), end: Date(timeIntervalSince1970: 4),
+                latitude: 3.333, longitude: 4.444, momentCount: 1, photoCount: 1, place: nil, confidence: 1)
+        ]
+        let evidence = try JSONEncoder().encode(stops)
+        var database: OpaquePointer?
+        let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+        XCTAssertEqual(sqlite3_open(url.path, &database), SQLITE_OK)
+        var statement: OpaquePointer?
+        XCTAssertEqual(sqlite3_prepare_v2(database, "INSERT INTO stories VALUES(?,?,?,?,?,?,?,?,?,?)", -1,
+                                          &statement, nil), SQLITE_OK)
+        sqlite3_bind_text(statement, 1, "stuck", -1, transient)
+        sqlite3_bind_text(statement, 2, "Journey from Home", -1, transient)
+        sqlite3_bind_double(statement, 3, 1); sqlite3_bind_double(statement, 4, 4)
+        sqlite3_bind_int64(statement, 5, 2); sqlite3_bind_int64(statement, 6, 1)
+        sqlite3_bind_null(statement, 7); sqlite3_bind_int64(statement, 8, 2)
+        sqlite3_bind_text(statement, 9, "journey", -1, transient)
+        _ = evidence.withUnsafeBytes { sqlite3_bind_blob(statement, 10, $0.baseAddress, Int32(evidence.count), transient) }
+        XCTAssertEqual(sqlite3_step(statement), SQLITE_DONE)
+        sqlite3_finalize(statement); sqlite3_close(database)
+
+        let provider = MockGeocodingProvider(places: [:], fallback: nil)
+        let geocoder = CuratorGeocodingService(provider: provider)
+        let first = try await store.enrichJourneyStops(maximumLookups: 8, geocoder: geocoder)
+        let second = try await store.enrichJourneyStops(maximumLookups: 8, geocoder: geocoder)
+        XCTAssertEqual(first.attempted, 2)
+        XCTAssertEqual(first.updated, 0)
+        XCTAssertFalse(first.hasMore)
+        XCTAssertEqual(second.attempted, 0)
+        XCTAssertFalse(second.hasMore)
+        XCTAssertEqual(provider.lookupCount, 2)
+    }
+
     func testJourneyStopNamePrefersCityOverStreetLocality() {
         let street = ResolvedPlace(locality: "Avenue Carnot", administrativeArea: "Île-de-France",
                                    country: "France")

@@ -71,6 +71,12 @@ Panama must be one Journey; mid-route Home zigzags removed).
 - Adaptive evidence **defers** GPS-rich Vision/OCR while claimable thin work
   remains; soft-deferred thin retries must not stall the claim gate.
 - Journey stop geocode runs **before** the OCR interleave on the shared scheduler.
+  Failed stop lookups are not retried in the same process. Caption / projection
+  updates must not wrap a finished 7k refinement pass; only scene splits and
+  continuity join flips may. Refinement progress is high-water monotonic, and
+  large-Moment window rescans run only on evidence drift (not every quiet pass).
+  Idle wakes keep the settled status line (bounded probe); they must not flip
+  back to “Analyzing photos and refining Moments…” for a full quiet re-walk.
 - Photos albums update in place after the first save, using the stored album ID:
   rename, move to the current Story folder, and exact membership. Automatic saving
   re-syncs changed published Moments. This is unit-tested with a fake adapter;
@@ -116,6 +122,10 @@ no longer shows storage summary, shadow curation, rollback, reanalyze, or
 Diagnostics; Reset stays. Analysis uses up to 3 Vision/thumbnail lanes; one SQLite
 writer. Pre-2010 no-GPS photos stay priority 80 so scene splits and highlights
 can catch up. Sqlite signals are not guaranteed across macOS updates.
+
+**Later (not started):** native Aura Frames publication, Google-shaped
+auth/client/sync, unofficial Pushd API. Spare frame required before phase 1.
+Plan: [AURA_NATIVE_CLIENT.md](AURA_NATIVE_CLIENT.md).
 
 Current source audit: [Curation algorithm](CURATION_ALGORITHM.md).
 Soak ops: [SOAK_AGENT.md](SOAK_AGENT.md), [SOAK_FIX_LOG.md](SOAK_FIX_LOG.md).

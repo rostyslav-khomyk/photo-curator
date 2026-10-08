@@ -127,6 +127,19 @@ Titles follow the same adaptive rule: date/place metadata titles persist first s
 cards are not stuck on “Title preparation…”; Vision/OCR captions upgrade when
 sampled evidence is ready. Grouping is projected into the catalog before captions
 so a caption-only refresh cannot leave `grouping_state` stuck on preparing.
+A refinement pass is caught up when it finishes walking every Moment. Caption
+writes and first-time catalog projections refresh the UI but do not wrap the
+walk back to zero. Advertised refinement progress is monotonic within a scope
+(high-water), so an extra lap never flashes `0/N`. After a clean pass, idle
+wakes only rotate a bounded settled probe and keep the “Available local
+evidence processed” status; they do not reopen a multi-step Analyzing walk.
+Only a new scene split schedules one extra lap; a continuity join flip rebuilds
+the Moment list. Identical caption evidence is never rewritten hourly. Large
+Moments scan internal windows once; a second pass starts only when a window’s
+evidence fingerprint drifts, and the parent Moment stays pinned until that scan
+finishes. In-progress large-Moment windows keep their checkpoints. Journey
+geocode does not retry a stop that already failed in this process, and skips
+further per-step scans once unresolved stops are exhausted.
 OCR timeouts and framework reader failures (`CRImageReaderError`, oversized
 frames) cache empty text evidence and continue; they must not pause Moment
 preparation overnight.
@@ -444,6 +457,8 @@ flowchart LR
 | Improve journey names | Grounded names and cached geocoding ship | Story summaries + grounded synopsis candidates; user title/synopsis edits preserved |
 
 Publication to Photos or Google is a separate side-effect workflow after selection.
+A native Aura Frames client is planned on the same pattern as Google Photos and
+is not shipping; see [AURA_NATIVE_CLIENT.md](AURA_NATIVE_CLIENT.md).
 Photos albums are written under `Photo Curator / Year / Story / Moment`. Story
 folders use the owner-visible Journey or Outing title (renames included); two
 Stories with one title in the same year add the start month (`· Jul`). Moment

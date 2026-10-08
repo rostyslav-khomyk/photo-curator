@@ -252,6 +252,8 @@ actor CatalogV2Store {
     private var cachedReviewDecisions: [String: ReviewDecision] = [:]
     private var cachedGoogleMoments = Set<String>()
     private var journeyAttemptedStopKeys = Set<String>()
+    /// All unresolved Journey stops were attempted this process; skip per-step story scans.
+    private var journeyStopLookupsExhausted = false
     private var journeyTransportCursor = 0
     private var journeyTransportRetryAfter = Date.distantPast
 
@@ -363,6 +365,8 @@ actor CatalogV2Store {
     }
 
     func rebuildStories(calendar: Calendar = .current) throws {
+        // New or retitled stops may need geocode again after hierarchy changes.
+        journeyStopLookupsExhausted = false
         let statement = try prepare("""
             SELECT m.id,m.start,m.end,m.narrative,m.photo_count,m.highlight_count,m.cover_asset_id,
                    AVG(a.latitude),AVG(a.longitude)
@@ -683,6 +687,7 @@ actor CatalogV2Store {
     /// rebuilds so home start/end anchors and country/season names refresh.
     func reprocessJourneyPresentation() throws {
         journeyAttemptedStopKeys.removeAll()
+        journeyStopLookupsExhausted = false
         let stories = try storySummaries().filter { $0.kind == .journey }
         let homeLabel = try homeMeaningfulPlaces().first?.label ?? "Home"
         let encoder = JSONEncoder()
@@ -937,6 +942,7 @@ actor CatalogV2Store {
                             geocoder: CuratorGeocodingService = .journeys) async throws
         -> (attempted: Int, updated: Int, hasMore: Bool) {
         guard maximumLookups > 0 else { return (0, 0, false) }
+        if journeyStopLookupsExhausted { return (0, 0, false) }
         let stories = try storySummaries().filter { $0.kind == .journey }
         let evidenceStatement = try prepare("SELECT id,evidence FROM stories WHERE kind='journey' AND evidence IS NOT NULL")
         var originalEvidence: [String: Data] = [:]
@@ -955,12 +961,13 @@ actor CatalogV2Store {
                                                              longitude: stop.longitude))
                 && seen.insert(key(stop)).inserted
         }
-        var candidates = unresolved.filter { !journeyAttemptedStopKeys.contains(key($0)) }
-        if candidates.isEmpty, !unresolved.isEmpty {
-            journeyAttemptedStopKeys.removeAll()
-            candidates = unresolved
+        let candidates = unresolved.filter { !journeyAttemptedStopKeys.contains(key($0)) }
+        // Stops that reverse-geocode to nothing useful must not be retried this process:
+        // resetting the attempted set restarted two lookups every analysis step forever.
+        guard !candidates.isEmpty else {
+            journeyStopLookupsExhausted = true
+            return (0, 0, false)
         }
-        guard !candidates.isEmpty else { return (0, 0, false) }
         let selected = Array(candidates.prefix(maximumLookups))
         journeyAttemptedStopKeys.formUnion(selected.map(key))
         let hasMore = candidates.count > selected.count

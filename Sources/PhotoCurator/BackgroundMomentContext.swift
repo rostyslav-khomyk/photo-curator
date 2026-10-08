@@ -116,8 +116,11 @@ actor BackgroundMomentContext {
             let encoder = JSONEncoder()
             encoder.outputFormatting = .sortedKeys
             let evidenceFingerprint = key(String(decoding: try encoder.encode(inputs), as: UTF8.self))
-            if let previous = cached(moment), previous.evidenceFingerprint == evidenceFingerprint,
-               previous.retryAfter == nil || previous.retryAfter! > Date() { return false }
+            // Same sampled evidence cannot produce a new caption worth restarting the
+            // library walk. Hourly deterministic retries used to wrap 7k Moments forever.
+            if let previous = cached(moment), previous.evidenceFingerprint == evidenceFingerprint {
+                return false
+            }
             let evidence = CaptionEvidenceBuilder.build(inputs, moment: moment)
             let place = await CuratorGeocodingService.shared.place(for: moment)
             let metadata = MomentNarrativeMetadata(dateLabel: moment.start.formatted(date: .abbreviated, time: .omitted),
@@ -129,7 +132,7 @@ actor BackgroundMomentContext {
                 confidence: suggestion.source == "Deterministic fallback" ? 0.55 : 0.8,
                 provenance: [suggestion.source], state: .automatic)
             try write(BackgroundCaption(fingerprint: fingerprint(moment), narrative: narrative,
-                                        retryAfter: suggestion.source == "Deterministic fallback" ? Date().addingTimeInterval(3600) : nil,
+                                        retryAfter: nil,
                                         evidence: evidence, evidenceFingerprint: evidenceFingerprint),
                       at: root.appendingPathComponent("moment-" + key(moment.id) + ".json"))
             return true

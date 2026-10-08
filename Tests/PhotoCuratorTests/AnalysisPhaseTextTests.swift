@@ -14,5 +14,7 @@ final class AnalysisPhaseTextTests: XCTestCase {
             XCTAssertTrue(AnalysisPhaseText.isPhase(status))
         }
         XCTAssertFalse(AnalysisPhaseText.isPhase("Available local evidence processed."))
+        XCTAssertTrue(AnalysisPhaseText.isSettled(AnalysisPhaseText.settled))
+        XCTAssertFalse(AnalysisPhaseText.isSettled(AnalysisPhaseText.starting))
     }
 }
