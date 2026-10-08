@@ -33,3 +33,16 @@ updates the UI dependency table when needed, not the algorithm's claimed status.
 - Overnight / clean-room soak monitoring: [Docs/SOAK_AGENT.md](Docs/SOAK_AGENT.md)
   (local loop + telemetry watch + Photos full-access clicker; fix log in
   [Docs/SOAK_FIX_LOG.md](Docs/SOAK_FIX_LOG.md)).
+
+## Cursor Cloud specific instructions
+
+Cloud Agent machines are Linux. The app targets macOS 13 and uses AppKit, SwiftUI, PhotoKit, and codesign, so `swift test`, `./Scripts/build_app.sh`, and `./Scripts/qualify_alpha.sh` are macOS commands.
+
+ExifTool is installed from `libimage-exiftool-perl`. Node is already on the image. Verify the portable export audit with:
+
+```bash
+node --test Tools/Evaluation/audit-export.test.mjs
+node Tools/Evaluation/audit-export.mjs EXPORT_FOLDER NEW_REPORT_FOLDER
+```
+
+The audit reads copied media in an export folder and writes a new report directory outside that folder. It does not open the Photos library. Use a synthetic or isolated export for checks.
